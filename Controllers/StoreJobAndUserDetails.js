@@ -1,6 +1,7 @@
 // controllers/StoreJobAndUserDetails.js
 import { JobModel } from "../Schema_Models/JobModel.js";
 import { isClientLocked } from "./operations/ClientOperations.js";
+import ExtensionCode from "../Schema_Models/ExtensionCode.js";
 
 export default async function StoreJobAndUserDetails(req, res) {
     console.log(req.body);
@@ -149,17 +150,18 @@ export default async function StoreJobAndUserDetails(req, res) {
 
 export async function saveToDashboard(req, res) {
     try {
-      //  console.log(req.body);
         const {
             company,
             description,
             position,
             selectedEmails,
             logo,
-            url
+            url,
+            operatorEmail,
+            operatorName,
+            extensionCode
         } = req.body;
 
-        // --- Input Validation (no changes here) ---
         if (!selectedEmails || !Array.isArray(selectedEmails) || selectedEmails.length === 0) {
             return res.status(400).json({
                 success: false,
@@ -171,6 +173,33 @@ export async function saveToDashboard(req, res) {
                 success: false,
                 message: "Missing required job details: 'position', 'company', and 'url' are required."
             });
+        }
+
+        // Block jobs from jobright.ai
+        if (url && String(url).toLowerCase().includes('jobright.ai')) {
+            return res.status(400).json({
+                success: false,
+                message: "Jobs from Jobright are not allowed. Please use a different job source."
+            });
+        }
+
+        const isOperator = operatorEmail && String(operatorEmail).toLowerCase().endsWith('@flashfirehq');
+        let addedByName = null;
+        if (isOperator) {
+            if (!extensionCode || !String(extensionCode).trim()) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Extension code is required when adding jobs as an operator."
+                });
+            }
+            const extDoc = await ExtensionCode.findOne({ code: String(extensionCode).trim() });
+            if (!extDoc) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid or expired extension code."
+                });
+            }
+            addedByName = extDoc.name;
         }
 
         const summary = {
@@ -212,7 +241,7 @@ export async function saveToDashboard(req, res) {
                     continue;
                 }
 
-                // If no duplicate is found, create and save the job.
+                const timelineEntry = addedByName ? `Added by ${addedByName}` : 'Added';
                 const payload = {
                     dateAdded: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
                     createdAt: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
@@ -223,8 +252,10 @@ export async function saveToDashboard(req, res) {
                     companyLogo : logo,
                     currentStatus: "saved",
                     jobDescription: description || "",
-                    timeline: ["Added"],
-                    attachments: []
+                    timeline: [timelineEntry],
+                    attachments: [],
+                    operatorName: isOperator ? (operatorName || addedByName) : 'user',
+                    operatorEmail: isOperator ? (operatorEmail || '') : 'user@flashfirehq'
                 };
 
                 const newJob = await JobModel.create(payload);
