@@ -21,10 +21,92 @@ import axios from "axios";
 import { recordAiUsage, AI_USAGE_SOURCES } from "../Utils/aiUsage.js";
 import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { getAppSettings } from "../Schema_Models/AppSettings.js";
-import { mergeOverlay, mergeWithLocks, countOverlayBullets, parseSections, extractProvenance } from "../Utils/summaryOverlay.js";
+import { mergeOverlay, mergeWithLocks, countOverlayBullets, parseSections, extractProvenance, provenanceForText } from "../Utils/summaryOverlay.js";
 
 const RESUME_API_URL = process.env.RESUME_API_URL || "http://localhost:5000";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+// Per-call timeout for the OpenAI chat.completions requests. The structured
+// brief is a large prompt and on a small Render instance a single call can
+// legitimately run past 60s — which surfaced as OPENAI_NETWORK "timeout of
+// 60000ms exceeded" and a failed build. Now that the build is fully async
+// (POST /build-ai-summary returns 202, no proxy in the path) the only ceiling
+// is this value, so give it real headroom. Override with OPENAI_TIMEOUT_MS.
+const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS) || 180_000;
+
+// Wall-clock ceiling for ONE whole build (resume fetch + every OpenAI call).
+// Without it the pieces multiply: 3 round-1 attempts x (180s + a 180s network
+// retry) + a 180s notes pass is ~24 min, far past the window the status
+// endpoint and the clients-tracking poller are willing to wait. Every OpenAI
+// call is clamped to the time left in this budget, and the round-1 reroll loop
+// stops once there isn't room for another full attempt.
+const BUILD_BUDGET_MS = Number(process.env.SUMMARY_BUILD_BUDGET_MS) || 8 * 60 * 1000;
+// Don't start an OpenAI call with less than this left — it would only abort.
+const MIN_CALL_MS = 15_000;
+// A build still flagged "building" this long after it started is treated as
+// dead (process restarted mid-build) so a fresh trigger can claim it. MUST
+// stay above BUILD_BUDGET_MS: while a build is legitimately running, the
+// status endpoint would otherwise report a stale "done"/"error" and the
+// clients-tracking poller would show the PREVIOUS build's word count as if it
+// were the new one.
+const BUILD_STALE_MS = BUILD_BUDGET_MS + 90_000;
+
+// msLeft — milliseconds remaining before `deadlineAt` (epoch ms). Returns
+// Infinity when no deadline was threaded through (direct/legacy callers).
+function msLeft(deadlineAt) {
+  if (!deadlineAt) return Infinity;
+  return deadlineAt - Date.now();
+}
+
+// postOpenAI — axios POST to chat.completions with one retry on a timeout /
+// transient network abort (ECONNABORTED / ECONNRESET / no response). A real
+// HTTP error (4xx/5xx with a body) is NOT retried — it re-throws immediately.
+// `deadlineAt` clamps both the per-call timeout and whether the retry is even
+// attempted, so a build can never outrun BUILD_BUDGET_MS.
+async function postOpenAI(body, apiKey, deadlineAt = 0) {
+  const budget = () => Math.min(OPENAI_TIMEOUT_MS, msLeft(deadlineAt));
+  const first = budget();
+  if (first < MIN_CALL_MS) {
+    const err = new Error(`build budget exhausted (${Math.round(first / 1000)}s left)`);
+    err.code = "EBUDGET";
+    throw err;
+  }
+  const cfg = {
+    timeout: first,
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey || OPENAI_API_KEY}`,
+    },
+  };
+  try {
+    return await axios.post("https://api.openai.com/v1/chat/completions", body, cfg);
+  } catch (err) {
+    const transient = !err.response
+      && (err.code === "ECONNABORTED" || err.code === "ECONNRESET" || err.code === "ETIMEDOUT");
+    if (!transient) throw err;
+    const retryTimeout = budget();
+    if (retryTimeout < MIN_CALL_MS) {
+      console.warn(`[BuildAiSummary] OpenAI call ${err.code} — no budget left to retry`);
+      throw err;
+    }
+    console.warn(`[BuildAiSummary] OpenAI call ${err.code} — retrying once (${Math.round(retryTimeout / 1000)}s budget)`);
+    return await axios.post("https://api.openai.com/v1/chat/completions", body, { ...cfg, timeout: retryTimeout });
+  }
+}
+
+// resolveProfileByEmail — the lookup ladder every summary consumer uses:
+// exact lowercase first, then a case-insensitive match for legacy mixed-case
+// profile rows. GetProfile.resolveProfile documents why this matters — the
+// profiles the auto-rebuild triggers WRITE to are exactly the ones an
+// exact-match-only lookup 404s on.
+async function resolveProfileByEmail(email, projection = null) {
+  const lower = String(email).toLowerCase();
+  const q = (filter) => (projection
+    ? ProfileModel.findOne(filter).select(projection).lean()
+    : ProfileModel.findOne(filter).lean());
+  const hit = await q({ email: lower });
+  if (hit) return hit;
+  return q({ email: { $regex: new RegExp(`^${escapeRegex(email)}$`, "i") } });
+}
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 // Summary builds use gpt-4o-mini exclusively. Gemini path removed after it
 // repeatedly miscategorised operator-notes directives. To restore Gemini,
@@ -403,9 +485,9 @@ ${blocks.join("\n\n")}`;
 // instructions that OVERRIDE profile/resume signals — not as data to
 // summarise. Empty / missing notes → empty string (no append).
 function renderSystemNotesDirective(profile) {
-  const text = (profile?.aiNotes?.text || "").trim();
+  const text = stripPromptFences((profile?.aiNotes?.text || "").trim());
   if (!text) return "";
-  const who = profile?.aiNotes?.updatedBy || "ops";
+  const who = stripPromptFences(profile?.aiNotes?.updatedBy || "ops");
   return `
 
 ═══════════════════════════════════════════════════════════════════════
@@ -443,10 +525,29 @@ export function isPureLogisticalReason(reason) {
 // capped for the prompt. Single source of truth for the prompt block AND
 // the deterministic enforcement pass.
 const REMOVAL_FEEDBACK_PROMPT_LIMIT = 10;
+
+// Removal reasons are CLIENT-authored free text. They are pasted into the
+// prompt inside <<<REMOVALS>>> / <<<END>>> fences (applyNotesPass) and into
+// the user message (renderRemovalFeedbackBlock). A reason containing a fence
+// marker would close the block early and have whatever follows it read as
+// instruction rather than data. Neutralise any <<<...>>> run on the way in.
+// The same guard covers operator aiNotes — a trusted author, but the
+// structural break is identical and it lands in the SYSTEM message.
+const FENCE_RE = /<{2,}[^<>]*>{2,}/g;
+export function stripPromptFences(s) {
+    return String(s ?? "").replace(FENCE_RE, " ");
+}
+
 function usableRemovalFeedback(profile) {
     return (Array.isArray(profile?.removalFeedback) ? profile.removalFeedback : [])
         .filter((i) => i?.reason && String(i.reason).trim() && !isPureLogisticalReason(i.reason))
-        .slice(0, REMOVAL_FEEDBACK_PROMPT_LIMIT);
+        .slice(0, REMOVAL_FEEDBACK_PROMPT_LIMIT)
+        .map((i) => ({
+            ...i,
+            reason: stripPromptFences(i.reason),
+            jobTitle: stripPromptFences(i.jobTitle),
+            companyName: stripPromptFences(i.companyName),
+        }));
 }
 
 // companyRejectedByEntry: true when the entry's reason rejects the COMPANY
@@ -545,7 +646,13 @@ export function deterministicRemovalBullets(profile) {
         if (/not\s+my\s+target\s+role/i.test(reason) && cleaned) {
             if (!titleOverlapsPreferred(cleaned, profile)) {
                 const needleTokens = qualifierTokens(cleaned).slice(0, 2).join(" ") || cleaned.toLowerCase();
-                push("# Hard Disqualifiers", needleTokens, `- Skip roles like "${cleaned}".`);
+                // Plain `Skip <title> roles.` — NOT `Skip roles like "<title>".`.
+                // The extension's matcher (background.js extractSummarySkipPhrases)
+                // takes everything after "skip ", strips role nouns, and requires
+                // the remainder to appear literally in a job title. The old
+                // wording left it holding the dead token `like <title>`, which no
+                // posting can ever contain, so this bullet never enforced.
+                push("# Hard Disqualifiers", needleTokens, `- Skip ${cleaned} roles.`);
             } else {
                 push("# Notes for Grader", title, `- Removal feedback: the candidate removed "${title}"${company ? ` at ${company}` : ""} as not their target role — down-rank near-identical postings even within their preferred families.`);
             }
@@ -556,7 +663,10 @@ export function deterministicRemovalBullets(profile) {
             || reason.match(/too\s+(junior|senior)/i);
         if ((/wrong\s+seniority\s+level/i.test(reason) || /too\s+(junior|senior)/i.test(reason)) && senMatch) {
             const band = senMatch[1].toLowerCase().replace(/^jr$/, "junior").replace(/^sr$/, "senior");
-            push("# Hard Disqualifiers", `${band} level roles`, `- Skip ${band}-level roles.`);
+            // `Skip <band> roles.`, not `Skip <band>-level roles.` — the
+            // hyphenated form yields the token "junior-level", and job titles
+            // say "Junior Software Engineer", so the matcher never fired.
+            push("# Hard Disqualifiers", `${band} level roles`, `- Skip ${band} roles.`);
         }
         // 6. Location / salary — grader guidance, never hard skips.
         if (/location\s+doesn'?t\s+work/i.test(reason)) {
@@ -1077,26 +1187,23 @@ async function fetchResume(email) {
 // a classification/routing task, not creative writing). Hardcoded on purpose.
 const SUMMARY_TEMPERATURE = 0;
 
-async function callOpenAI(profile, resume, existingSummary, profileDiff, apiKey, overlay = null) {
+// retryHint — when a previous round-1 attempt came back missing required
+// headers, this string is appended to the system message so the reroll is
+// explicitly told which sections to restore. Empty on the first attempt.
+async function callOpenAI(profile, resume, existingSummary, profileDiff, apiKey, overlay = null, retryHint = "", deadlineAt = 0) {
   const body = {
     model: OPENAI_MODEL,
     messages: [
       // Operator notes are appended to the SYSTEM message (verbatim) so the
       // model treats them as authoritative instructions, on top of the
       // detailed routing rules carried in the user message.
-      { role: "system", content: SYSTEM_PROMPT + renderSystemNotesDirective(profile) },
+      { role: "system", content: SYSTEM_PROMPT + renderSystemNotesDirective(profile) + retryHint },
       { role: "user", content: buildUserPrompt(profile, resume, existingSummary, profileDiff, overlay) },
     ],
     temperature: SUMMARY_TEMPERATURE,
   };
   try {
-    const res = await axios.post("https://api.openai.com/v1/chat/completions", body, {
-      timeout: 60_000,
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${apiKey || OPENAI_API_KEY}`,
-      },
-    });
+    const res = await postOpenAI(body, apiKey, deadlineAt);
     recordAiUsage({
       source: AI_USAGE_SOURCES.AI_SUMMARY,
       model: res.data?.model || OPENAI_MODEL,
@@ -1123,7 +1230,7 @@ async function callOpenAI(profile, resume, existingSummary, profileDiff, apiKey,
 // reflected with correct polarity. Runs only when notes exist (+1 call/build).
 // Fail-open: returns the input brief unchanged on any error/empty — the
 // deterministic enforceNoteDirectives still runs afterwards as the guarantee.
-async function applyNotesPass(brief, notesText, apiKey, removalDirectivesText = "") {
+async function applyNotesPass(brief, notesText, apiKey, removalDirectivesText = "", deadlineAt = 0) {
   if (!notesText && !removalDirectivesText) return brief;
   const sys = `You revise a candidate brief so it FULLY reflects the operator's notes and the client's removal-feedback directives. Output ONLY the corrected brief — same section headers, same order, keep all existing content, change nothing the inputs don't require.
 Rules:
@@ -1138,11 +1245,11 @@ Rules:
     : "";
   const user = `Operator notes:\n<<<NOTES>>>\n${notesText || "(none)"}\n<<<END>>>${removalBlock}\n\nCurrent brief:\n<<<BRIEF>>>\n${brief}\n<<<END>>>\n\nReturn the corrected full brief.`;
   try {
-    const res = await axios.post("https://api.openai.com/v1/chat/completions", {
+    const res = await postOpenAI({
       model: OPENAI_MODEL,
       messages: [{ role: "system", content: sys }, { role: "user", content: user }],
       temperature: 0,
-    }, { timeout: 60_000, headers: { "content-type": "application/json", authorization: `Bearer ${apiKey || OPENAI_API_KEY}` } });
+    }, apiKey, deadlineAt);
     recordAiUsage({
       source: AI_USAGE_SOURCES.AI_SUMMARY,
       model: res.data?.model || OPENAI_MODEL,
@@ -1180,32 +1287,308 @@ export async function buildSummaryForEmail(email, reasonTag = "manual") {
     if (!email || typeof email !== "string" || !email.includes("@")) {
       return { success: false, status: 400, error: "BAD_INPUT", message: "email is required", step: "validate" };
     }
-    const lower = String(email).toLowerCase();
-    let profile = await ProfileModel.findOne({ email: lower }).lean();
-    if (!profile) {
-      profile = await ProfileModel.findOne({
-        email: { $regex: new RegExp(`^${escapeRegex(email)}$`, "i") },
-      }).lean();
-    }
+    const profile = await resolveProfileByEmail(email);
     if (!profile) {
       return { success: false, status: 404, error: "PROFILE_NOT_FOUND", message: `No profile in DB for ${email}`, step: "loading-profile" };
     }
-    return await runForProfileCore(profile, effectiveKey, reasonTag);
+
+    // Claim the build atomically. Every trigger routes through here — the
+    // Build button, job-removal feedback, resume attach, profile create/update
+    // and the 30-min cron sweep — so this is the single place that can stop
+    // two builds racing on the same profile document. Two overlapping builds
+    // both write the full aiSummaryMeta and aiSummaryPrevious, so the loser's
+    // text wins at random and the operator sees a summary that ignores the
+    // change they just made.
+    const startedAt = new Date();
+    const staleCutoff = new Date(startedAt.getTime() - BUILD_STALE_MS);
+    const claimed = await ProfileModel.findOneAndUpdate(
+      {
+        _id: profile._id,
+        $or: [
+          { "aiSummaryMeta.status": { $ne: "building" } },
+          { "aiSummaryMeta.buildStartedAt": null },
+          { "aiSummaryMeta.buildStartedAt": { $exists: false } },
+          { "aiSummaryMeta.buildStartedAt": { $lt: staleCutoff } },
+        ],
+      },
+      {
+        $set: {
+          "aiSummaryMeta.status": "building",
+          "aiSummaryMeta.buildStartedAt": startedAt,
+          "aiSummaryMeta.lastError": null,
+        },
+      },
+      { new: false, lean: true },
+    );
+    if (!claimed) {
+      // Record that a rebuild was wanted DURING the running build. Without
+      // this the in-flight build (which started before this change existed)
+      // clears summaryStale on success and the change — a removal reason, a
+      // freshly attached resume — never reaches the brief.
+      const running = await ProfileModel.findOneAndUpdate(
+        { _id: profile._id },
+        { $set: { summaryStale: true, summaryRebuildRequestedAt: startedAt } },
+        { new: true, lean: true },
+      ).select({ "aiSummaryMeta.buildStartedAt": 1 });
+      console.log(`[BuildAiSummary] build already in progress email=${email} reason=${reasonTag} — skipping duplicate`);
+      return {
+        success: false,
+        skipped: true,
+        status: 202,
+        error: "BUILD_IN_PROGRESS",
+        message: "A build is already running for this client.",
+        step: "claim",
+        buildStartedAt: running?.aiSummaryMeta?.buildStartedAt || null,
+      };
+    }
+
+    // runForProfileCore persists the whole aiSummaryMeta object, so hand it
+    // the claim we just wrote — otherwise it would restore the PREVIOUS
+    // buildStartedAt and the staleness maths would be wrong on the next run.
+    profile.aiSummaryMeta = { ...(profile.aiSummaryMeta || {}), status: "building", buildStartedAt: startedAt };
+
+    let result;
+    try {
+      result = await runForProfileCore(profile, effectiveKey, reasonTag, startedAt.getTime() + BUILD_BUDGET_MS);
+    } catch (err) {
+      result = { success: false, status: 500, error: "INTERNAL", message: err?.message || String(err), step: "internal" };
+    }
+    // runForProfileCore writes status:"done" itself on success. Every failure
+    // path returns early without touching the document, so release the claim
+    // here — otherwise the profile stays "building" until BUILD_STALE_MS and
+    // the UI spins on a build that is already dead.
+    if (!result?.success) {
+      await ProfileModel.updateOne(
+        { _id: profile._id },
+        {
+          $set: {
+            "aiSummaryMeta.status": "error",
+            "aiSummaryMeta.lastAttemptAt": new Date(),
+            "aiSummaryMeta.lastError": {
+              error: result?.error || "UNKNOWN",
+              message: result?.message || "",
+              step: result?.step || "",
+            },
+          },
+        },
+      ).catch(() => {});
+      console.error(
+        `[BuildAiSummary] build failed email=${email} reason=${reasonTag} error=${result?.error} step=${result?.step} msg=${result?.message}`,
+      );
+    }
+    return result;
   } catch (err) {
     console.error("buildSummaryForEmail fatal:", err);
     return { success: false, status: 500, error: "INTERNAL", message: err.message, step: "internal" };
   }
 }
 
+// runBuildInBackground — kick off buildSummaryForEmail without holding the
+// HTTP request open. buildSummaryForEmail owns the whole build lifecycle
+// (claim → status:"done" on success, status:"error" + lastError on failure),
+// so there is nothing to write here; this only logs the outcome.
+async function runBuildInBackground(email, reasonTag) {
+  try {
+    const result = await buildSummaryForEmail(email, reasonTag);
+    if (result?.success) {
+      console.log(`[BuildAiSummary] background build ok email=${email} words=${result.wordCount} source=${result.source}`);
+    } else if (result?.skipped) {
+      console.log(`[BuildAiSummary] background build skipped email=${email} — ${result.error}`);
+    }
+  } catch (err) {
+    // buildSummaryForEmail already catches everything; this is belt-and-braces
+    // so an unhandled rejection can never take the process down.
+    console.error(`[BuildAiSummary] background build threw email=${email}:`, err);
+  }
+}
+
+// POST /build-ai-summary  { email }
+// Returns 202 immediately and builds in the background — the full build is
+// 90-150s (resume fetch + two OpenAI passes), longer than Cloudflare's ~100s
+// origin timeout, so a synchronous response reliably 502s. The clients-tracking
+// AI Summary page polls GET /ai-summary-status until status leaves "building"
+// AND builtAt catches up to the `buildStartedAt` returned here.
 export default async function BuildAiSummary(req, res) {
   const { email } = req.body || {};
-  const result = await buildSummaryForEmail(email);
-  const { status = result.success ? 200 : 500, ...payload } = result;
-  return res.status(status).json(payload);
+  if (!email || typeof email !== "string" || !email.includes("@")) {
+    return res.status(400).json({ success: false, error: "BAD_INPUT", message: "email is required", step: "validate" });
+  }
+  // Case-insensitive, same as every other summary consumer — an exact-match
+  // lookup 404s on legacy mixed-case profile rows that build fine everywhere
+  // else.
+  const profile = await resolveProfileByEmail(email, { _id: 1, email: 1, aiSummaryMeta: 1 });
+  if (!profile) {
+    return res.status(404).json({ success: false, error: "PROFILE_NOT_FOUND", message: `No profile in DB for ${email}`, step: "loading-profile" });
+  }
+
+  // Informational only — the real guard is the atomic claim inside
+  // buildSummaryForEmail, which also covers builds started by the auto
+  // triggers (job removal, resume attach, profile save, cron sweep).
+  const meta = profile.aiSummaryMeta || {};
+  const startedAt = meta.buildStartedAt ? new Date(meta.buildStartedAt).getTime() : 0;
+  const alreadyRunning = meta.status === "building" && startedAt > 0 && Date.now() - startedAt < BUILD_STALE_MS;
+
+  // Timestamp handed back to the poller. Taken BEFORE the build is fired, so
+  // it can never be later than the claim's buildStartedAt — the poller uses it
+  // to reject a "done" left over from an earlier build.
+  const requestedAt = new Date();
+
+  // Fire and forget — do NOT await.
+  runBuildInBackground(profile.email || String(email).toLowerCase(), "manual");
+
+  return res.status(202).json({
+    success: true,
+    status: "building",
+    alreadyRunning,
+    buildStartedAt: (alreadyRunning ? new Date(startedAt) : requestedAt).toISOString(),
+    requestedAt: requestedAt.toISOString(),
+    message: alreadyRunning
+      ? "A build is already in progress for this client."
+      : "Build started. Poll /ai-summary-status for completion.",
+  });
+}
+
+// GET /ai-summary-status?email=
+// Lightweight poll target for the clients-tracking AI Summary page.
+export async function AiSummaryStatus(req, res) {
+  const email = (req.query?.email || "").toString();
+  if (!email || !email.includes("@")) {
+    return res.status(400).json({ success: false, error: "BAD_INPUT", message: "email query param is required" });
+  }
+  const profile = await resolveProfileByEmail(email, {
+    email: 1, aiSummary: 1, aiSummaryMeta: 1, summaryStale: 1,
+  });
+  if (!profile) {
+    return res.status(404).json({ success: false, error: "PROFILE_NOT_FOUND", message: `No profile in DB for ${email}` });
+  }
+  const meta = profile.aiSummaryMeta || {};
+  let status = meta.status || (meta.builtAt ? "done" : "idle");
+  // Treat a build that started too long ago with no result as dead so the UI
+  // stops spinning forever after a mid-build process restart. BUILD_STALE_MS
+  // sits above BUILD_BUDGET_MS, so a build that is still legitimately running
+  // never trips this.
+  const startedAt = meta.buildStartedAt ? new Date(meta.buildStartedAt).getTime() : 0;
+  if (status === "building" && startedAt && Date.now() - startedAt > BUILD_STALE_MS) {
+    status = "error";
+    // Persist it — otherwise the document stays "building" forever and every
+    // other reader of aiSummaryMeta.status keeps showing a build that died.
+    ProfileModel.updateOne(
+      { email: profile.email },
+      {
+        $set: {
+          "aiSummaryMeta.status": "error",
+          "aiSummaryMeta.lastError": {
+            error: "BUILD_ABANDONED",
+            message: "Build did not finish — the server most likely restarted mid-build.",
+            step: "background",
+          },
+        },
+      },
+    ).catch(() => {});
+  }
+  return res.status(200).json({
+    success: true,
+    status,
+    builtAt: meta.builtAt || null,
+    buildStartedAt: meta.buildStartedAt || null,
+    lastError: status === "error" && !meta.lastError
+      ? { error: "BUILD_ABANDONED", message: "Build did not finish — the server most likely restarted mid-build.", step: "background" }
+      : meta.lastError || null,
+    wordCount: meta.wordCount || 0,
+    source: meta.source || "",
+    model: meta.model || "",
+    summaryStale: !!profile.summaryStale,
+    aiSummary: profile.aiSummary || "",
+    aiSummaryMeta: meta,
+  });
 }
 
 function escapeRegex(s) {
   return String(s).replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+}
+
+// ── Structural contract ────────────────────────────────────────────────────
+// These six headers are not cosmetic. Three separate consumers pattern-match
+// them and ALL of them fail silently when one goes missing:
+//   • ensureBulletInSection() below returns the text untouched when the header
+//     isn't found, so both deterministic enforce passes become no-ops.
+//   • jr-direct-extension/background.js → extractSummarySkipPhrases() matches
+//     /#+\s*Hard Disqualifiers/ and returns [] on a miss, dropping every
+//     auto-skip the brief was supposed to carry.
+//   • clients-tracking → ClientAiSummary.jsx renders per-# section.
+// The model is told to emit them verbatim (SYSTEM_PROMPT rule 5), but nothing
+// verified it until now — a malformed brief was persisted and shipped to the
+// grader with no log line anywhere.
+const REQUIRED_SECTIONS = [
+  "# Candidate Summary",
+  "# Target Roles",
+  "# Hard Constraints",
+  "# Strong Signals",
+  "# Hard Disqualifiers",
+  "# Notes for Grader",
+];
+
+// missingSections — which required headers a brief does NOT contain. Prefix
+// match, so the parenthetical suffixes ("# Strong Signals (auto-PICK if
+// matched)") still count as present.
+export function missingSections(text) {
+  const heads = String(text || "")
+    .split("\n")
+    .filter((l) => /^\s*#\s/.test(l))
+    .map((l) => l.trim().toLowerCase());
+  return REQUIRED_SECTIONS.filter(
+    (want) => !heads.some((h) => h.startsWith(want.toLowerCase())),
+  );
+}
+
+// ensureRequiredSections — append any REQUIRED_SECTIONS header the brief is
+// missing, each with a single placeholder bullet. The model sometimes omits
+// sections it judges "empty" (sparse profile, no notes, no removal feedback)
+// despite the prompt. Rather than hard-fail the whole build, we backfill so
+// the six-header contract the grader + JR-direct extension depend on always
+// holds. Deterministic, no LLM call.
+export function ensureRequiredSections(text) {
+  const missing = missingSections(text);
+  if (!missing.length) return String(text || "").trimEnd();
+  const missingSet = new Set(missing);
+  // Split the brief into "everything before the first # header" + one block
+  // per header, then rebuild in REQUIRED_SECTIONS order with the placeholders
+  // slotted into place. Appending them at the end instead would render
+  // e.g. "# Hard Constraints" below "# Notes for Grader" in clients-tracking.
+  const lines = String(text || "").split("\n");
+  const preamble = [];
+  const blocks = []; // { key, lines }
+  let current = null;
+  for (const line of lines) {
+    if (/^\s*#\s/.test(line)) {
+      current = { key: line.trim().toLowerCase(), lines: [line] };
+      blocks.push(current);
+      continue;
+    }
+    (current ? current.lines : preamble).push(line);
+  }
+  const placeholder = (header) => [header, "- None specified."];
+  const ordered = [];
+  const used = new Set();
+  for (const want of REQUIRED_SECTIONS) {
+    if (missingSet.has(want)) {
+      ordered.push(placeholder(want));
+      continue;
+    }
+    const idx = blocks.findIndex((b, i) => !used.has(i) && b.key.startsWith(want.toLowerCase()));
+    if (idx !== -1) {
+      used.add(idx);
+      ordered.push(blocks[idx].lines);
+    }
+  }
+  // Anything the model added on top of the six required headers keeps its
+  // content and lands after them rather than being dropped.
+  blocks.forEach((b, i) => { if (!used.has(i)) ordered.push(b.lines); });
+  const body = ordered
+    .map((blk) => blk.join("\n").replace(/\s+$/, ""))
+    .join("\n\n");
+  const head = preamble.join("\n").trim();
+  return (head ? `${head}\n\n${body}` : body).trimEnd();
 }
 
 // enforceRemovalDirectives — deterministic backstop for removal feedback,
@@ -1215,15 +1598,35 @@ function escapeRegex(s) {
 // # Hard Disqualifiers — regardless of what the model emitted. This is what
 // makes company rejection 100% reliable; the prompt handles the softer
 // pattern-level signals (role family, seniority, location, salary).
-function enforceRemovalDirectives(summary, profile) {
+function enforceRemovalDirectives(summary, profile, lockedSections = []) {
   const bullets = deterministicRemovalBullets(profile);
   if (!bullets.length) return summary;
   const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   let out = summary;
   for (const b of bullets) {
+    if (isLockedHeader(b.header, lockedSections)) continue; // operator owns it
     out = ensureBulletInSection(out, b.header, b.needle, b.bullet, norm);
   }
   return out;
+}
+
+// isLockedHeader — does `headerPrefix` ("# Hard Disqualifiers") name a section
+// the operator locked? lockedSections stores headers WITHOUT the leading "# "
+// and WITH the parenthetical suffix ("Hard Disqualifiers (auto-SKIP if
+// matched)"), so compare on the normalised prefix from both ends.
+//
+// Locked means "AI must not touch this". mergeWithLocks honours that, but the
+// enforce passes below run AFTER the merge and used to write into locked
+// sections anyway — and because ClientAiSummary.jsx paints every line in a
+// locked section as 'Operator', the injected bullet then read as if the
+// operator had authored it.
+function isLockedHeader(headerPrefix, lockedSections) {
+  const want = String(headerPrefix).replace(/^#\s*/, "").trim().toLowerCase();
+  if (!want) return false;
+  return (Array.isArray(lockedSections) ? lockedSections : []).some((h) => {
+    const got = String(h || "").replace(/^#\s*/, "").trim().toLowerCase();
+    return got.startsWith(want) || want.startsWith(got);
+  });
 }
 
 // enforceNoteDirectives — deterministic "round 2": after the LLM writes the
@@ -1231,7 +1634,7 @@ function enforceRemovalDirectives(summary, profile) {
 // reflected with the correct polarity (SCRAP→Strong Signals priority,
 // SKIP→Hard Disqualifiers), and strip the malformed "[— operator priority]"
 // tag the model sometimes emits. ponytail: code, not a 2nd OpenAI call.
-function enforceNoteDirectives(summary, notesText) {
+function enforceNoteDirectives(summary, notesText, lockedSections = []) {
   if (!notesText) return summary;
   const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   // Strip the literal "[— operator priority]" / "[— operator allows]" artifact.
@@ -1243,8 +1646,10 @@ function enforceNoteDirectives(summary, notesText) {
     const text = m[2].replace(/^(?:do\s*not\s+scrap|don'?t\s+scrap|never\s+scrap|scrap|skip)\s+/i, "").trim();
     if (!text) continue;
     if (/^scrap$/i.test(m[1])) {
+      if (isLockedHeader("# Strong Signals", lockedSections)) continue;
       out = ensureBulletInSection(out, "# Strong Signals", text, `- ${text} — operator priority`, norm);
     } else {
+      if (isLockedHeader("# Hard Disqualifiers", lockedSections)) continue;
       // A conditional / full-sentence rule ("If in job title, ... do not
       // scrap them") reads wrong with a "Skip " prefix bolted on — render
       // it verbatim as its own rule bullet instead.
@@ -1273,11 +1678,27 @@ function ensureBulletInSection(summary, headerPrefix, needle, bullet, norm) {
   return lines.join("\n");
 }
 
-async function runForProfileCore(profile, apiKey, reasonTag = "manual") {
+async function runForProfileCore(profile, apiKey, reasonTag = "manual", deadlineAt = 0) {
   const email = profile.email;
+  // When this build claimed the profile — used at persist time to tell whether
+  // another trigger asked for a rebuild while this one was running.
+  const buildStartedMs = profile?.aiSummaryMeta?.buildStartedAt
+    ? new Date(profile.aiSummaryMeta.buildStartedAt).getTime()
+    : 0;
   const resumeRes = await fetchResume(email);
   const resume = resumeRes.ok ? resumeRes.resume : null;
   const source = resume ? "profile+resume" : "profile-only";
+  // "No resume assigned" (404) is a legitimate profile-only build. A network
+  // error or 5xx from the resume API is NOT — it produces a materially weaker
+  // brief that is indistinguishable from the legitimate case in the UI ("Built
+  // from Profile only"). Flag it, and leave summaryStale set at the end so the
+  // 30-min sweep rebuilds with the resume once the API recovers.
+  const resumeFetchFailed = !resumeRes.ok && resumeRes.error !== "NO_RESUME";
+  if (resumeFetchFailed) {
+    console.error(
+      `[BuildAiSummary] resume fetch FAILED email=${email} error=${resumeRes.error} msg=${resumeRes.message} — building profile-only and leaving summaryStale=true for retry`,
+    );
+  }
 
   // FRESH BUILD EVERY TIME — never feed the previous summary back into the
   // prompt. Old behaviour was diff-aware ("preserve voice, only edit
@@ -1303,7 +1724,48 @@ async function runForProfileCore(profile, apiKey, reasonTag = "manual") {
   // No fallback; if OpenAI fails the build fails loudly so the operator
   // knows to fix the key / retry, instead of silently degrading.
   const overlayForPrompt = profile?.aiSummaryOverlay || null;
-  const ai = await callOpenAI(profile, resume, existingSummary, profileDiff, apiKey, overlayForPrompt);
+  // gpt-4o-mini intermittently drops one or more of the six required headers
+  // from round 1 (observed: only "# Candidate Summary" + "# Target Roles"
+  // emitted). That is a stochastic instruction-following miss, not a profile
+  // problem — a plain reroll with an explicit "you omitted X" nudge almost
+  // always produces a well-formed brief. Try up to MAX_ROUND1_ATTEMPTS times
+  // before failing with MALFORMED_SUMMARY.
+  const MAX_ROUND1_ATTEMPTS = 3;
+  let ai = null;
+  let round1Missing = [];
+  let round1Raw = "";
+  for (let attempt = 1; attempt <= MAX_ROUND1_ATTEMPTS; attempt++) {
+    // Only reroll while there is room for a full attempt AND the notes pass
+    // that follows it. Without this the retries can eat the entire build
+    // budget and the brief never gets persisted at all.
+    if (attempt > 1 && msLeft(deadlineAt) < 2 * OPENAI_TIMEOUT_MS) {
+      console.warn(
+        `[BuildAiSummary] round-1 reroll skipped (budget ${Math.round(msLeft(deadlineAt) / 1000)}s left) email=${profile.email}`,
+      );
+      break;
+    }
+    const hint = round1Missing.length
+      ? `\n\nCRITICAL: your previous attempt OMITTED required section(s): ${round1Missing.join(", ")}. `
+        + `Re-emit the FULL brief now with ALL SIX headers, each on its own line, exactly as: `
+        + `"# Candidate Summary", "# Target Roles", "# Hard Constraints", "# Strong Signals", `
+        + `"# Hard Disqualifiers", "# Notes for Grader". Do not skip any header even if a section would be short.`
+      : "";
+    ai = await callOpenAI(profile, resume, existingSummary, profileDiff, apiKey, overlayForPrompt, hint, deadlineAt);
+    if (!ai.ok) break; // network/HTTP error — handled below, no point rerolling
+    round1Raw = (ai.summary || "")
+      .replace(/^\s*<{2,}[^<>]*>{2,}\s*$/gm, "")
+      .trim();
+    round1Missing = missingSections(round1Raw);
+    if (!round1Missing.length) {
+      if (attempt > 1) {
+        console.log(`[BuildAiSummary] round-1 well-formed on attempt ${attempt} email=${profile.email}`);
+      }
+      break;
+    }
+    console.warn(
+      `[BuildAiSummary] round-1 attempt ${attempt}/${MAX_ROUND1_ATTEMPTS} malformed email=${profile.email} missing=${round1Missing.join(", ")}`,
+    );
+  }
   const usedModel = OPENAI_MODEL;
   let usedSource = `${source}+openai`;
   // Append the trigger origin so the AI Summaries dashboard / logs show whether
@@ -1314,10 +1776,20 @@ async function runForProfileCore(profile, apiKey, reasonTag = "manual") {
   } else if (reasonTag === "manual") {
     usedSource = `${usedSource} [manual]`;
   }
+  // Make the degraded build visible in the AI Summaries UI rather than letting
+  // it read as a normal profile-only client.
+  if (resumeFetchFailed) usedSource = `${usedSource} [resume-fetch-failed:${resumeRes.error}]`;
   if (!ai.ok) {
     return { success: false, status: 502, error: ai.error, message: ai.message, step: "openai" };
   }
-  let summary = (ai.summary || "").slice(0, MAX_SUMMARY_CHARS);
+  // Strip any whole-line <<<MARKER>>> the model echoed back from the prompt
+  // fences. applyNotesPass already does this for round 2, but it returns early
+  // when there are no notes and no removal directives — so without this a
+  // no-notes client could keep an echoed marker in their persisted brief.
+  let summary = (round1Raw || ai.summary || "")
+    .replace(/^\s*<{2,}[^<>]*>{2,}\s*$/gm, "")
+    .trim()
+    .slice(0, MAX_SUMMARY_CHARS);
   if (!summary) {
     return { success: false, status: 502, error: "EMPTY_SUMMARY", message: "OpenAI returned empty content", step: "openai" };
   }
@@ -1328,7 +1800,26 @@ async function runForProfileCore(profile, apiKey, reasonTag = "manual") {
   // aiSummaryMeta so the UI can colour-tint each line by source.
   const provExtract = extractProvenance(summary, { noResume: !resume });
   summary = provExtract.cleanText;
-  let aiProvenance = provExtract.provenance;
+  // provIndex is content-keyed, so it survives every rewrite below. The
+  // positional map the UI consumes is re-derived from the FINAL text at the
+  // end of this function — deriving it here would leave the colour codes
+  // pointing at the wrong lines the moment anything inserts a bullet.
+  const provIndex = provExtract.index;
+  // Round 1 must already carry the six required headers. If it doesn't, the
+  // enforce passes and the extension's skip matcher are both no-ops, so fail
+  // loudly instead of persisting a brief that silently grades on nothing.
+  const missingRound1 = missingSections(summary);
+  if (missingRound1.length) {
+    // The retry loop above already gave the model MAX_ROUND1_ATTEMPTS tries.
+    // If headers are STILL missing, backfill them with a placeholder bullet
+    // instead of failing the build — a persisted brief with an empty section
+    // is far better than no brief at all, and the 6-header contract stays
+    // intact for the grader + extension skip matcher.
+    console.warn(
+      `[BuildAiSummary] round-1 still missing ${missingRound1.join(", ")} after ${MAX_ROUND1_ATTEMPTS} attempts email=${profile.email} — backfilling placeholders`,
+    );
+    summary = ensureRequiredSections(summary.slice(0, MAX_SUMMARY_CHARS));
+  }
   // Round 2 (LLM): re-apply the operator notes AND the pre-resolved removal
   // directives so every directive is reflected with correct polarity. The
   // deterministic enforce* passes below are the guarantee if this misses.
@@ -1338,7 +1829,23 @@ async function runForProfileCore(profile, apiKey, reasonTag = "manual") {
       return resolveEntryDirectives(entry).map((d) => `${label ? `[${label}] ` : ""}${d}`);
     })
     .join("\n");
-  summary = (await applyNotesPass(summary, (profile?.aiNotes?.text || "").trim(), apiKey, removalDirectivesText)).slice(0, MAX_SUMMARY_CHARS);
+  const beforeNotesPass = summary;
+  summary = (await applyNotesPass(summary, (profile?.aiNotes?.text || "").trim(), apiKey, removalDirectivesText, deadlineAt)).slice(0, MAX_SUMMARY_CHARS);
+  // The notes pass rewrites the WHOLE brief. If its rewrite dropped a required
+  // section, keep round 1 — a brief that lost # Hard Disqualifiers grades with
+  // no auto-skips at all, which is worse than one missing a note directive
+  // (the deterministic enforce passes below still re-apply those).
+  const missingAfterNotes = missingSections(summary);
+  if (missingAfterNotes.length) {
+    console.warn(
+      `[BuildAiSummary] notes pass dropped section(s) ${missingAfterNotes.join(", ")} email=${profile.email} — reverting to round-1 brief`,
+    );
+    summary = beforeNotesPass;
+  }
+  // round-1 itself may have been backfilled with placeholders above; if the
+  // revert still leaves anything missing, backfill again so we can't ship a
+  // brief with fewer than six headers.
+  summary = ensureRequiredSections(summary.slice(0, MAX_SUMMARY_CHARS));
   // Apply operator's saved format overlay: if enabled, re-inject any bullets
   // the operator added on top of the previous build + replace any
   // locked-section bodies verbatim. Pure AI output if no overlay or overlay
@@ -1347,6 +1854,13 @@ async function runForProfileCore(profile, apiKey, reasonTag = "manual") {
   const overlay = profile?.aiSummaryOverlay || {};
   let overlayStats = null;
   let lockCount = 0;
+  // Locks only bind when the overlay is actually enabled with saved text —
+  // that is the only path where mergeWithLocks runs, so it is also the only
+  // case where the enforce passes must hold off.
+  const activeLocks =
+    overlay.enabled && overlay.savedText && Array.isArray(overlay.lockedSections)
+      ? overlay.lockedSections
+      : [];
   if (overlay.enabled && overlay.savedText) {
     const locks = Array.isArray(overlay.lockedSections) ? overlay.lockedSections : [];
     lockCount = locks.length;
@@ -1367,10 +1881,21 @@ async function runForProfileCore(profile, apiKey, reasonTag = "manual") {
   }
   // Round 2 (deterministic): guarantee every SKIP:/SCRAP: operator-note line is
   // present with the right polarity, regardless of what the LLM emitted.
-  summary = enforceNoteDirectives(summary, (profile?.aiNotes?.text || "").trim()).slice(0, MAX_SUMMARY_CHARS);
+  summary = enforceNoteDirectives(summary, (profile?.aiNotes?.text || "").trim(), activeLocks).slice(0, MAX_SUMMARY_CHARS);
   // Round 3 (deterministic): guarantee every company-rejecting removal
   // feedback entry produced its "Skip <Company> jobs." disqualifier.
-  summary = enforceRemovalDirectives(summary, profile).slice(0, MAX_SUMMARY_CHARS);
+  summary = enforceRemovalDirectives(summary, profile, activeLocks).slice(0, MAX_SUMMARY_CHARS);
+  // Final structural check — the overlay merge can drop a section too (a saved
+  // overlay from an older prompt version, a lock whose body was emptied).
+  const missingFinal = missingSections(summary);
+  if (missingFinal.length) {
+    console.warn(
+      `[BuildAiSummary] FINAL brief missing section(s) ${missingFinal.join(", ")} email=${profile.email} — backfilling placeholders before persist`,
+    );
+    summary = ensureRequiredSections(summary.slice(0, MAX_SUMMARY_CHARS));
+  }
+  // Now that the text is final, derive the positional provenance the UI reads.
+  const aiProvenance = provenanceForText(summary, provIndex);
   const wordCount = summary.trim().split(/\s+/).filter(Boolean).length;
 
   const builtAt = new Date();
@@ -1399,12 +1924,33 @@ async function runForProfileCore(profile, apiKey, reasonTag = "manual") {
           provenance: aiProvenance || null,
           builtInputs,
           temperature: SUMMARY_TEMPERATURE,
+          lastAttemptAt: builtAt,
+          status: "done",
+          buildStartedAt: profile?.aiSummaryMeta?.buildStartedAt || null,
+          lastError: null,
         },
-        summaryStale: false,
+        // Stay stale when the resume API failed, so the cron sweep retries and
+        // upgrades this profile-only brief once the resume is reachable again.
+        summaryStale: resumeFetchFailed,
       },
     },
     { new: true, lean: true },
   );
+
+  // A trigger that fired while this build was running was skipped as a
+  // duplicate, so this brief does not reflect whatever changed. Keep the
+  // profile stale and let the 30-min sweep rebuild it.
+  const requestedDuringBuild = updated?.summaryRebuildRequestedAt
+    && buildStartedMs
+    && new Date(updated.summaryRebuildRequestedAt).getTime() > buildStartedMs;
+  if (requestedDuringBuild && !resumeFetchFailed) {
+    console.log(`[BuildAiSummary] rebuild was requested mid-build email=${profile.email} — leaving summaryStale=true for the sweep`);
+    await ProfileModel.updateOne({ _id: profile._id }, { $set: { summaryStale: true } }).catch(() => {});
+  } else if (updated?.summaryRebuildRequestedAt) {
+    // This build started after the request, so it already reflects it. Clear
+    // the flag or the sweeper's cooldown exemption would fire forever.
+    await ProfileModel.updateOne({ _id: profile._id }, { $set: { summaryRebuildRequestedAt: null } }).catch(() => {});
+  }
 
   return {
     success: true,

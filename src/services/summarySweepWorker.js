@@ -49,7 +49,12 @@ async function findCandidates() {
                         { "aiSummaryMeta.lastAttemptAt": { $lt: failedCutoff } },
                         // Successful builds reset summaryStale, so any stale-true
                         // row with a recent timestamp implies failure; cooldown
-                        // skips it.
+                        // skips it. One exception: a rebuild requested WHILE a
+                        // build was running is skipped as a duplicate, so the
+                        // finished brief never saw that change. That row is
+                        // deliberately left stale right after a successful
+                        // build, and the cooldown must not hide it for 2h.
+                        { $expr: { $gt: ["$summaryRebuildRequestedAt", "$aiSummaryMeta.builtAt"] } },
                     ],
                 },
             ],
@@ -109,12 +114,16 @@ async function sweepOnce() {
             return buildSummaryForEmail(email, "cron-sweep");
         });
         const ok = results.filter((r) => r.ok && r.r?.success).length;
-        const fail = results.length - ok;
-        console.log(`[summary-sweep] tick done — ok=${ok} fail=${fail} elapsedMs=${Date.now() - startedAt}`);
+        // A profile already being built by another trigger (Build button, job
+        // removal, resume attach) is skipped by buildSummaryForEmail's claim,
+        // not failed — it stays stale and the next tick picks it up.
+        const skipped = results.filter((r) => r.ok && r.r?.skipped).length;
+        const fail = results.length - ok - skipped;
+        console.log(`[summary-sweep] tick done — ok=${ok} skipped=${skipped} fail=${fail} elapsedMs=${Date.now() - startedAt}`);
         if (fail > 0) {
             // Surface first few failures so ops sees what's wrong without
             // tailing the entire log.
-            const sample = results.filter((r) => !(r.ok && r.r?.success)).slice(0, 5);
+            const sample = results.filter((r) => !(r.ok && (r.r?.success || r.r?.skipped))).slice(0, 5);
             for (const s of sample) {
                 console.warn(`[summary-sweep] fail email=${s.item.email} err=${s.r?.error || s.error}`);
             }

@@ -1,4 +1,5 @@
 import { UserModel } from "../Schema_Models/UserModel.js";
+import { creditReferralOnPlan } from "../Utils/referralCredit.js";
 
 function normalizePortfolioUrl(raw) {
   let url = (raw || "").trim();
@@ -283,6 +284,16 @@ export default async function PlanSelect(req, res) {
       if (pushOps.coverLetters && normCover?.url) {
         syncDoc('coverLetter', normCover.url, normCover.name || 'cover letter');
       }
+    }
+
+    // Fire-and-forget: if this save put the client on a paid plan and they
+    // named a referrer at onboarding, credit that referrer their bonus
+    // applications. Idempotent, so re-saving a plan cannot pay twice, and it
+    // never rejects - a referral problem must not fail a plan update.
+    if (typeof planType !== "undefined") {
+      creditReferralOnPlan(userDetails.email).catch((e) =>
+        console.warn("[referralCredit]", e?.message || e),
+      );
     }
 
     return res.status(200).json({

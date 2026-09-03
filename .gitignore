@@ -83,3 +83,10 @@ env.example
 
 # Vertex AI service-account key (secret — never commit)
 flashfire-466710-*.json
+
+
+# Rendered reminder previews from scripts/verify-client-reminders.mjs --render.
+# These contain real client names and job titles; never commit them.
+tmp-reminder-preview/
+/docs
+/tmp-reminder-preview

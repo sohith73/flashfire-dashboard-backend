@@ -144,8 +144,9 @@ console.log("\n[3] notifyMailDigest — real multipart upload vs stub Discord");
     res.end();
   });
 
-  process.env.DISCORD_MAIL_WEBHOOK_URL = `${url}/webhook`;
-  process.env.GMAIL_RECONNECT_URL = "https://dash.flashfire.io/inbox";
+  // The webhook is hard-coded in the module; override it to the local stub so
+  // NOTHING reaches the real Discord channel. Must be set before first import.
+  process.env.ONE_MAIN_DISCORD_FOR_MAIL_NOTIFICATIONS = `${url}/webhook`;
   const { notifyMailDigest, notifyGmailAuthError, isGmailAuthError } =
     await import(`../Utils/discordMailNotify.js`);
 
@@ -251,7 +252,7 @@ console.log("\n[3] notifyMailDigest — real multipart upload vs stub Discord");
   ok("auth embed names the client", af.includes("Priya Sharma"));
   ok("auth embed names the mailbox", af.includes("priya.jobs@gmail.com"));
   ok("auth embed carries the raw error", af.includes("invalid_grant"));
-  ok("auth embed has reconnect deep link", af.includes("dash.flashfire.io/inbox"));
+  ok("auth embed has reconnect deep link", af.includes("portal.flashfirejobs.com/inbox"));
 
   srv.close();
 }
@@ -287,12 +288,14 @@ console.log("\n[3b] Error classification — quota 403 must NOT look like a dead
   ok("incidental '512' in prose → still auth when invalid_grant present", isGmailAuthError("invalid_grant after 512 bytes"));
 }
 
-console.log("\n[4] Discord unconfigured → graceful, never throws");
+console.log("\n[4] Unreachable webhook → fail-soft, never throws");
 {
-  delete process.env.DISCORD_MAIL_WEBHOOK_URL;
+  // The webhook is hard-coded, so it can never be "unconfigured"; instead point
+  // it at an unreachable address and confirm a post fails soft (ok:false, no throw).
+  process.env.ONE_MAIN_DISCORD_FOR_MAIL_NOTIFICATIONS = "http://127.0.0.1:1/never";
   const mod = await import(`../Utils/discordMailNotify.js?nocache=${Date.now()}`);
   const r = await mod.notifyMailDigest({ client: {}, mailbox: "a@b.c", digest: { subject: "s", date: new Date() } });
-  ok("returns not-ok instead of throwing", r.ok === false && r.error === "webhook_not_configured", JSON.stringify(r));
+  ok("returns not-ok instead of throwing", r.ok === false && !!r.error, JSON.stringify(r));
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"} — ${pass} passed, ${fail} failed\n`);

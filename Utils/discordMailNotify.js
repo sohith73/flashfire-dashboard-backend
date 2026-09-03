@@ -11,20 +11,52 @@
 // must never break the poll worker; undelivered digests are retried next tick
 // because MailDigest.discordPostedAt stays null.
 //
-// Posting goes to a single webhook (DISCORD_MAIL_WEBHOOK_URL). Client identity
-// lives in the embed, not in the channel name.
+// ONE channel handles everything mail-related: per-mail digests, milestone
+// reminders, "please connect your mail" nudges, dead-token alerts, and the
+// daily 5am summary. Hard-coded here (per request) so it works with no env;
+// ONE_MAIN_DISCORD_FOR_MAIL_NOTIFICATIONS can override it for rotation.
+const MAIL_WEBHOOK =
+  process.env.ONE_MAIN_DISCORD_FOR_MAIL_NOTIFICATIONS ||
+  "https://discord.com/api/webhooks/1535172893590294579/hJQzqUbV_vmreWWdQrNoXS3Z3tMTqMIxZeZ9i9LmHVpewgGyxb858MBb0TIbgNyH7Em7";
+const ERROR_WEBHOOK = MAIL_WEBHOOK;
 
-const MAIL_WEBHOOK = process.env.DISCORD_MAIL_WEBHOOK_URL || "";
-const ERROR_WEBHOOK = process.env.DISCORD_MAIL_ERROR_WEBHOOK_URL || MAIL_WEBHOOK;
-// Optional "<@&123>" role ping prepended to auth-error posts.
-const ALERT_MENTION = process.env.DISCORD_MAIL_ALERT_MENTION || "";
+// Deep link shown in connect / reconnect alerts.
+const RECONNECT_URL = "https://portal.flashfirejobs.com/inbox";
 
-// Discord's classic per-message upload ceiling for non-boosted guilds is 8 MiB.
-// Stay under it with margin for the multipart envelope + payload_json.
-const MAX_UPLOAD_BYTES = Number(process.env.MAIL_DISCORD_MAX_UPLOAD_BYTES) || 7_500_000;
+/** The single mail-notifications webhook. */
+export function mailNotifyWebhook() {
+  return MAIL_WEBHOOK;
+}
+
+/**
+ * Confirm the webhook is valid + reachable WITHOUT posting a message: a GET on a
+ * Discord webhook returns its object (200), no message sent. Used by the health route.
+ * @returns {Promise<{ok: boolean, channelId?: string|null, status?: number, error?: string}>}
+ */
+export async function verifyWebhook() {
+  if (!MAIL_WEBHOOK) return { ok: false, error: "no_webhook_configured" };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(MAIL_WEBHOOK, { method: "GET", signal: ctrl.signal });
+    if (res.ok) {
+      const j = await res.json().catch(() => ({}));
+      return { ok: true, channelId: j.channel_id || null };
+    }
+    return { ok: false, status: res.status, error: `discord_http_${res.status}` };
+  } catch (e) {
+    return { ok: false, error: e?.name === "AbortError" ? "timed_out" : String(e?.message || e).slice(0, 200) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const ALERT_MENTION = ""; // no role ping
+// Discord's per-message upload ceiling for non-boosted guilds is 8 MiB; stay
+// under it with margin for the multipart envelope + payload_json.
+const MAX_UPLOAD_BYTES = 7_500_000;
 const MAX_FILES = 10;
-
-const POST_TIMEOUT_MS = Number(process.env.MAIL_DISCORD_TIMEOUT_MS) || 15000;
+const POST_TIMEOUT_MS = 15000;
 const MAX_ATTEMPTS = 3;
 
 // ─── Discord field/embed length caps ────────────────────────────────
@@ -389,7 +421,7 @@ export async function notifyMailDigest({ client = {}, mailbox, digest = {}, file
  * @param {Date}   [a.since] - when the account first started failing
  */
 export async function notifyGmailAuthError({ client = {}, mailbox, error, since } = {}) {
-  const reconnectUrl = process.env.GMAIL_RECONNECT_URL || "";
+  const reconnectUrl = RECONNECT_URL;
 
   const fields = [
     {
@@ -437,7 +469,7 @@ export async function notifyGmailAuthError({ client = {}, mailbox, error, since 
     description: `No mail can be read for **${client.name || mailbox || "this client"}** until the Google account is reconnected.`,
     fields,
     timestamp: new Date().toISOString(),
-    footer: { text: "FlashFire • Mail AI • hourly poll" }
+    footer: { text: "FlashFire • Mail • connection" }
   };
 
   const payload = {
@@ -447,6 +479,112 @@ export async function notifyGmailAuthError({ client = {}, mailbox, error, since 
   };
 
   return postToWebhook(ERROR_WEBHOOK, payload);
+}
+
+// ─── Public: "connect your mail" nudge ──────────────────────────────
+
+/**
+ * Nudge for an active client whose mail is not connected, or whose token died.
+ * Throttling (once/day/client) is the caller's job.
+ *
+ * @param {Object} a
+ * @param {Object} a.client - { name, email }
+ * @param {"not_connected"|"token_dead"} a.kind
+ * @param {string} [a.reconnectUrl]
+ */
+export async function notifyClientNotConnected({ client = {}, kind = "not_connected", reconnectUrl } = {}) {
+  const url = reconnectUrl || RECONNECT_URL;
+  const who = client.name || client.email || "This client";
+  const isDead = kind === "token_dead";
+
+  const embed = {
+    title: isDead ? "🔌 Mail disconnected — please reconnect" : "📭 No mail connected — please connect",
+    color: isDead ? 0xf59e0b : 0x6366f1, // amber / indigo
+    description: isDead
+      ? `**${who}** had mail connected, but the Google token is no longer valid. We can't read their inbox until it's reconnected.`
+      : `**${who}** is active but has **no mail connected**. Please connect their Gmail so we can watch for interviews, assignments, and offers.`,
+    fields: [
+      { name: "Client", value: truncate(client.name || "—", LIMIT.fieldValue), inline: true },
+      { name: "Account", value: truncate(client.email || "—", LIMIT.fieldValue), inline: true },
+      {
+        name: "➡️ Action",
+        value: truncate(
+          "Dashboard → **Inbox** → connect / reconnect the client's Google account." +
+            (url ? `\n\n[Open Inbox](${url})` : ""),
+          LIMIT.fieldValue
+        ),
+        inline: false
+      }
+    ],
+    timestamp: new Date().toISOString(),
+    footer: { text: "FlashFire • Mail • connection check" }
+  };
+
+  return postToWebhook(MAIL_WEBHOOK, { embeds: [embed], allowed_mentions: { parse: [] } });
+}
+
+// ─── Public: daily 5am summary ──────────────────────────────────────
+
+/**
+ * Header message for the daily summary. Sent once, then followed by one
+ * per-useful-mail message via notifyUsefulMailLine().
+ *
+ * @param {Object} a - { scannedClients, connectedMailboxes, notConnected,
+ *                        totalMails, usefulMails, windowHours, dateLabel }
+ */
+export async function notifyDailySummaryHeader(a = {}) {
+  const useful = Number(a.usefulMails || 0);
+  const embed = {
+    title: "📊 Daily Mail Summary",
+    color: useful > 0 ? 0x22c55e : 0x3b82f6, // green if there's good news, else blue
+    description: a.dateLabel ? `Window: last ${a.windowHours || 24}h · ${a.dateLabel}` : `Last ${a.windowHours || 24} hours`,
+    fields: [
+      { name: "Active clients scanned", value: String(a.scannedClients ?? 0), inline: true },
+      { name: "Mailboxes connected", value: String(a.connectedMailboxes ?? 0), inline: true },
+      { name: "Not connected", value: String(a.notConnected ?? 0), inline: true },
+      { name: "📥 Mails seen", value: String(a.totalMails ?? 0), inline: true },
+      { name: "⭐ Useful (interview / assignment / offer)", value: String(useful), inline: true }
+    ],
+    timestamp: new Date().toISOString(),
+    footer: { text: "FlashFire • Mail • daily 5 AM IST" }
+  };
+  if (useful === 0) {
+    embed.fields.push({ name: "Result", value: "No useful mails in this window. Detail messages follow only when there are.", inline: false });
+  } else {
+    embed.fields.push({ name: "Result", value: `${useful} useful mail(s) — one message each follows. ⬇️`, inline: false });
+  }
+  return postToWebhook(MAIL_WEBHOOK, { embeds: [embed], allowed_mentions: { parse: [] } });
+}
+
+const USEFUL_META = {
+  interview: { emoji: "🎉", label: "Interview", color: 0x7c3aed },
+  assessment: { emoji: "📝", label: "Assignment", color: 0x0891b2 },
+  offer: { emoji: "🏆", label: "Offer", color: 0x16a34a }
+};
+
+/**
+ * One message per useful mail: "Client (Name) got: <subject> — received <time>".
+ *
+ * @param {Object} a - { clientName, clientEmail, category, subject, from, receivedAt }
+ */
+export async function notifyUsefulMailLine(a = {}) {
+  const meta = USEFUL_META[a.category] || { emoji: "⭐", label: "Useful", color: 0x22c55e };
+  const embed = {
+    title: `${meta.emoji} ${meta.label} — ${truncate(a.clientName || a.clientEmail || "Client", 80)}`,
+    color: meta.color,
+    description: truncate(`**${a.clientName || a.clientEmail || "A client"}** got: **${a.subject || "(no subject)"}**`, LIMIT.description),
+    fields: [
+      { name: "From", value: truncate(a.from || "—", LIMIT.fieldValue), inline: false },
+      {
+        name: "Received",
+        value: a.receivedAt ? `${discordTimestamp(a.receivedAt)} · ${discordTimestamp(a.receivedAt, "R")}` : "—",
+        inline: true
+      }
+    ],
+    timestamp: a.receivedAt ? new Date(a.receivedAt).toISOString() : new Date().toISOString(),
+    footer: { text: "FlashFire • Mail update" }
+  };
+  return postToWebhook(MAIL_WEBHOOK, { embeds: [embed], allowed_mentions: { parse: [] } });
 }
 
 export const __testables = { truncate, pickUploadable, discordTimestamp };

@@ -777,6 +777,8 @@ function triggerSummaryRebuild(email, reason) {
       .then((r) => {
         if (r?.success) {
           console.log(`[summary-rebuild:${reason}] ok email=${email} words=${r.wordCount} source=${r.source}`);
+        } else if (r?.skipped) {
+          console.log(`[summary-rebuild:${reason}] skipped email=${email} — a build is already running, profile left stale for the sweep`);
         } else {
           console.warn(`[summary-rebuild:${reason}] fail email=${email} err=${r?.error} msg=${r?.message}`);
         }

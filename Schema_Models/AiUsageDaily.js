@@ -27,6 +27,8 @@ export const AI_USAGE_SOURCES = {
     RECRUITER_TEMPLATE: "recruiter-template", // RecruiterAiTemplate (gpt-4o!)
     JOB_EXTRACT: "job-extract",       // extractJobData
     MAIL_SUMMARY: "mail-summary",     // mailAiSummarizer (disabled by default)
+    MAIL_VERIFY: "mail-verify",       // mailMilestoneVerifier second-stage check
+    MAIL_REGEX: "mail-regex",         // mailRegexLearner exclusion-pattern proposals
 };
 
 const aiUsageDailySchema = new mongoose.Schema({

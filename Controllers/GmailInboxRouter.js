@@ -1,4 +1,5 @@
 import express from "express";
+import mongoose from "mongoose";
 import multer from "multer";
 import { GmailUser } from "../Schema_Models/GmailUser.js";
 import { InboxThread } from "../Schema_Models/InboxThread.js";
@@ -8,6 +9,17 @@ import { GmailPollState } from "../Schema_Models/GmailPollState.js";
 import { uploadFile } from "../Utils/storageService.js";
 import { getPresignedUrl } from "../Utils/r2Storage.js";
 import { pollOnce } from "../src/services/mailPollWorker.js";
+import { sendEmail, isSendgridConfigured } from "../Utils/sendgridClient.js";
+import { sendViaSmtp, isSmtpConfigured, verifySmtp } from "../Utils/smtpSender.js";
+import { renderClientMilestoneEmail, NOTIFIABLE_CATEGORIES } from "../Utils/clientMailTemplates.js";
+import { checkConnectionsAndAlert, sendDailySummary } from "../src/services/mailClientMonitor.js";
+import { mailNotifyWebhook, verifyWebhook, isGmailAuthError, errorText } from "../Utils/discordMailNotify.js";
+import { isMailPollEnabled } from "../src/services/mailPollWorker.js";
+import { getActiveUnpausedClients } from "../Schema_Models/ClientPaymentLookup.js";
+import { MailVerifierFeedback } from "../Schema_Models/MailVerifierFeedback.js";
+import { decideSuppression } from "../src/services/mailVerifierLearning.js";
+import { MailClassifierRule } from "../Schema_Models/MailClassifierRule.js";
+import { invalidateRuleCache } from "../src/services/mailRegexLearner.js";
 // This router talks to Gmail over native fetch + getAccessToken() below, not
 // through googleapis — its bundled node-fetch throws ERR_STREAM_PREMATURE_CLOSE
 // on Render. gmailClientForUser() is deliberately NOT imported here; only the
@@ -739,6 +751,74 @@ router.post("/star", async (req, res) => {
 // Mail → AI → Discord pipeline
 // =========================
 
+// Verifier feedback report: which sender domains the AI keeps rejecting, with
+// example subjects + reasons. This is the evidence an engineer reads to
+// tighten Utils/mailRulesClassifier.js deliberately (the classifier never
+// rewrites itself). Sorted worst-offender first.
+//   GET /gmail/mail-verify/feedback?limit=50
+router.get("/mail-verify/feedback", async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const rows = await MailVerifierFeedback.find({})
+      .sort({ rejectCount: -1, lastSeenAt: -1 })
+      .limit(limit)
+      .lean();
+    res.json({
+      ok: true,
+      count: rows.length,
+      domains: rows.map((r) => ({
+        domain: r.domain,
+        rejectCount: r.rejectCount,
+        genuineCount: r.genuineCount,
+        suppressed: decideSuppression({ domain: r.domain, rejectCount: r.rejectCount, genuineCount: r.genuineCount }),
+        lastSeenAt: r.lastSeenAt,
+        examples: (r.examples || []).slice(0, 5)
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || "feedback_failed" });
+  }
+});
+
+// AI-learned exclusion rules: list them (with provenance + hit counts) and
+// disable a bad one. Rules are written by the regex learner off verified
+// false positives; see src/services/mailRegexLearner.js.
+//   GET  /gmail/mail-verify/rules?status=active|disabled|all
+//   POST /gmail/mail-verify/rules/:id/disable
+//   POST /gmail/mail-verify/rules/:id/enable
+router.get("/mail-verify/rules", async (req, res) => {
+  try {
+    const status = String(req.query.status || "active");
+    const q = status === "all" ? {} : { status };
+    const rules = await MailClassifierRule.find(q).sort({ createdAt: -1 }).limit(500).lean();
+    res.json({ ok: true, count: rules.length, rules });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || "rules_failed" });
+  }
+});
+
+router.post("/mail-verify/rules/:id/disable", async (req, res) => {
+  try {
+    const r = await MailClassifierRule.findByIdAndUpdate(req.params.id, { $set: { status: "disabled" } }, { new: true });
+    if (!r) return res.status(404).json({ ok: false, error: "rule_not_found" });
+    invalidateRuleCache();
+    res.json({ ok: true, rule: r });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || "disable_failed" });
+  }
+});
+
+router.post("/mail-verify/rules/:id/enable", async (req, res) => {
+  try {
+    const r = await MailClassifierRule.findByIdAndUpdate(req.params.id, { $set: { status: "active" } }, { new: true });
+    if (!r) return res.status(404).json({ ok: false, error: "rule_not_found" });
+    invalidateRuleCache();
+    res.json({ ok: true, rule: r });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || "enable_failed" });
+  }
+});
+
 // Manual trigger for the hourly poll. Useful for ops ("I just sent a test mail")
 // and for verifying a freshly reconnected mailbox without waiting for the hour.
 // The worker's own overlap guard makes a concurrent cron tick a no-op.
@@ -799,6 +879,204 @@ router.post("/digests", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err?.message || "digests_failed" });
   }
+});
+
+// =========================
+// Client milestone alerts (interview / assignment / offer → the client)
+// =========================
+
+// Preview a branded alert email in the browser. GET so it renders directly:
+//   /gmail/inbox/client-alert/preview?category=interview
+// Sends nothing — pure template render with sample data.
+router.get("/client-alert/preview", (req, res) => {
+  try {
+    const category = NOTIFIABLE_CATEGORIES.includes(String(req.query.category))
+      ? String(req.query.category)
+      : "interview";
+    const sample = {
+      interview: {
+        subject: "Interview invitation — Backend Engineer at Acme",
+        summary: "Acme's hiring team wants to schedule a 45-minute technical interview this week. They proposed Thursday or Friday afternoon and asked you to confirm a slot.",
+        keyPoints: ["45-min technical round", "Thursday or Friday PM", "Reply to confirm a slot"],
+        actionRequired: "Reply with your preferred time before end of day."
+      },
+      assessment: {
+        subject: "Take-home assignment — Frontend role at Nimbus",
+        summary: "Nimbus sent a take-home coding assignment. It's due in 3 days and should take about 4 hours.",
+        keyPoints: ["Take-home coding task", "Due in 3 days", "~4 hours of work"],
+        actionRequired: "Start the assignment and submit before the deadline."
+      },
+      offer: {
+        subject: "Your offer from Vertex Labs",
+        summary: "Vertex Labs extended a full-time offer for the Senior Engineer position, including compensation details and a start date to confirm.",
+        keyPoints: ["Full-time Senior Engineer", "Comp details attached", "Start date to confirm"],
+        actionRequired: "Review the offer and respond to the recruiter."
+      }
+    }[category];
+
+    const { subject, html } = renderClientMilestoneEmail({
+      client: { name: "Alex Carter", email: "alex@example.com" },
+      digest: { category, from: "Talent Team <talent@company.com>", urls: ["https://mail.google.com/"], ...sample },
+      dashboardUrl: process.env.CLIENT_DASHBOARD_URL || process.env.FRONTEND_URL || ""
+    });
+    res.set("Content-Type", "text/html; charset=utf-8").send(`<!-- subject: ${subject} -->\n${html}`);
+  } catch (err) {
+    res.status(500).send(`preview_failed: ${err?.message || "unknown"}`);
+  }
+});
+
+// Send a real test alert to an address, over the configured channel (SMTP by
+// default — so the send lands in the App-Password account's Sent folder).
+//   body: { to, category, channel? }
+router.post("/client-alert/test", async (req, res) => {
+  try {
+    const { to, category, channel } = req.body || {};
+    if (!to) return res.status(400).json({ error: "missing_to" });
+    const cat = NOTIFIABLE_CATEGORIES.includes(String(category)) ? String(category) : "interview";
+    const useChannel =
+      String(channel || process.env.CLIENT_MAIL_CHANNEL || "smtp").toLowerCase() === "sendgrid" ? "sendgrid" : "smtp";
+
+    if (useChannel === "smtp" && !isSmtpConfigured()) return res.status(503).json({ error: "smtp_not_configured" });
+    if (useChannel === "sendgrid" && !isSendgridConfigured()) return res.status(503).json({ error: "sendgrid_not_configured" });
+
+    const { subject, html, text } = renderClientMilestoneEmail({
+      client: { name: (to.split("@")[0] || "there"), email: to },
+      digest: {
+        category: cat,
+        subject: `Test ${cat} alert`,
+        from: "FlashFire Test <test@flashfirehq.com>",
+        summary: "This is a test of the FlashFire client milestone alert email.",
+        keyPoints: ["Template render check", "Delivery check"],
+        urls: ["https://mail.google.com/"]
+      },
+      dashboardUrl: process.env.CLIENT_DASHBOARD_URL || process.env.FRONTEND_URL || ""
+    });
+
+    const result =
+      useChannel === "smtp"
+        ? await sendViaSmtp({ to, subject, html, text })
+        : await sendEmail({
+            to,
+            subject,
+            html,
+            text,
+            fromEmail: process.env.CLIENT_MAIL_FROM_EMAIL || undefined,
+            fromName: process.env.CLIENT_MAIL_FROM_NAME || "FlashFire",
+            categories: ["client-milestone-test"]
+          });
+    if (!result.ok) return res.status(502).json({ ok: false, channel: useChannel, error: result.error });
+    // messageId (SMTP) is the Sent-folder receipt.
+    res.json({ ok: true, to, category: cat, channel: useChannel, messageId: result.messageId, status: result.status });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "test_send_failed" });
+  }
+});
+
+// Manually run the daily 5am summary now (header + one message per useful mail).
+router.post("/daily-summary-now", async (_req, res) => {
+  try {
+    const result = await sendDailySummary();
+    res.json({ ok: !result?.skipped, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "summary_failed" });
+  }
+});
+
+// Manually run the "connect your mail" connection check now (throttled per client).
+router.post("/connection-check-now", async (_req, res) => {
+  try {
+    const result = await checkConnectionsAndAlert();
+    res.json({ ok: !result?.skipped, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "connection_check_failed" });
+  }
+});
+
+// =========================
+// Health check — GET /gmail/inbox/health
+// =========================
+// One call that verifies every moving part of the mail pipeline for real:
+// Mongo, the master switch, Google OAuth config, SMTP auth (actual login),
+// the Discord webhook (validity, no message posted), each connected mailbox's
+// live token, and client / payment-email coverage. No secrets are returned.
+router.get("/health", async (_req, res) => {
+  const checks = {};
+  const problems = [];
+  const warnings = [];
+
+  // 1. Mongo
+  const rs = mongoose.connection.readyState;
+  checks.mongo = { ok: rs === 1, state: ["disconnected", "connected", "connecting", "disconnecting"][rs] || String(rs) };
+  if (!checks.mongo.ok) problems.push("MongoDB is not connected");
+
+  // 2. Pipeline master switch
+  const enabled = isMailPollEnabled();
+  checks.pipeline = { ok: enabled, enabled, note: enabled ? "running" : "off (auto-on only on Render; set MAIL_POLL_ENABLED=1 to force)" };
+  if (!enabled) warnings.push("Mail pipeline is disabled here (expected off outside Render)");
+
+  // 3. Google OAuth (poller needs these to read Gmail)
+  const gid = !!process.env.GOOGLE_CLIENT_ID;
+  const gsec = !!process.env.GOOGLE_CLIENT_SECRET;
+  checks.googleOAuth = { ok: gid && gsec, clientId: gid, clientSecret: gsec };
+  if (!checks.googleOAuth.ok) problems.push("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET missing — Gmail cannot be read");
+
+  // 4. SMTP — real connect + auth
+  checks.smtp = await verifySmtp();
+  if (!checks.smtp.ok) problems.push(`SMTP not working: ${checks.smtp.error} — client alert emails will not send`);
+
+  // 5. Discord webhook — validity, no post
+  checks.discord = { configured: !!mailNotifyWebhook(), ...(await verifyWebhook()) };
+  if (!checks.discord.ok) problems.push(`Discord webhook problem: ${checks.discord.error} — no ops notifications`);
+
+  // 6. Connected mailboxes — live token health
+  try {
+    const mailboxes = await GmailUser.find({ refreshToken: { $exists: true, $ne: "" } }).select("email refreshToken").lean();
+    const perMailbox = [];
+    for (const m of mailboxes) {
+      try {
+        await getAccessToken(m.refreshToken);
+        perMailbox.push({ email: m.email, ok: true });
+      } catch (e) {
+        // Google's token error body is multi-line; collapse whitespace so the
+        // JSON response stays valid and the error reads on one line.
+        const msg = (errorText(e) || String(e?.message || e)).replace(/\s+/g, " ").trim();
+        perMailbox.push({ email: m.email, ok: false, dead: isGmailAuthError(msg), error: msg.slice(0, 200) });
+      }
+    }
+    const healthy = perMailbox.filter((x) => x.ok).length;
+    checks.mailboxes = { connected: mailboxes.length, healthy, dead: perMailbox.filter((x) => !x.ok) };
+    if (mailboxes.length && healthy === 0) problems.push("No connected mailbox has a working token");
+  } catch (e) {
+    checks.mailboxes = { ok: false, error: String(e?.message || e).slice(0, 160) };
+  }
+
+  // 7. Client + payment-email coverage
+  try {
+    const active = await getActiveUnpausedClients();
+    const withPayment = active.filter((c) => c.paymentEmail).length;
+    checks.clients = {
+      activeUnpaused: active.length,
+      withPaymentEmail: withPayment,
+      withoutPaymentEmail: active.length - withPayment
+    };
+    if (active.length && withPayment === 0) {
+      warnings.push("No active client has a paymentEmail — milestone alert emails will all be skipped");
+    }
+  } catch (e) {
+    checks.clients = { ok: false, error: String(e?.message || e).slice(0, 160) };
+  }
+
+  checks.config = { classifier: "rules", channel: "smtp", scanActiveOnly: true, dailySummary: "05:00 IST" };
+
+  const ok = problems.length === 0;
+  res.status(ok ? 200 : 503).json({
+    ok,
+    summary: ok ? (warnings.length ? "working, with warnings" : "all systems go") : "problems found",
+    problems,
+    warnings,
+    checks,
+    checkedAt: new Date().toISOString()
+  });
 });
 
 export default router;

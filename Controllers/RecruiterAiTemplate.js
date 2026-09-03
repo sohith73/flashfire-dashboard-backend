@@ -9,7 +9,9 @@ import { getAppSettings } from "../Schema_Models/AppSettings.js";
 import { callGemini, GEMINI_JUDGE_MODEL, HAS_GEMINI_CREDENTIALS } from "../Utils/vertexGeminiJudge.js";
 
 const RESUME_API_URL = process.env.RESUME_API_URL || "http://localhost:5000";
-const OPENAI_MODEL = process.env.OPENAI_RECRUITER_MODEL || "gpt-4o";
+// Default to gpt-4o-mini: gpt-4o cost ~16x more per token and drove a spend
+// spike. Override via OPENAI_RECRUITER_MODEL if a stronger tier is ever needed.
+const OPENAI_MODEL = process.env.OPENAI_RECRUITER_MODEL || "gpt-4o-mini";
 const PREFER_GEMINI = process.env.FF_RECRUITER_PREFER_GEMINI !== "0";
 // Recruiter emails benefit from a stronger Gemini tier than the cheap judge
 // model. Override via env if needed.

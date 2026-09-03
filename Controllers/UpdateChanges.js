@@ -101,9 +101,24 @@ const buildOperatorFields = (role, body, userDetails) => {
   return fields;
 };
 
+// Stamp appliedDate on the first move into an applied column.
+//
+// This used to compare `currentStatus === "saved"` against the RAW stored value,
+// which is wrong for every job an operator has ever touched. Every status write
+// goes through formatStatusWithAttribution(), and shouldAttributeStatus()
+// appends " by <name>" to anything not already containing " by ". So the moment
+// an operator moves a card to Saved, currentStatus becomes "saved by Sathya" and
+// the exact-equality test can never match again. appliedDate then stayed null
+// forever, which silently broke everything keyed on it: the "Last applied by"
+// column, "Since 1st Apply", the operator performance report, and the
+// applied-on-date counts.
+//
+// Compare on the leading word instead, lower-cased, so both the attribution
+// suffix and whatever casing the client sent are tolerated.
 const shouldSetAppliedDate = (currentStatus, newStatus) => {
-  return currentStatus === "saved" &&
-    (newStatus.includes("applied") || newStatus === "applied");
+  const from = String(currentStatus || "").trim().toLowerCase();
+  const to = String(newStatus || "").trim().toLowerCase();
+  return from.startsWith("saved") && to.startsWith("applied");
 };
 
 const incrementRemovalCount = async (userEmail, status, role) => {
@@ -226,6 +241,8 @@ const scheduleDebouncedRebuild = (userEmail) => {
       const result = await buildSummaryForEmail(userEmail, "job-removal");
       if (result?.success) {
         console.log(`[summary-rebuild:job-removal] ok email=${userEmail} words=${result.wordCount} source=${result.source}`);
+      } else if (result?.skipped) {
+        console.log(`[summary-rebuild:job-removal] skipped email=${userEmail} — a build is already running, profile left stale for the sweep`);
       } else {
         console.warn(`[summary-rebuild:job-removal] fail email=${userEmail} err=${result?.error} msg=${result?.message}`);
       }

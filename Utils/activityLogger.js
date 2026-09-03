@@ -1,5 +1,7 @@
 import jwt from "jsonwebtoken";
 import { ActivityLog } from "../Schema_Models/ActivityLog.js";
+import { resolveGeo } from "./ipGeo.js";
+import { extractClientIp, normalizeIp } from "./clientIp.js";
 
 function safeDecodeJwt(req) {
   try {
@@ -15,11 +17,9 @@ function safeDecodeJwt(req) {
   }
 }
 
-function extractIp(req) {
-  const fwd = req.headers?.["x-forwarded-for"];
-  if (typeof fwd === "string" && fwd) return fwd.split(",")[0].trim();
-  return req.ip || req.socket?.remoteAddress || "";
-}
+// Removed the old leftmost-X-Forwarded-For reader: that header entry is
+// client-supplied and therefore forgeable. extractClientIp() resolves through
+// Express's `trust proxy` setting instead. See Utils/clientIp.js.
 
 function actorFromReq(req, override = {}) {
   const decoded = safeDecodeJwt(req);
@@ -46,8 +46,13 @@ function actorFromReq(req, override = {}) {
  *   diff?: any,
  *   context?: any,
  *   actor?: { email?: string, name?: string, role?: string, source?: string },
- *   severity?: 'info'|'warning'|'critical'
- * }} payload
+ *   severity?: 'info'|'warning'|'critical',
+ *   ip?: string,
+ *   userAgent?: string,
+ *   location?: string
+ * }} payload  `ip`/`userAgent` are honoured only from trusted callers (the
+ *   secret-gated /admin/activity/ingest endpoint), where `req` belongs to the
+ *   forwarding service and not to the end user.
  */
 export function logActivity(req, payload) {
   try {
@@ -63,12 +68,34 @@ export function logActivity(req, payload) {
       context: payload.context ?? null,
       severity: payload.severity || "info",
       actor: actorFromReq(req || {}, payload.actor || {}),
-      ip: req ? extractIp(req) : "",
-      userAgent: req?.headers?.["user-agent"]?.toString().slice(0, 512) || "",
+      // A forwarded event carries the END USER's ip/userAgent in the payload.
+      // Deriving them from `req` there records the calling service instead —
+      // which is why every optimizer-sourced event used to show one identical
+      // location. Payload wins when present; otherwise read the request.
+      ip: normalizeIp(payload.ip) || (req ? extractClientIp(req) : ""),
+      location: payload.location || "",
+      userAgent:
+        (payload.userAgent || req?.headers?.["user-agent"] || "").toString().slice(0, 512),
     };
-    ActivityLog.create(doc).catch((err) => {
-      console.warn("[activityLogger] create failed:", err?.message || err);
-    });
+    ActivityLog.create(doc)
+      .then((saved) => {
+        // Resolve geolocation off the request path and patch it in. Fire-and-forget.
+        if (saved && doc.ip && !doc.location) {
+          resolveGeo(doc.ip)
+            .then((geo) => {
+              if (!geo || !geo.location) return;
+              // `votes` stays in ip_geo_cache, keyed by IP — copying the raw
+              // per-provider answers onto every event row would duplicate the
+              // same blob thousands of times for one office IP.
+              const { location, votes, ...rest } = geo;
+              ActivityLog.updateOne({ _id: saved._id }, { $set: { location, geo: rest } }).catch(() => {});
+            })
+            .catch(() => {});
+        }
+      })
+      .catch((err) => {
+        console.warn("[activityLogger] create failed:", err?.message || err);
+      });
   } catch (err) {
     console.warn("[activityLogger] unexpected:", err?.message || err);
   }

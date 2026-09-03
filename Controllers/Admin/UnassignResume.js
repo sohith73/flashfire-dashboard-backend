@@ -19,20 +19,34 @@ export default async function UnassignResume(req, res) {
         user.assignedResumeId = null;
         await user.save();
 
-        if (previousResumeId) {
-            const resumeApiUrl = process.env.RESUME_API_URL || "http://localhost:5000";
-            try {
-                const updateRes = await fetch(`${resumeApiUrl}/api/update-resume-user-email`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ resumeId: previousResumeId, userEmail: null })
-                });
-                if (!updateRes.ok) {
-                    console.error("Failed to clear ResumeIndex userEmail during unassign");
-                }
-            } catch (err) {
-                console.error("Error clearing ResumeIndex userEmail during unassign:", err);
+        // The admin UI decides "assigned" from ResumeIndex.userEmail in the resume
+        // service, keyed BY EMAIL — not from assignedResumeId. So the unlink MUST
+        // clear that email there, always (even when assignedResumeId was already
+        // null or points at a stale/different row), or the row snaps right back on
+        // the next refresh. Clear by email, and treat a failed clear as a real
+        // failure instead of reporting a success the user won't see.
+        const resumeApiUrl = process.env.RESUME_API_URL || "http://localhost:5000";
+        let resumeServiceCleared = false;
+        try {
+            const updateRes = await fetch(`${resumeApiUrl}/api/update-resume-user-email`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ clearByEmail: userEmail })
+            });
+            resumeServiceCleared = updateRes.ok;
+            if (!updateRes.ok) {
+                console.error("Failed to clear ResumeIndex userEmail during unassign:", updateRes.status);
             }
+        } catch (err) {
+            console.error("Error clearing ResumeIndex userEmail during unassign:", err);
+        }
+
+        if (!resumeServiceCleared) {
+            return res.status(502).json({
+                success: false,
+                message: "Could not fully unlink: the resume service was unreachable, so the link may reappear. Please retry.",
+                previousResumeId
+            });
         }
 
         res.json({

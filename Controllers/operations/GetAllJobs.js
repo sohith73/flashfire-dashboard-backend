@@ -1,4 +1,5 @@
 import { JobModel } from "../../Schema_Models/JobModel.js";
+import { computeJobTimes } from "../../Utils/jobActivityTime.js";
 
 export default async function GetAllJobsOPS(req,res) {
     let {email}= req.body;
@@ -24,87 +25,30 @@ export default async function GetAllJobsOPS(req,res) {
 
         const allJobsRaw = await cursor;
         
-        const parseDateAdded = (raw) => {
-            if (raw == null || raw === "") return 0;
-            if (raw instanceof Date) {
-                const t = raw.getTime();
-                return Number.isNaN(t) ? 0 : t;
+        // Ordering is delegated to Utils/jobActivityTime.js, which the client
+        // dashboard also uses. This file used to carry its own copy of a parser
+        // that read "MM/DD unless the first number is > 12" - wrong for every
+        // en-IN row, which is the majority of the collection since Oct 2025.
+        // Two copies of the rule meant operations and the client could see the
+        // same cards in different orders.
+        const nowMs = Date.now();
+        const withTimes = allJobsRaw.map((job) => ({ job, times: computeJobTimes(job, nowMs) }));
+
+        withTimes.sort((a, b) => {
+            if (b.times.activityAt !== a.times.activityAt) {
+                return b.times.activityAt - a.times.activityAt;
             }
-            if (typeof raw === "number" && Number.isFinite(raw)) {
-                return raw;
-            }
-            const dateString = typeof raw === "string" ? raw : String(raw);
-            try {
-                if (/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(dateString)) {
-                    return new Date(dateString).getTime();
-                }
-                
-                const parts = dateString.trim().split(",");
-                if (parts.length === 2) {
-                    const datePart = parts[0].trim();
-                    const timePart = parts[1].trim();
-                    const dateNumbers = datePart.split("/").map(p => parseInt(p.trim()));
-                    
-                    if (dateNumbers.length === 3) {
-                        let mm, dd, yyyy;
-                        
-                       if (dateNumbers[0] > 12) {
-                            // DD/MM/YYYY format (createdAt)
-                            dd = dateNumbers[0];
-                            mm = dateNumbers[1];
-                            yyyy = dateNumbers[2];
-                        } else {
-                            mm = dateNumbers[0];
-                            dd = dateNumbers[1];
-                            yyyy = dateNumbers[2];
-                        }
-                        
-                        if (dd && mm && yyyy) {
-                            if (yyyy < 100) yyyy += 2000;
-                            
-                            const timeMatch = timePart.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)/i);
-                            if (timeMatch) {
-                                let hour = parseInt(timeMatch[1]);
-                                const minute = parseInt(timeMatch[2]);
-                                const second = timeMatch[3] ? parseInt(timeMatch[3]) : 0;
-                                const meridian = (timeMatch[4] || "").toLowerCase();
-                                
-                                if (!isNaN(hour) && !isNaN(minute)) {
-                                    // Convert to 24-hour format
-                                    if (meridian === "pm" && hour !== 12) hour += 12;
-                                    if (meridian === "am" && hour === 12) hour = 0;
-                                    
-                                    // IST offset is +05:30 => 330 minutes
-                                    const istOffsetMinutes = 330;
-                                    const utcMs = Date.UTC(yyyy, mm - 1, dd, hour, minute, second) - istOffsetMinutes * 60 * 1000;
-                                    const d = new Date(utcMs);
-                                    if (!isNaN(d.getTime())) {
-                                        return d.getTime();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                const native = new Date(dateString);
-                if (!isNaN(native.getTime())) return native.getTime();
-            } catch (error) {
-                console.warn("Failed to parse dateAdded:", dateString, error);
-            }
-            return 0;
-        };
-        
-        // Sort by updatedAt (most recently acted-upon first = stack behavior)
-        // Fall back to dateAdded/createdAt for jobs that haven't been moved yet
-        const allJobsSorted = allJobsRaw.sort((a, b) => {
-            const timeA = parseDateAdded(a.updatedAt || a.dateAdded || a.createdAt);
-            const timeB = parseDateAdded(b.updatedAt || b.dateAdded || b.createdAt);
-            if (timeB !== timeA) return timeB - timeA;
-            return b._id.toString().localeCompare(a._id.toString());
+            return b.job._id.toString().localeCompare(a.job._id.toString());
         });
-        
-        const allJobs = allJobsSorted.map(job => ({ ...job, _id: job._id.toString() }));
+
+        const allJobs = withTimes.map(({ job, times }) => ({
+            ...job,
+            _id: job._id.toString(),
+            createdAtMs: times.createdAtMs,
+            updatedAtMs: times.updatedAtMs,
+            appliedAtMs: times.appliedAtMs,
+            activityAt: times.activityAt
+        }));
         
         res.status(200).json({
             message : 'all Jobs List',

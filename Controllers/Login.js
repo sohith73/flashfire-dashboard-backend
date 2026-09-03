@@ -3,6 +3,7 @@ import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import dotenv from 'dotenv';
 import { signAuthToken, normalizeEmail } from "../Utils/AuthToken.js";
 import { decrypt } from "../Utils/CryptoHelper.js";
+import { logActivity } from "../Utils/activityLogger.js";
 dotenv.config();
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -31,6 +32,20 @@ export default async function Login(req, res) {
                     await ProfileModel.findOne({ email: { $regex: new RegExp(`^${escapeRegex(email)}$`, "i") } });
                const hasProfile = profileLookUp && profileLookUp.email && profileLookUp.email.length > 0;
                const canonicalEmail = existanceOfUser.email || email;
+
+               // Record the client login for the admin Activity Monitor (captures
+               // IP + resolves location async). Fire-and-forget; never blocks login.
+               logActivity(req, {
+                    action: "login",
+                    category: "auth",
+                    actor: {
+                         email: canonicalEmail,
+                         name: existanceOfUser.name || "",
+                         role: existanceOfUser.userType || "client",
+                         source: "dashboard",
+                    },
+                    summary: `${existanceOfUser.name || canonicalEmail} logged in`,
+               });
 
                return res.status(200).json({
                     message: 'Login Success..!',
