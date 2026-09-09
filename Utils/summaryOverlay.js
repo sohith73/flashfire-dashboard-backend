@@ -202,18 +202,27 @@ function normProvCode(code) {
 }
 
 // extractProvenance: strip [R]/[P]/[RP]/[I] markers off bullet + prose lines
-// and return both the clean text + a per-section index of source codes.
+// and return the clean text, a per-section index of source codes, and a
+// CONTENT-KEYED map of line → code.
 //   text — raw AI output with markers.
-// Returns { cleanText, provenance: { [header]: { bullets: [code...], prose: [code...] } } }.
+// Returns { cleanText, provenance: { [header]: { bullets:[code...], prose:[code...] } }, index: Map }.
 // Lines with NO marker get "I" (inferred) so the UI can render neutral.
 // `noResume:true` flag forces every marker to "P" since a profile-only build
 // cannot legitimately cite the resume — useful as a guard after the strip.
+//
+// The positional `provenance` is only valid for THIS exact text. The build
+// pipeline rewrites the brief several times after this runs (notes pass,
+// overlay merge, the two deterministic enforce passes), and the UI indexes
+// provenance positionally — so the pipeline must re-derive it from the FINAL
+// text via provenanceForText(finalText, index). `index` is what survives
+// those rewrites, because it is keyed on the line content, not its position.
 export function extractProvenance(text, { noResume = false } = {}) {
     if (typeof text !== "string" || !text.trim()) {
-        return { cleanText: text || "", provenance: {} };
+        return { cleanText: text || "", provenance: {}, index: new Map() };
     }
     const lines = text.split(/\r?\n/);
     const provenance = {};
+    const index = new Map();
     let current = "__preamble";
     provenance[current] = { bullets: [], prose: [] };
     const cleanLines = [];
@@ -233,9 +242,50 @@ export function extractProvenance(text, { noResume = false } = {}) {
         const cleaned = provMatch ? raw.replace(PROVENANCE_RE, "") : raw;
         if (bulletMatch) provenance[current].bullets.push(code);
         else if (raw.trim()) provenance[current].prose.push(code);
+        if (cleaned.trim()) {
+            // Key on the bullet BODY (markers + list marker stripped) so the
+            // same fact still resolves after stitchSections rewrites "* x" to
+            // "- x" or the notes pass moves the line to another section.
+            const body = cleaned.match(BULLET_RE)?.[1] ?? cleaned;
+            const key = normaliseBullet(body);
+            if (key && !index.has(key)) index.set(key, code);
+        }
         cleanLines.push(cleaned);
     }
-    return { cleanText: cleanLines.join("\n"), provenance };
+    return { cleanText: cleanLines.join("\n"), provenance, index };
+}
+
+// provenanceForText: rebuild the positional provenance map the UI consumes
+// (ClientAiSummary.jsx walks `[header].bullets[i]` / `.prose[i]` in render
+// order) from the FINAL brief plus the content-keyed index captured at
+// extraction time.
+//
+// Every line the model originally marked keeps its true source. Any line that
+// is NOT in the index was introduced after the AI wrote the brief — by the
+// operator-notes pass, the saved overlay, or the deterministic enforce passes
+// — so it is attributed to "U" (Operator) rather than silently inheriting a
+// neighbour's colour. Walk order mirrors the UI's parser exactly.
+export function provenanceForText(text, index) {
+    const provenance = {};
+    if (typeof text !== "string" || !text.trim()) return provenance;
+    const map = index instanceof Map ? index : new Map();
+    let current = "__preamble";
+    provenance[current] = { bullets: [], prose: [] };
+    for (const raw of text.split(/\r?\n/)) {
+        const headerMatch = raw.match(HEADER_RE);
+        if (headerMatch) {
+            current = headerMatch[1].trim();
+            if (!provenance[current]) provenance[current] = { bullets: [], prose: [] };
+            continue;
+        }
+        if (!raw.trim()) continue; // blank lines are skipped by the UI too
+        const bulletMatch = raw.match(BULLET_RE);
+        const body = bulletMatch ? bulletMatch[1] : raw;
+        const code = map.get(normaliseBullet(body)) || "U";
+        if (bulletMatch) provenance[current].bullets.push(code);
+        else provenance[current].prose.push(code);
+    }
+    return provenance;
 }
 
 // countOverlayBullets: count operator additions per section relative to the

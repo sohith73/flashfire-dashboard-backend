@@ -32,9 +32,11 @@
 // rather than passing a guess off as a measurement.
 
 import axios from "axios";
+import cron from "node-cron";
 import { AppSettingsModel } from "../Schema_Models/AppSettings.js";
 import { ExtensionSessionStat } from "../Schema_Models/ExtensionSessionStat.js";
 import { JobModel } from "../Schema_Models/JobModel.js";
+import { ScrapeCostDaily } from "../Schema_Models/ScrapeCostDaily.js";
 import { getDailyUsage, istDay } from "./aiUsage.js";
 import { priceTokens, inr, FX_USD_INR } from "./aiRateCard.js";
 
@@ -465,6 +467,70 @@ async function fireDiscord(milestone, r, today) {
     } catch (err) {
         console.warn(`[scrapeCostNotifier] Discord POST failed for milestone ${milestone}:`, err.message);
     }
+}
+
+// ─── Daily snapshot for the admin dashboard graphs ───────────────────
+// Persist today's scrape-pipeline cost as a dated row so /admin/scrape-cost/
+// history can chart daily and monthly spend. Unlike the Discord milestone
+// (which only fires at 5000-job thresholds), this runs unconditionally on a
+// cron, so even a low-volume day still gets a row. Idempotent: one upsert per
+// IST day, overwriting as the day's numbers climb. Never throws.
+export async function snapshotTodayScrapeCost() {
+    try {
+        const day = istDay();
+        const ext = await getTodayExtensionTotals();
+        const [secondStats, usage] = await Promise.all([
+            getTodaySecondJudgeRuns(),
+            getDailyUsage(day),
+        ]);
+        const r = await buildCostReport({ scrapedJobs: ext.captures, ext, usage, secondStats });
+        await ScrapeCostDaily.updateOne(
+            { day },
+            {
+                $set: {
+                    day,
+                    scraped: r.scraped,
+                    stage1Usd: r.stage1.usd,
+                    stage1InputTokens: r.stage1.inputTokens,
+                    stage1CachedTokens: r.stage1.cachedTokens,
+                    stage1OutputTokens: r.stage1.outputTokens,
+                    stage1Batches: r.stage1.batches,
+                    stage1Measured: r.stage1.measured,
+                    stage2Usd: r.stage2Usd,
+                    totalUsd: r.totalUsd,
+                    perJobUsd: r.perJobUsd,
+                    otherUsd: r.otherUsd,
+                    otherCalls: r.otherCalls,
+                    fastScreenSavedUsd: r.fastScreenSavedUsd,
+                    cacheSavedUsd: r.cacheSavedUsd,
+                    fxRate: r.fxRate,
+                    fullyMeasured: r.fullyMeasured,
+                    callsMissingUsage: r.callsMissingUsage,
+                    sessions: r.sessions,
+                    duplicateRows: r.duplicateRows,
+                    secondJudgeCompleted: r.secondStats.completed,
+                    secondJudgeFastKept: r.secondStats.fastKept,
+                    secondJudgeLlm: r.secondStats.llm,
+                },
+            },
+            { upsert: true }
+        );
+        return r;
+    } catch (err) {
+        console.warn("[scrapeCostSnapshot] failed:", err.message);
+        return null;
+    }
+}
+
+let snapshotTask = null;
+// Snapshot on boot, then every 10 minutes (IST). Guarantees a dated row for the
+// current day regardless of whether a Discord milestone ever fires.
+export function startScrapeCostSnapshotWorker() {
+    snapshotTodayScrapeCost();
+    if (snapshotTask) return snapshotTask;
+    snapshotTask = cron.schedule("*/10 * * * *", () => snapshotTodayScrapeCost(), { timezone: "Asia/Kolkata" });
+    console.log("[scrapeCostSnapshot] worker registered (cron='*/10 * * * *')");
+    return snapshotTask;
 }
 
 // checkAndNotify: call after every ExtensionSessionStat upsert. Cheap when

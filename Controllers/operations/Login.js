@@ -1,5 +1,6 @@
 import Operations from "../../Schema_Models/Operations.js";
 import bcrypt from "bcrypt";
+import { logActivity } from "../../Utils/activityLogger.js";
 
 const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
 
@@ -25,6 +26,19 @@ export async function OperationsLogin(req, res) {
           if (!isMatch) {
                return res.status(401).json({ error: "Invalid credentials" });
           }
+
+          // Record the operator login for the admin Activity Monitor.
+          logActivity(req, {
+               action: "login",
+               category: "auth",
+               actor: {
+                    email: opUser.email,
+                    name: opUser.name || "",
+                    role: opUser.role || "operations",
+                    source: "dashboard",
+               },
+               summary: `${opUser.name || opUser.email} (operator) logged in`,
+          });
 
           res.json({
                message: "Login successful",

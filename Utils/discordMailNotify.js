@@ -1,30 +1,60 @@
 // Discord delivery for the hourly Gmail → AI → Discord pipeline.
 //
-// Two entry points:
-//   • notifyMailDigest()   — one rich embed per new mail: client info, the
-//     gpt-4o-mini summary, extracted links, and the .txt attachment uploaded
-//     as a real Discord file.
-//   • notifyGmailAuthError() — loud red alert when a client's Gmail refresh
-//     token stops working (invalid_grant / revoked), telling ops to reconnect.
+// Entry points:
+//   • notifyUsefulMailLine()     — one short embed per interview / assignment /
+//     offer, posted by the poll the moment it classifies the mail.
+//   • notifyDailySummaryHeader() — the 5 AM IST totals line.
+//   • notifyMailDigest()         — one rich embed per mail with the AI summary
+//     and the .txt attachment; kept for the verify script and manual use.
 //
-// Both swallow their own errors and return a result object. A Discord outage
+// All swallow their own errors and return a result object. A Discord outage
 // must never break the poll worker; undelivered digests are retried next tick
 // because MailDigest.discordPostedAt stays null.
 //
-// Posting goes to a single webhook (DISCORD_MAIL_WEBHOOK_URL). Client identity
-// lives in the embed, not in the channel name.
+// ONE channel, and it carries ONLY the mails that matter to the team: one
+// line per interview / assignment / offer as the poll finds it, and the daily
+// 5am summary of the same. Connection nudges ("please connect", "token dead")
+// and auth-error embeds were removed on purpose (Sept 2026): ops asked for a
+// channel with nothing but real milestones in it. Connection health is still
+// logged by the poll and counted in the daily header. Hard-coded here (per request) so it works with no env;
+// ONE_MAIN_DISCORD_FOR_MAIL_NOTIFICATIONS can override it for rotation.
+const MAIL_WEBHOOK =
+  process.env.ONE_MAIN_DISCORD_FOR_MAIL_NOTIFICATIONS ||
+  "https://discord.com/api/webhooks/1535172893590294579/hJQzqUbV_vmreWWdQrNoXS3Z3tMTqMIxZeZ9i9LmHVpewgGyxb858MBb0TIbgNyH7Em7";
 
-const MAIL_WEBHOOK = process.env.DISCORD_MAIL_WEBHOOK_URL || "";
-const ERROR_WEBHOOK = process.env.DISCORD_MAIL_ERROR_WEBHOOK_URL || MAIL_WEBHOOK;
-// Optional "<@&123>" role ping prepended to auth-error posts.
-const ALERT_MENTION = process.env.DISCORD_MAIL_ALERT_MENTION || "";
+/** The single mail-notifications webhook. */
+export function mailNotifyWebhook() {
+  return MAIL_WEBHOOK;
+}
 
-// Discord's classic per-message upload ceiling for non-boosted guilds is 8 MiB.
-// Stay under it with margin for the multipart envelope + payload_json.
-const MAX_UPLOAD_BYTES = Number(process.env.MAIL_DISCORD_MAX_UPLOAD_BYTES) || 7_500_000;
+/**
+ * Confirm the webhook is valid + reachable WITHOUT posting a message: a GET on a
+ * Discord webhook returns its object (200), no message sent. Used by the health route.
+ * @returns {Promise<{ok: boolean, channelId?: string|null, status?: number, error?: string}>}
+ */
+export async function verifyWebhook() {
+  if (!MAIL_WEBHOOK) return { ok: false, error: "no_webhook_configured" };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(MAIL_WEBHOOK, { method: "GET", signal: ctrl.signal });
+    if (res.ok) {
+      const j = await res.json().catch(() => ({}));
+      return { ok: true, channelId: j.channel_id || null };
+    }
+    return { ok: false, status: res.status, error: `discord_http_${res.status}` };
+  } catch (e) {
+    return { ok: false, error: e?.name === "AbortError" ? "timed_out" : String(e?.message || e).slice(0, 200) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Discord's per-message upload ceiling for non-boosted guilds is 8 MiB; stay
+// under it with margin for the multipart envelope + payload_json.
+const MAX_UPLOAD_BYTES = 7_500_000;
 const MAX_FILES = 10;
-
-const POST_TIMEOUT_MS = Number(process.env.MAIL_DISCORD_TIMEOUT_MS) || 15000;
+const POST_TIMEOUT_MS = 15000;
 const MAX_ATTEMPTS = 3;
 
 // ─── Discord field/embed length caps ────────────────────────────────
@@ -375,78 +405,68 @@ export async function notifyMailDigest({ client = {}, mailbox, digest = {}, file
   return { ...result, skipped };
 }
 
-// ─── Public: Gmail auth failure ─────────────────────────────────────
+// ─── Public: daily 5am summary ──────────────────────────────────────
 
 /**
- * Red alert when a client's Gmail token can no longer authenticate.
- * Throttling is the caller's job (GmailPollState.lastAuthAlertAt) so the
- * throttle survives restarts.
+ * Header message for the daily summary. Sent once, then followed by one
+ * per-useful-mail message via notifyUsefulMailLine().
  *
- * @param {Object} a
- * @param {Object} a.client  - { name, email, planType }
- * @param {string} a.mailbox - the Gmail address that failed
- * @param {string} a.error   - raw error text (e.g. "invalid_grant")
- * @param {Date}   [a.since] - when the account first started failing
+ * @param {Object} a - { scannedClients, connectedMailboxes, notConnected,
+ *                        totalMails, usefulMails, windowHours, dateLabel }
  */
-export async function notifyGmailAuthError({ client = {}, mailbox, error, since } = {}) {
-  const reconnectUrl = process.env.GMAIL_RECONNECT_URL || "";
-
-  const fields = [
-    {
-      name: "👤 Client",
-      value: truncate(
-        [
-          `**Name:** ${client.name || "—"}`,
-          `**Account:** ${client.email || "—"}`,
-          `**Plan:** ${client.planType || "—"}`
-        ].join("\n"),
-        LIMIT.fieldValue
-      ),
-      inline: true
-    },
-    {
-      name: "📥 Mailbox",
-      value: truncate(mailbox || "unknown", LIMIT.fieldValue),
-      inline: true
-    },
-    {
-      name: "Error",
-      value: truncate("```" + String(error || "unknown").slice(0, 900) + "```", LIMIT.fieldValue),
-      inline: false
-    }
-  ];
-
-  if (since) {
-    fields.push({ name: "Failing since", value: discordTimestamp(since, "R"), inline: true });
-  }
-
-  fields.push({
-    name: "➡️ Action needed",
-    value: truncate(
-      "The Google refresh token for this mailbox is dead — Gmail polling and the Mails tab are **both** down for this client.\n\n" +
-        "**Fix:** Dashboard → **Inbox** → Google account → **Reconnect**, then re-grant access." +
-        (reconnectUrl ? `\n\n[Reconnect now](${reconnectUrl}?email=${encodeURIComponent(client.email || "")})` : ""),
-      LIMIT.fieldValue
-    ),
-    inline: false
-  });
-
+export async function notifyDailySummaryHeader(a = {}) {
+  const useful = Number(a.usefulMails || 0);
   const embed = {
-    title: "🔐 Gmail authorization error — please reconnect the mail",
-    color: 0xef4444,
-    description: `No mail can be read for **${client.name || mailbox || "this client"}** until the Google account is reconnected.`,
-    fields,
+    title: "📊 Daily Mail Summary",
+    color: useful > 0 ? 0x22c55e : 0x3b82f6, // green if there's good news, else blue
+    description: a.dateLabel ? `Window: last ${a.windowHours || 24}h · ${a.dateLabel}` : `Last ${a.windowHours || 24} hours`,
+    fields: [
+      { name: "Active clients scanned", value: String(a.scannedClients ?? 0), inline: true },
+      { name: "Mailboxes connected", value: String(a.connectedMailboxes ?? 0), inline: true },
+      { name: "Not connected", value: String(a.notConnected ?? 0), inline: true },
+      { name: "📥 Mails seen", value: String(a.totalMails ?? 0), inline: true },
+      { name: "⭐ Useful (interview / assignment / offer)", value: String(useful), inline: true }
+    ],
     timestamp: new Date().toISOString(),
-    footer: { text: "FlashFire • Mail AI • hourly poll" }
+    footer: { text: "FlashFire • Mail • daily 5 AM IST" }
   };
+  if (useful === 0) {
+    embed.fields.push({ name: "Result", value: "No useful mails in this window. Detail messages follow only when there are.", inline: false });
+  } else {
+    embed.fields.push({ name: "Result", value: `${useful} useful mail(s) — one message each follows. ⬇️`, inline: false });
+  }
+  return postToWebhook(MAIL_WEBHOOK, { embeds: [embed], allowed_mentions: { parse: [] } });
+}
 
-  const payload = {
-    ...(ALERT_MENTION ? { content: ALERT_MENTION } : {}),
-    embeds: [embed],
-    allowed_mentions: ALERT_MENTION ? { parse: ["roles", "users"] } : { parse: [] }
+const USEFUL_META = {
+  interview: { emoji: "🎉", label: "Interview", color: 0x7c3aed },
+  assessment: { emoji: "📝", label: "Assignment", color: 0x0891b2 },
+  offer: { emoji: "🏆", label: "Offer", color: 0x16a34a }
+};
+
+/**
+ * One message per useful mail: "Client (Name) got: <subject> — received <time>".
+ *
+ * @param {Object} a - { clientName, clientEmail, category, subject, from, receivedAt }
+ */
+export async function notifyUsefulMailLine(a = {}) {
+  const meta = USEFUL_META[a.category] || { emoji: "⭐", label: "Useful", color: 0x22c55e };
+  const embed = {
+    title: `${meta.emoji} ${meta.label} — ${truncate(a.clientName || a.clientEmail || "Client", 80)}`,
+    color: meta.color,
+    description: truncate(`**${a.clientName || a.clientEmail || "A client"}** got: **${a.subject || "(no subject)"}**`, LIMIT.description),
+    fields: [
+      { name: "From", value: truncate(a.from || "—", LIMIT.fieldValue), inline: false },
+      {
+        name: "Received",
+        value: a.receivedAt ? `${discordTimestamp(a.receivedAt)} · ${discordTimestamp(a.receivedAt, "R")}` : "—",
+        inline: true
+      }
+    ],
+    timestamp: a.receivedAt ? new Date(a.receivedAt).toISOString() : new Date().toISOString(),
+    footer: { text: "FlashFire • Mail update" }
   };
-
-  return postToWebhook(ERROR_WEBHOOK, payload);
+  return postToWebhook(MAIL_WEBHOOK, { embeds: [embed], allowed_mentions: { parse: [] } });
 }
 
 export const __testables = { truncate, pickUploadable, discordTimestamp };

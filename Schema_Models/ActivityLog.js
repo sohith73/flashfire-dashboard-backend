@@ -10,6 +10,26 @@ const ActorSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// Structured IP geolocation. `location` above stays as the display string so
+// existing readers keep working; these fields let the UI show a flag and say
+// how much the answer can be trusted. Raw per-provider votes live in
+// ip_geo_cache, keyed by IP, rather than being copied onto every event.
+const GeoSchema = new mongoose.Schema(
+  {
+    city: { type: String, default: "" }, // blank when providers disagreed on it
+    region: { type: String, default: "" },
+    country: { type: String, default: "" },
+    countryCode: { type: String, default: "" }, // ISO 3166-1 alpha-2
+    lat: { type: Number, default: null },
+    lon: { type: Number, default: null },
+    timezone: { type: String, default: "" },
+    label: { type: String, default: "" }, // set by a pinned override
+    source: { type: String, default: "" }, // "consensus" | "override" | "single"
+    confidence: { type: String, default: "" }, // "high" | "medium" | "low"
+  },
+  { _id: false }
+);
+
 const ActivityLogSchema = new mongoose.Schema(
   {
     actor: { type: ActorSchema, default: () => ({}) },
@@ -22,6 +42,8 @@ const ActivityLogSchema = new mongoose.Schema(
     diff: { type: mongoose.Schema.Types.Mixed, default: null },
     context: { type: mongoose.Schema.Types.Mixed, default: null },
     ip: { type: String, default: "" },
+    location: { type: String, default: "" }, // "City, Region, Country" resolved from IP (best-effort)
+    geo: { type: GeoSchema, default: null },
     userAgent: { type: String, default: "" },
     severity: { type: String, default: "info", enum: ["info", "warning", "critical"] },
     createdAt: { type: Date, default: Date.now, index: true },

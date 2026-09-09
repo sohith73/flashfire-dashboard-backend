@@ -10,6 +10,7 @@ import {
 } from "../Utils/exclusionLists.js";
 import { sanitizeJobTitle } from "../Utils/jobTitle.js";
 import { checkCap, detectOvershoot, checkPlanCap, enforcePlanCapPostInsert } from "../Utils/dailyCapGuard.js";
+import { jobLinkKey, inspectJobLink, SHARED_FORM_COMPANY_LIMIT } from "../Utils/jobLinkKey.js";
 
 /**
  * Normalize job title/company for duplicate check: trim and collapse multiple spaces.
@@ -47,13 +48,23 @@ export default async function StoreJobAndUserDetails(req, res) {
         const { value: joblink } = pickKey(b, ["applyUrl", "url"], "www.google.com");
         const { value: jobDescriptionHtml } = pickKey(b, ["descriptionHtml"]);
 
-        const existing = await JobModel.findOne({
-            $or: [
-                { userID, joblink },
-            ]
-        });
+        // Was exact string equality on joblink, which misses every cosmetic
+        // variation: ?utm_source=linkedin, a trailing slash and a www. prefix
+        // each read as a brand new job. Compare the canonical key instead.
+        // Fails open — a spam filter must not block a real push on a DB hiccup.
+        let linkInfo = null;
+        try {
+            linkInfo = await inspectJobLink(JobModel, userID, joblink);
+        } catch (e) {
+            console.warn("inspectJobLink failed, allowing the push:", e.message);
+        }
+        if (linkInfo && linkInfo.companyCount >= SHARED_FORM_COMPANY_LIMIT) {
+            console.log(`🚫 Shared application form for ${userID} — recorded under ${linkInfo.companyCount} companies. Skipping save.`);
+            return res.status(200).json({ success: true, skipped: true, reason: "shared_application_form", companyCount: linkInfo.companyCount });
+        }
+        const existing = linkInfo?.duplicateForClient;
         if (existing) {
-            console.log(`❌ Duplicate job found for user ${userID}. Skipping save.`);
+            console.log(`❌ Duplicate job link for user ${userID} (${existing.jobTitle} at ${existing.companyName}). Skipping save.`);
             return res.status(200).json({ success: true, skipped: true, reason: "duplicate" });
         }
 
@@ -63,6 +74,7 @@ export default async function StoreJobAndUserDetails(req, res) {
             userID,
             jobTitle,
             joblink,
+            joblinkKey: jobLinkKey(joblink),
             companyName,
             currentStatus: "saved",
             jobDescription: jobDescriptionHtml, // <-- Use the correctly picked description value
@@ -389,8 +401,42 @@ export async function saveToDashboard(req, res) {
                 const normTitle = normalizeString(sanitizedPosition);
                 const normCompany = normalizeString(company);
 
+                // Same LINK first. The title+company test below cannot catch a
+                // shared application form used for several roles — one Tally or
+                // careers-portal URL under five different titles passes it five
+                // times, which is exactly how the same link ended up on five
+                // cards for one client.
+                let linkInfo2 = null;
+                try {
+                    linkInfo2 = await inspectJobLink(JobModel, userEmail, url);
+                } catch (e) {
+                    console.warn('inspectJobLink failed, allowing the push:', e.message);
+                }
+                if (linkInfo2 && linkInfo2.companyCount >= SHARED_FORM_COMPANY_LIMIT) {
+                    console.log(`🚫 Shared application form for ${userEmail} — ${linkInfo2.companyCount} companies. Skipping.`);
+                    summary.skippedAsDuplicate++;
+                    summary.details.push({
+                        user: userEmail,
+                        status: 'skipped_duplicate',
+                        reason: `Generic application form: this link is already recorded under ${linkInfo2.companyCount} different companies.`
+                    });
+                    continue;
+                }
+                const dupLink = linkInfo2?.duplicateForClient;
+                if (dupLink) {
+                    console.log(`⏩ Duplicate job LINK for user ${userEmail}. Skipping.`);
+                    summary.skippedAsDuplicate++;
+                    summary.details.push({
+                        user: userEmail,
+                        status: 'skipped_duplicate',
+                        reason: `This job link was already added for this client (${dupLink.jobTitle} at ${dupLink.companyName}).`
+                    });
+                    continue;
+                }
+
                 // Duplicate check: same user + same job title + same company (case-insensitive).
-                // Uses title+company because URL can vary (e.g. ?utm_source=linkedin, "Unknown URL").
+                // Kept as a second net for postings whose URL genuinely differs
+                // run to run (e.g. "Unknown URL" fallbacks, per-session tokens).
                 const existingJob = await JobModel.findOne({
                     userID: userEmail,
                     jobTitle: { $regex: new RegExp('^' + escapeRegex(normTitle) + '$', 'i') },
@@ -418,6 +464,7 @@ export async function saveToDashboard(req, res) {
                     userID: userEmail,
                     jobTitle: sanitizedPosition,
                     joblink: url,
+                    joblinkKey: jobLinkKey(url),
                     companyName: company,
                     jobLocation: locationStr || "",
                     companyLogo : logo,

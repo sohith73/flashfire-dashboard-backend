@@ -2,6 +2,12 @@ import mongoose from "mongoose";
 import jwt from "jsonwebtoken";
 import { ActivityLog } from "../Schema_Models/ActivityLog.js";
 import { logActivity } from "../Utils/activityLogger.js";
+import { ClientPaymentLookup } from "../Schema_Models/ClientPaymentLookup.js";
+
+// Internal team accounts use @flashfirehq addresses and operator-ish roles.
+// audience=clients strips them so the view shows CLIENTS only.
+const OPERATOR_ROLES = ["operations", "operator", "admin", "manager", "ops", "team", "operations_manager"];
+const INTERNAL_EMAIL_RE = /@flashfirehq\.com$/i;
 
 /**
  * Admin gate: verifies the Bearer JWT and checks for an admin role.
@@ -44,6 +50,19 @@ export async function listActivity(req, res) {
     if (req.query.actorEmail) {
       filter["actor.email"] = String(req.query.actorEmail).toLowerCase();
     }
+    // Clients-only view: drop the operations team (operator roles + @flashfirehq
+    // internal emails). Skip the email exclusion when a specific client is picked.
+    if (String(req.query.audience) === "clients") {
+      filter["actor.role"] = { $nin: OPERATOR_ROLES };
+      if (!req.query.actorEmail) {
+        filter["actor.email"] = { $not: INTERNAL_EMAIL_RE };
+      }
+    }
+    if (req.query.ip) {
+      // Substring match so a partial IP (e.g. "49.36") narrows results.
+      const safeIp = String(req.query.ip).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (safeIp) filter.ip = new RegExp(safeIp, "i");
+    }
     if (req.query.since || req.query.until) {
       filter.createdAt = {};
       if (req.query.since) filter.createdAt.$gte = new Date(req.query.since);
@@ -78,6 +97,24 @@ export async function listActivity(req, res) {
     const hasMore = items.length > limit;
     const trimmed = hasMore ? items.slice(0, limit) : items;
     const nextCursor = hasMore ? String(trimmed[trimmed.length - 1]._id) : null;
+
+    // Enrich with each client's PAYMENT email (one batched lookup for the page).
+    // Keyed on the actor's email → dashboardtrackings.paymentEmail.
+    try {
+      const emails = [...new Set(trimmed.map((it) => String(it?.actor?.email || "").toLowerCase()).filter(Boolean))];
+      if (emails.length) {
+        const clients = await ClientPaymentLookup.find({ email: { $in: emails } })
+          .select("email paymentEmail")
+          .lean();
+        const payByEmail = new Map(clients.map((c) => [String(c.email || "").toLowerCase(), c.paymentEmail || ""]));
+        for (const it of trimmed) {
+          it.paymentEmail = payByEmail.get(String(it?.actor?.email || "").toLowerCase()) || "";
+        }
+      }
+    } catch (e) {
+      // Enrichment is best-effort; the feed still works without payment emails.
+      console.warn("[activity] paymentEmail enrich failed:", e?.message || e);
+    }
 
     return res.json({ items: trimmed, nextCursor, hasMore });
   } catch (err) {
@@ -138,6 +175,10 @@ export async function ingestActivity(req, res) {
     if (!payload.action) {
       return res.status(400).json({ error: "action required" });
     }
+    // `req` here is the FORWARDING SERVICE's request, not the end user's, so
+    // its IP and user-agent describe our own infrastructure. The payload
+    // carries the real client's — logActivity() prefers those. Safe because
+    // this endpoint is gated on ACTIVITY_INGEST_SECRET above.
     logActivity(req, payload);
     return res.status(204).end();
   } catch (err) {

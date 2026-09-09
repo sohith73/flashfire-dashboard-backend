@@ -1,6 +1,7 @@
 import { JobModel } from "../Schema_Models/JobModel.js";
 import { UserModel } from "../Schema_Models/UserModel.js";
 import mongoose from "mongoose";
+import { computeJobTimes } from "../Utils/jobActivityTime.js";
 
 export default async function GetAllJobs(req, res) {
     try {
@@ -39,91 +40,41 @@ export default async function GetAllJobs(req, res) {
 
         const allJobsRaw = await cursor;
         
-        const parseDateAdded = (raw) => {
-            if (raw == null || raw === "") return 0;
-            if (raw instanceof Date) {
-                const t = raw.getTime();
-                return Number.isNaN(t) ? 0 : t;
+        // Ordering used to run through a local locale-string parser that assumed
+        // MM/DD whenever the first number was <= 12. The collection is a mix of
+        // en-US (M/D, uppercase meridiem), en-IN (D/M, lowercase meridiem) and
+        // ISO, so that assumption silently threw a large slice of the cards into
+        // the wrong month - "1/5/2026" (1 May, en-IN) sorted as 5 January.
+        //
+        // Utils/jobActivityTime.js now owns this. It reads creation time from
+        // the ObjectId (exact, no parsing), disambiguates the remaining strings
+        // on the meridiem case, and clamps anything impossible back to the
+        // creation time. See the header comment there for the measurements.
+        const nowMs = Date.now();
+        const withTimes = allJobsRaw.map((job) => ({ job, times: computeJobTimes(job, nowMs) }));
+
+        withTimes.sort((a, b) => {
+            if (b.times.activityAt !== a.times.activityAt) {
+                return b.times.activityAt - a.times.activityAt;
             }
-            if (typeof raw === "number" && Number.isFinite(raw)) {
-                return raw;
-            }
-            const dateString = typeof raw === "string" ? raw : String(raw);
-            try {
-                if (/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(dateString)) {
-                    return new Date(dateString).getTime();
-                }
-                
-                const parts = dateString.trim().split(",");
-                if (parts.length === 2) {
-                    const datePart = parts[0].trim();
-                    const timePart = parts[1].trim();
-                    const dateNumbers = datePart.split("/").map(p => parseInt(p.trim()));
-                    
-                    if (dateNumbers.length === 3) {
-                        let mm, dd, yyyy;
-                        
-                        if (dateNumbers[0] > 12) {
-                            // DD/MM/YYYY format (createdAt)
-                            dd = dateNumbers[0];
-                            mm = dateNumbers[1];
-                            yyyy = dateNumbers[2];
-                        } else {
-                            // MM/DD/YYYY format (dateAdded)
-                            mm = dateNumbers[0];
-                            dd = dateNumbers[1];
-                            yyyy = dateNumbers[2];
-                        }
-                        
-                        if (dd && mm && yyyy) {
-                            if (yyyy < 100) yyyy += 2000;
-                            
-                            const timeMatch = timePart.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)/i);
-                            if (timeMatch) {
-                                let hour = parseInt(timeMatch[1]);
-                                const minute = parseInt(timeMatch[2]);
-                                const second = timeMatch[3] ? parseInt(timeMatch[3]) : 0;
-                                const meridian = (timeMatch[4] || "").toLowerCase();
-                                
-                                if (!isNaN(hour) && !isNaN(minute)) {
-                                    // Convert to 24-hour format
-                                    if (meridian === "pm" && hour !== 12) hour += 12;
-                                    if (meridian === "am" && hour === 12) hour = 0;
-                                    
-                                    // IST offset is +05:30 => 330 minutes
-                                    const istOffsetMinutes = 330;
-                                    const utcMs = Date.UTC(yyyy, mm - 1, dd, hour, minute, second) - istOffsetMinutes * 60 * 1000;
-                                    const d = new Date(utcMs);
-                                    if (!isNaN(d.getTime())) {
-                                        return d.getTime();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-               const native = new Date(dateString);
-                if (!isNaN(native.getTime())) return native.getTime();
-            } catch (error) {
-                console.warn("Failed to parse dateAdded:", dateString, error);
-            }
-            return 0;
-        };
-        
-        // Sort by updatedAt (most recently acted-upon first = stack behavior)
-        // Fall back to dateAdded/createdAt for jobs that haven't been moved yet
-        const allJobsSorted = allJobsRaw.sort((a, b) => {
-            const timeA = parseDateAdded(a.updatedAt || a.dateAdded || a.createdAt);
-            const timeB = parseDateAdded(b.updatedAt || b.dateAdded || b.createdAt);
-            if (timeB !== timeA) return timeB - timeA;
-            return b._id.toString().localeCompare(a._id.toString());
+            // Same instant: fall back to insert order, newest first.
+            return b.job._id.toString().localeCompare(a.job._id.toString());
         });
-        
-        // Strip extensionCode only (secret). Keep addedBy for timeline ("Added by …") in the app.
-        const allJobs = allJobsSorted.map((job) => {
+
+        // Strip extensionCode only (secret). Keep addedBy for timeline ("Added by ...").
+        //
+        // The *Ms fields are the sortable form of the locale strings above. They
+        // are additive: every existing consumer of dateAdded / updatedAt keeps
+        // working untouched, and anything that needs to ORDER cards should read
+        // activityAt instead of re-parsing a string that cannot be parsed
+        // reliably without this file's disambiguation rules.
+        const allJobs = withTimes.map(({ job, times }) => {
             const j = { ...job, _id: job._id.toString() };
             delete j.extensionCode;
+            j.createdAtMs = times.createdAtMs;
+            j.updatedAtMs = times.updatedAtMs;
+            j.appliedAtMs = times.appliedAtMs;
+            j.activityAt = times.activityAt;
             return j;
         });
 

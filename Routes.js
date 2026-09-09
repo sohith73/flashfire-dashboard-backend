@@ -5,10 +5,13 @@ import Login from "./Controllers/Login.js";
 import Register from "./Controllers/Register.js";
 import GoogleOAuth from "./Controllers/GoogleOAuth.js";
 import { getAllClients } from './Controllers/ClientController.js';
+import { getClientTrackingStatus } from './Controllers/ClientTrackingStatus.js';
+import { listAutopilotCreds, getAutopilotCreds, putAutopilotCreds } from './Controllers/AutopilotCreds.js';
 import { getDashboardManagers, getDashboardManagerByName, syncDashboardManagers } from './Controllers/DashboardManagerController.js';
 import Add_Update_Profile from "./Controllers/Add_Update_Profile.js";
 import AddJob from "./Controllers/AddJob.js";
 import GetAllJobs from "./Controllers/GetAllJobs.js";
+import Unsubscribe from "./Controllers/Unsubscribe.js";
 import Get24HourJobs from "./Controllers/Get24HourJobs.js";
 import StoreJobAndUserDetails, { saveToDashboard } from "./Controllers/StoreJobAndUserDetails.js";
 import UpdateChanges from "./Controllers/UpdateChanges.js";
@@ -48,6 +51,16 @@ import GetAllJobsOPS from "./Controllers/operations/GetAllJobs.js";
 import { getClientOperations, updateClientOperations, checkLockPeriod } from "./Controllers/operations/ClientOperations.js";
 import { reconcileExclusionJobsHandler } from "./Controllers/operations/reconcileExclusionJobs.js";
 import { queueAutoOptimizeSavedJobs } from "./Controllers/operations/QueueAutoOptimizeSavedJobs.js";
+import requireOpsKey from "./Middlewares/RequireOpsKey.js";
+import {
+  getClientReminderConfig,
+  updateClientReminderConfig,
+  setClientReminderPaymentEmail,
+  sendClientReminderNow,
+  testClientReminderMattermost,
+  previewClientReminder,
+  getClientReminderHistory
+} from "./Controllers/operations/ClientReminders.js";
 import ForgotPassword from "./Controllers/ForgotPassword.js";
 import ExtensionLogin from "./Controllers/Extensions/login.js";
 import { GeminiJudge } from "./Controllers/Extensions/geminiJudge.js";
@@ -56,6 +69,9 @@ import { OpenAiJudge } from "./Controllers/Extensions/openaiJudge.js";
 import { ReciveData } from "./Controllers/Extensions/reciveData.js";
 import { extractJobData } from "./Controllers/Extensions/extractJobData.js";
 import ClientLogin from "./Controllers/Extensions/clientLogin.js";
+import { getSpeedyApplyProfile, saveSpeedyApplyProfile } from "./Controllers/Extensions/speedyApplyProfile.js";
+import { onboardingTick } from "./src/services/onboardingMailWorker.js";
+import { OnboardingMailStatus, SendOnboardingMailStep } from "./Controllers/OnboardingMailStatus.js";
 import { getExtensionExclusionLists } from "./Controllers/Extensions/exclusionLists.js";
 import { getExtensionSettings, updateExtensionSettings } from "./Controllers/Extensions/settings.js";
 import { extGetProfile, extPatchProfile } from "./Controllers/Extensions/profileExt.js";
@@ -65,7 +81,7 @@ import { UserModel } from "./Schema_Models/UserModel.js";
 import CheckProfile from "./Controllers/CheckProfile.js";
 import GetProfile from "./Controllers/GetProfile.js";
 import UpdateAiSummary from "./Controllers/UpdateAiSummary.js";
-import BuildAiSummary from "./Controllers/BuildAiSummary.js";
+import BuildAiSummary, { AiSummaryStatus } from "./Controllers/BuildAiSummary.js";
 import {
   SaveSummaryOverlay,
   ClearSummaryOverlay,
@@ -84,6 +100,7 @@ import ExtensionTodayStats from "./Controllers/ExtensionTodayStats.js";
 import ExtensionDailyHistory from "./Controllers/ExtensionDailyHistory.js";
 import PricingInfo from "./Controllers/PricingInfo.js";
 import AiCostReport from "./Controllers/AiCostReport.js";
+import ScrapeCostHistory from "./Controllers/ScrapeCostHistory.js";
 import { generateSessionKey, listSessionKeys, revokeSession, revokeUserSessions, listActiveSessions, verifySessionKey } from "./Controllers/operations/SessionKeys.js";
 import gmailRouter from "./Controllers/GmailRouter.js";
 import gmailInboxRouter from "./Controllers/GmailInboxRouter.js";
@@ -106,27 +123,54 @@ app.post("/google-oauth", GoogleOAuth);
 // exists, so nothing about this endpoint may be self-service.
 app.post("/api/clients/register", AdminKeyVerify, RegisterVerify, Register);
 app.get("/api/clients/all", getAllClients);
+app.get("/api/clients/tracking-status", getClientTrackingStatus);
+// Autopilot credential store - shared-secret gated, see Controllers/AutopilotCreds.js
+app.get("/autopilot/creds", requireOpsKey, listAutopilotCreds);
+app.get("/autopilot/creds/:email", requireOpsKey, getAutopilotCreds);
+app.put("/autopilot/creds/:email", requireOpsKey, putAutopilotCreds);
 app.get("/api/dashboard-managers", getDashboardManagers);
 app.get("/sync/managers", syncDashboardManagers);
 app.post("/refresh-token", RefreshToken);
 app.post('/get-updated-user', async (req, res) => {
   try {
-    const existanceOfUser = await UserModel.findOne({ email: req.body.email });
-    res.status(200).json({
-      name: existanceOfUser?.name,
-      email: existanceOfUser?.email,
-      planType: existanceOfUser?.planType,
-      userType: existanceOfUser?.userType,
-      planLimit: existanceOfUser?.planLimit,
-      resumeLink: existanceOfUser?.resumeLink,
-      coverLetters: existanceOfUser?.coverLetters,
-      optimizedResumes: existanceOfUser?.optimizedResumes,
-      transcript: existanceOfUser?.transcript,
-      portfolioLinks: existanceOfUser?.portfolioLinks || [],
-      dashboardManager: existanceOfUser?.dashboardManager
+    const email = req.body?.email;
+    if (!email) {
+      return res.status(400).json({ message: "email is required", code: "MISSING_EMAIL" });
+    }
+
+    const existanceOfUser = await UserModel.findOne({ email });
+
+    // A miss used to fall through to the 200 below, which serialised every
+    // field as undefined and shipped `{"portfolioLinks":[]}` with no email.
+    // The dashboard trusted that and overwrote its stored session with it,
+    // stranding the user in a half-authenticated state that survived reloads
+    // and could only be escaped by clearing site data. Operators legitimately
+    // miss here because they live in the Operations collection, so answer 404
+    // and let the client keep the session it already has.
+    if (!existanceOfUser) {
+      return res.status(404).json({ message: "User not found", code: "ACCOUNT_NOT_FOUND" });
+    }
+
+    return res.status(200).json({
+      name: existanceOfUser.name,
+      email: existanceOfUser.email,
+      planType: existanceOfUser.planType,
+      userType: existanceOfUser.userType,
+      planLimit: existanceOfUser.planLimit,
+      resumeLink: existanceOfUser.resumeLink,
+      coverLetters: existanceOfUser.coverLetters,
+      optimizedResumes: existanceOfUser.optimizedResumes,
+      transcript: existanceOfUser.transcript,
+      portfolioLinks: existanceOfUser.portfolioLinks || [],
+      dashboardManager: existanceOfUser.dashboardManager,
+      currency: existanceOfUser.currency || "USD",
+      addons: existanceOfUser.addons || [],
+      amountPaid: existanceOfUser.amountPaid || "0",
     })
   } catch (error) {
-    console.log(error)
+    // This used to log and never respond, hanging the request until timeout.
+    console.error('get-updated-user error:', error);
+    return res.status(500).json({ message: "Internal server error" });
   }
 })
 
@@ -297,6 +341,53 @@ app.post('/get-referral-stats', async (req, res) => {
   }
 });
 
+// Plan usage — read-only view of the SAME numbers /addjob enforces, so the
+// dashboard can show the limit and stop a job card being started once it is
+// reached instead of only failing at submit. Deliberately reuses checkPlanCap
+// (Utils/dailyCapGuard.js) rather than recomputing: one source of truth means
+// the banner can never disagree with the gate. Removed/deleted jobs are already
+// excluded by countTotalJobs, and referral + addon bonuses are already stacked.
+app.post("/plan-usage", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({
+        success: false,
+        error: "BAD_INPUT",
+        message: "email is required",
+      });
+    }
+
+    const { checkPlanCap } = await import("./Utils/dailyCapGuard.js");
+    const check = await checkPlanCap(email);
+
+    return res.status(200).json({
+      success: true,
+      email,
+      planType: check.planType || null,
+      // cap === null means this client has no recognisable plan → uncapped.
+      cap: check.cap,
+      used: check.count,
+      remaining: check.cap == null ? null : Math.max(0, check.cap - check.count),
+      allowed: check.allowed,
+      baseCap: check.baseCap,
+      referralBonus: check.referralBonus,
+      referralCount: check.referralCount,
+      addonBonus: check.addonBonus,
+      addonCount: check.addonCount,
+      reason: check.reason || null,
+      message: check.message || null,
+    });
+  } catch (error) {
+    console.error("Error computing plan usage:", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Server error",
+      message: "Failed to compute plan usage",
+    });
+  }
+});
+
 // Profile routes
 app.get("/get-profile", GetProfile);
 app.post("/check-profile", CheckProfile);
@@ -307,6 +398,9 @@ app.post("/update-ai-summary", UpdateAiSummary);
 // Server-side candidate brief builder. Consumers (JR-direct extension)
 // just POST { email } — backend pulls profile + resume + calls OpenAI.
 app.post("/build-ai-summary", BuildAiSummary);
+// Poll target for the async build above — returns { status, builtAt,
+// lastError, aiSummary, ... }. status: idle|building|done|error.
+app.get("/ai-summary-status", AiSummaryStatus);
 // Summary format overlay: operator-saved "format snapshot" so future rebuilds
 // re-inject operator-added bullets. Save = enable + write snapshot.
 // Clear = disable (snapshot retained). Get = read current state + stats.
@@ -339,6 +433,7 @@ app.get("/admin/pricing-info", PricingInfo);
 // Real AI spend for an IST day, by pipeline + model. Reconciles the Discord
 // milestone embed against the OpenAI usage dashboard.
 app.get("/admin/ai-cost", AiCostReport);
+app.get("/admin/scrape-cost/history", ScrapeCostHistory);
 app.post("/upload-profile-file", upload.single('file'), uploadProfileFile);
 
 // Generic file upload routes (supports both Cloudinary and R2)
@@ -463,6 +558,37 @@ app.post('/operations/reconcile-exclusion-jobs', reconcileExclusionJobsHandler);
 app.post('/operations/check-lock-period', checkLockPeriod);
 app.post('/operations/auto-optimize-saved', queueAutoOptimizeSavedJobs);
 
+// Client Reminders — operator-configured recurring reports for one client.
+//
+// Operations picks which of the Utils/reminderItems.js catalogue items a client
+// receives, on what IST schedule, and over which channels: the client's payment
+// email (existing SMTP) and/or a client-specific Mattermost incoming webhook.
+// src/services/clientReminderWorker.js does the actual delivery every five
+// minutes; these routes only read and write the configuration, plus a preview
+// and a manual "send now" that both run through that same worker code so what
+// an operator approves is exactly what the schedule ships.
+//
+// Product rule enforced downstream in the worker: a period with zero jobs added
+// AND zero applications submitted sends nothing at all. Silence beats an empty
+// digest.
+//
+// Every route is gated by requireOpsKey (header `x-ops-key`), because they can
+// email a paying client and post into their Mattermost channel.
+// Unsubscribe. NO AUTH on purpose: the link has to work from an email client
+// with no session, and the HMAC in it is the authorisation. GET serves a page
+// for a human; POST is the one-click action Gmail and Yahoo perform on the
+// user's behalf (RFC 8058). See Utils/unsubscribe.js.
+app.get('/unsubscribe', Unsubscribe);
+app.post('/unsubscribe', Unsubscribe);
+
+app.post('/operations/reminders/get', requireOpsKey, getClientReminderConfig);
+app.put('/operations/reminders', requireOpsKey, updateClientReminderConfig);
+app.post('/operations/reminders/payment-email', requireOpsKey, setClientReminderPaymentEmail);
+app.post('/operations/reminders/send-now', requireOpsKey, sendClientReminderNow);
+app.post('/operations/reminders/test-mattermost', requireOpsKey, testClientReminderMattermost);
+app.post('/operations/reminders/preview', requireOpsKey, previewClientReminder);
+app.post('/operations/reminders/history', requireOpsKey, getClientReminderHistory);
+
 //extensions
 app.post('/extension/login', ExtensionLogin);
 app.post('/extension/sendData', ReciveData);
@@ -474,6 +600,25 @@ app.post('/extension/settings/update', updateExtensionSettings);
 app.post('/extension/clientLogin', ClientLogin);
 app.get('/extension/profile', ExtensionAuth, extGetProfile);
 app.patch('/extension/profile', ExtensionAuth, extPatchProfile);
+// SpeedyApply autofill sync — save/load a client's profile so it restores on
+// login from any machine. Auth is the clientLogin JWT (Bearer), verified inside.
+app.get('/extension/speedyapply/profile', getSpeedyApplyProfile);
+app.post('/extension/speedyapply/profile', saveSpeedyApplyProfile);
+// Onboarding email sequence — manual trigger (runs backfill → detect → send-due).
+// Safe to call: backfill guards against retro-emailing existing clients.
+app.post('/admin/onboarding-mail/run-now', async (_req, res) => {
+  try {
+    const summary = await onboardingTick({ trigger: "manual" });
+    res.json({ ok: !summary.error, ...summary });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "onboarding_run_failed" });
+  }
+});
+// Per-client onboarding-mail state (résumé / cover letter / LinkedIn) + the
+// manual send-now escape hatch. Read by the Onboarding Emails panel in
+// clients-tracking → Client Onboarding → ticket modal.
+app.get('/admin/onboarding-mail/status', OnboardingMailStatus);
+app.post('/admin/onboarding-mail/send-step', SendOnboardingMailStep);
 // Gemini (Vertex AI) judge slice — extension routes ~10-15% of judge
 // batches here; OpenAI handles the rest in-worker.
 app.post('/extension/gemini-judge', GeminiJudge);
@@ -512,6 +657,35 @@ import { listActivity, listActivityFacets, ingestActivity } from "./Controllers/
 app.get("/admin/activity", listActivity);
 app.get("/admin/activity/facets", listActivityFacets);
 app.post("/admin/activity/ingest", ingestActivity);
+
+// IP → location administration. Everything the CLI scripts do, reachable from
+// the deployed service (Render gives no shell). Unlike the read-only activity
+// views above these MUTATE data and spend provider quota, so the admin token
+// gate stays on.
+//   GET    /admin/geo/status              resolver + cache health
+//   GET    /admin/geo/top?limit=20        busiest IPs, flagged when shared
+//   GET    /admin/geo/inspect/:ip         each provider's answer + the verdict
+//   GET    /admin/geo/overrides           list pinned networks
+//   POST   /admin/geo/overrides           pin / update one
+//   DELETE /admin/geo/overrides/:cidr     unpin ("1.2.3.0-24" or "1.2.3.0/24")
+//   POST   /admin/geo/backfill            start an async backfill job
+//   GET    /admin/geo/backfill            job progress
+//   DELETE /admin/geo/backfill            cancel the running job
+import { verifyAdminForActivity } from "./Controllers/ActivityController.js";
+import {
+  geoStatus, geoTop, geoInspect,
+  listOverrides, upsertOverride, deleteOverride,
+  startBackfill, backfillStatus, cancelBackfill,
+} from "./Controllers/GeoController.js";
+app.get("/admin/geo/status", verifyAdminForActivity, geoStatus);
+app.get("/admin/geo/top", verifyAdminForActivity, geoTop);
+app.get("/admin/geo/inspect/:ip", verifyAdminForActivity, geoInspect);
+app.get("/admin/geo/overrides", verifyAdminForActivity, listOverrides);
+app.post("/admin/geo/overrides", verifyAdminForActivity, upsertOverride);
+app.delete("/admin/geo/overrides/:cidr", verifyAdminForActivity, deleteOverride);
+app.post("/admin/geo/backfill", verifyAdminForActivity, startBackfill);
+app.get("/admin/geo/backfill", verifyAdminForActivity, backfillStatus);
+app.delete("/admin/geo/backfill", verifyAdminForActivity, cancelBackfill);
 
 app.use("/gmail", gmailRouter);
 app.use("/gmail/inbox", gmailInboxRouter);

@@ -42,6 +42,21 @@ export const JobSchema = new mongoose.Schema({
     required: true,
     default: 'unknown'
   },
+  /**
+   * Canonical form of `joblink`, produced by Utils/jobLinkKey.js. Duplicate
+   * detection compares THIS, never the raw link: ?utm_source=…, a trailing
+   * slash and a www. prefix all describe the same posting, and comparing raw
+   * strings let the same URL in five times for one client.
+   *
+   * Empty string means the link carries no identity (blank, or a placeholder
+   * like www.google.com). Readers must treat '' as "cannot compare" and skip
+   * the check, or every blank-link job matches every other one.
+   */
+  joblinkKey: {
+    type: String,
+    required: false,
+    default: ''
+  },
   /** Job location (e.g. from extension); used for exclusion reconciliation */
   jobLocation: {
     type: String,
@@ -249,6 +264,19 @@ JobSchema.index({ jobID: 1, userID: 1 });
 // Index for sorting by most recently updated (for job tracker) - kept for backward compatibility
 JobSchema.index({ userID: 1, updatedAt: -1 });
 JobSchema.index({ userID: 1, dateAdded: -1 });
+// Duplicate-link lookup on the add path. Deliberately NOT unique:
+//   • joblink defaults to '' and operators paste placeholders, so hundreds of
+//     rows legitimately share an empty key and a unique index would reject them
+//   • duplicates already exist in the collection, so building a unique index
+//     would fail outright
+//   • a race would surface as a raw E11000 to the operator instead of the
+//     readable "already added" message the controllers return
+// The application-level check in Utils/jobLinkKey.js is the guard; this index
+// only makes it fast.
+JobSchema.index({ userID: 1, joblinkKey: 1 });
+// Shared-application-form guard: counts how many distinct employers one link is
+// recorded under, across ALL clients, so userID cannot lead the index here.
+JobSchema.index({ joblinkKey: 1 });
 // Index for auto-optimization worker polling
 JobSchema.index({ 'autoOptimization.status': 1, 'autoOptimization.retryAfter': 1, _id: 1 });
 // Index for second-judge worker polling

@@ -228,7 +228,7 @@ export const profileSchema = new mongoose.Schema({
   },
   visaStatus: {
     type: String,
-    enum: ["CPT", "F1", "F1 OPT", "F1 STEM OPT", "H1B", "Green Card", "U.S. Citizen", "Canadian Citizen", "Permanent Resident (PR)", "Post-Graduation Work Permit (PGWP)", "Open Work Permit (OWP)", "Employer-Specific (Closed) Work Permit", "Study Permit", "Other"],
+    enum: ["CPT", "F1", "F1 OPT", "F1 STEM OPT", "H1B", "Green Card", "U.S. Citizen", "Canadian Citizen", "Permanent Resident (PR)", "Post-Graduation Work Permit (PGWP)", "Open Work Permit (OWP)", "Employer-Specific (Closed) Work Permit", "Study Permit", "Student Visa", "Short-term Study Visa", "Graduate Visa", "Skilled Worker Visa", "Global Talent Visa", "Other"],
     required: true,
   },
   otherVisaType: {
@@ -463,11 +463,19 @@ export const profileSchema = new mongoose.Schema({
   // Maximum number of jobs operators are allowed to push for this
   // client. /addjob checks JobModel.count vs this and refuses past the
   // cap with TARGET_REACHED so we don't over-fill the tracker. Set in
-  // CT RegisterClient or the AI Summary admin tab. 0/null = no cap.
+  // CT RegisterClient or the AI Summary admin tab.
+  //
+  // Defaults to 30 so every new client is capped at the standard daily
+  // target out of the box. NOTE: this default only stamps NEWLY created
+  // profiles — pre-existing rows with a null value are not migrated, but
+  // dailyCapGuard.readCap already treats null/0 as the same 30 (its
+  // DEFAULT_DAILY_CAP), so uncapped legacy clients are enforced at 30 too.
+  // There is no "unlimited" value: a positive number sets an explicit cap,
+  // anything else resolves to the 30 default.
   targetJobCount: {
     type: Number,
     required: false,
-    default: null,
+    default: 30,
     min: 0,
     max: 10000,
   },
@@ -496,6 +504,17 @@ export const profileSchema = new mongoose.Schema({
     // cron sweeper to skip recently-failed profiles, avoiding wasted
     // OpenAI/Gemini calls on broken profiles every 30 min.
     lastAttemptAt: { type: Date, required: false, default: null },
+    // Async build lifecycle. POST /build-ai-summary now returns 202 and runs
+    // the OpenAI work in the background (the full build is 90-150s, longer
+    // than Cloudflare's ~100s origin timeout, so a synchronous response 502s).
+    //   status         — "idle" | "building" | "done" | "error"
+    //   buildStartedAt — when the current/last background build began
+    //   lastError      — { error, message, step } from the last failed build
+    // The clients-tracking AI Summary page polls GET /ai-summary-status until
+    // status leaves "building".
+    status: { type: String, required: false, default: "idle" },
+    buildStartedAt: { type: Date, required: false, default: null },
+    lastError: { type: Object, required: false, default: null },
     // Per-bullet provenance map from the AI build. Each # section header
     // maps to two parallel arrays of source codes — one per bullet, one per
     // prose line — in document order. Codes: "R" = resume, "P" = profile,
@@ -541,6 +560,18 @@ export const profileSchema = new mongoose.Schema({
     type: Boolean,
     required: false,
     default: true,
+  },
+  // When a rebuild trigger fires while a build is ALREADY running, that
+  // trigger is skipped (two concurrent builds race on the same document) and
+  // its timestamp is recorded here instead. The running build compares this
+  // against its own start time on persist: newer means it never saw the change
+  // that fired the skipped trigger, so it leaves summaryStale=true and the
+  // 30-min sweep rebuilds. Lives OUTSIDE aiSummaryMeta on purpose — the build
+  // rewrites that whole object and would clobber the flag.
+  summaryRebuildRequestedAt: {
+    type: Date,
+    required: false,
+    default: null,
   },
   // Operator-saved "format overlay". When enabled, every future
   // BuildAiSummary rebuild re-injects the bullets the operator added on top

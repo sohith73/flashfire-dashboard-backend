@@ -2,6 +2,25 @@ import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { UserModel } from "../Schema_Models/UserModel.js";
 import { getAppSettings } from "../Schema_Models/AppSettings.js";
 
+function escapeRegex(s) {
+  return String(s).replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+}
+
+// resolveProfile — same lookup ladder buildSummaryForEmail and
+// UpdateChanges.recordRemovalFeedbackAndRebuild use: exact lowercase first,
+// then a case-insensitive match for legacy mixed-case profile rows.
+// Without the fallback this route 404s on exactly the profiles those two
+// WRITE to, so a summary would build fine and then be invisible to both
+// consumers (clients-tracking's AI Summary tab and the extension).
+async function resolveProfile(email) {
+  const lower = String(email).toLowerCase();
+  const hit = await ProfileModel.findOne({ email: lower }).lean();
+  if (hit) return hit;
+  return ProfileModel.findOne({
+    email: { $regex: new RegExp(`^${escapeRegex(email)}$`, "i") },
+  }).lean();
+}
+
 export default async function GetProfile(req, res) {
   try {
     const { email } = req.query;
@@ -11,8 +30,10 @@ export default async function GetProfile(req, res) {
     }
 
     const [profile, user] = await Promise.all([
-      ProfileModel.findOne({ email }).lean(), // Use lean() for better performance and modifiable object
-      UserModel.findOne({ email }).select('removedJobsCount').lean()
+      resolveProfile(email),
+      UserModel.findOne({ email: { $regex: new RegExp(`^${escapeRegex(email)}$`, "i") } })
+        .select('removedJobsCount')
+        .lean()
     ]);
 
     if (!profile) {

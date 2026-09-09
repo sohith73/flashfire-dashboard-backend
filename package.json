@@ -14,7 +14,14 @@
     "migrate:r2": "node scripts/migrate-resume-data-to-r2.js --batch-size=50 --use-url-in-key",
     "migrate:r2:dry": "node scripts/migrate-resume-data-to-r2.js --dry-run",
     "migrate:r2:user": "node scripts/migrate-resume-data-to-r2.js --user=someone@example.com",
-    "verify:mail": "node scripts/verify-mail-pipeline.mjs"
+    "verify:mail": "node scripts/verify-mail-pipeline.mjs",
+    "verify:client-alerts": "node scripts/verify-client-alerts.mjs",
+    "verify:mail-rules": "node scripts/verify-mail-rules.mjs",
+    "verify:client-smtp": "node scripts/verify-client-smtp.mjs",
+    "verify:mail-monitor": "node scripts/verify-mail-monitor.mjs",
+    "verify:client-reminders": "node scripts/verify-client-reminders.mjs",
+    "backfill:location": "node scripts/backfill-activity-location.mjs",
+    "geo:inspect": "node scripts/inspect-ip-location.mjs"
   },
   "keywords": [
     "flashfire",
@@ -48,7 +55,9 @@
     "mongoose": "^8.16.1",
     "multer": "^2.0.2",
     "node-cron": "^3.0.3",
-    "sharp": "^0.34.5"
+    "nodemailer": "^8.0.11",
+    "sharp": "^0.34.5",
+    "stripe": "^22.4.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
