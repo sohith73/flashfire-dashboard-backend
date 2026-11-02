@@ -108,6 +108,7 @@ import ClientLogin from "./Controllers/Extensions/clientLogin.js";
 import { getSpeedyApplyProfile, saveSpeedyApplyProfile } from "./Controllers/Extensions/speedyApplyProfile.js";
 import { speedyApplyLogin, getSpeedyApplyAccessCode, rotateSpeedyApplyAccessCode } from "./Controllers/Extensions/speedyApplyAccess.js";
 import { listSpeedyApplyOptimizedResumes, getSpeedyApplyOptimizedResumePdf } from "./Controllers/Extensions/speedyApplyResumes.js";
+import { listSpeedyApplyCoverLetters, getSpeedyApplyCoverLetterFile } from "./Controllers/Extensions/speedyApplyCoverLetters.js";
 import SpeedyApplyAuth from "./Middlewares/SpeedyApplyAuth.js";
 import { onboardingTick } from "./src/services/onboardingMailWorker.js";
 import { OnboardingMailStatus, SendOnboardingMailStep } from "./Controllers/OnboardingMailStatus.js";
@@ -793,6 +794,10 @@ app.post('/extension/speedyapply/ask', SpeedyApplyAuth, askSpeedyApplyAi);
 // and one of them as the PDF the job card downloads (built by the PDF server).
 app.get('/extension/speedyapply/optimized-resumes', SpeedyApplyAuth, listSpeedyApplyOptimizedResumes);
 app.get('/extension/speedyapply/optimized-resumes/:jobId/pdf', SpeedyApplyAuth, getSpeedyApplyOptimizedResumePdf);
+// SpeedyApply cover letters: the client's uploaded cover letter files, sent as
+// stored (not rebuilt by the PDF server).
+app.get('/extension/speedyapply/cover-letters', SpeedyApplyAuth, listSpeedyApplyCoverLetters);
+app.get('/extension/speedyapply/cover-letters/:id/file', SpeedyApplyAuth, getSpeedyApplyCoverLetterFile);
 // Shared learning: label aliases merged across all clients (daily, src/services/speedyApplyLearningWorker.js).
 // app.get('/extension/speedyapply/shared-learning', SpeedyApplyAuth, getSpeedyApplySharedLearning);
 // Onboarding email sequence — manual trigger (runs backfill → detect → send-due).
