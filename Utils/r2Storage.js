@@ -348,6 +348,23 @@ export async function getJSONFromR2(key) {
 }
 
 /**
+ * Read any object from R2 as bytes (e.g. an uploaded cover letter PDF).
+ * @param {string} key - The R2 key
+ * @returns {Promise<{success: true, buffer: Buffer, contentType: string} | {success: false, error: string}>}
+ */
+export async function getObjectFromR2(key) {
+  try {
+    const response = await r2Client.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+    const chunks = [];
+    for await (const chunk of response.Body) chunks.push(chunk);
+    return { success: true, buffer: Buffer.concat(chunks), contentType: response.ContentType || '' };
+  } catch (error) {
+    console.error('R2 object retrieve error:', error?.name || error?.message || error);
+    return { success: false, error: error?.message || String(error) };
+  }
+}
+
+/**
  * Check if JSON data exists in R2
  * @param {string} key - The R2 key to check
  * @returns {Promise<boolean>} True if exists
