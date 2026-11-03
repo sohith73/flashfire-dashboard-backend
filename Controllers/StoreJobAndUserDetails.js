@@ -363,7 +363,7 @@ export async function saveToDashboard(req, res) {
                 // "US H-1B sponsors only" (Utils/usVisaSponsor.js). Fails closed per client.
                 let usBlock;
                 try {
-                    usBlock = await usSponsorPushBlock({ email: userEmail, companyName: company });
+                    usBlock = await usSponsorPushBlock({ email: userEmail, companyName: company, jobDescription: description });
                 } catch (e) {
                     console.error("usSponsorPushBlock failed (saveToDashboard):", e.message);
                     summary.failedWithError++;

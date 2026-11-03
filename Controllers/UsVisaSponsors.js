@@ -3,6 +3,8 @@
 //   GET  /us-sponsor-only?email=           -> is this a US client, is the switch on, data status
 //   POST /update-us-sponsor-only           { email, enabled, updatedBy? } -> flip the switch
 //   GET  /us-visa-sponsors/lookup?company= -> would this employer pass?
+//   POST /us-visa-sponsors/lookup { company, description? } -> same, plus would
+//        this posting pass (description too long for a query string)
 //
 // Same access model as the UK endpoints next to them (/uk-sponsor-only): the
 // clients-tracking AI Summary page calls these from the browser. The switch can
@@ -12,6 +14,7 @@
 import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { resolveClientCountry } from "../Utils/ukVisaSponsor.js";
 import { lookupUsSponsor, usSponsorStatus, loadUsSponsors } from "../Utils/usVisaSponsor.js";
+import { detectNoSponsorship } from "../Utils/noSponsorshipText.js";
 
 const cleanEmail = (raw) => String(raw || "").toLowerCase().trim();
 
@@ -117,14 +120,17 @@ export async function UpdateUsSponsorOnly(req, res) {
 
 export async function LookupUsSponsor(req, res) {
   try {
-    const company = String(req.query?.company || "").trim().slice(0, 200);
+    const company = String(req.body?.company ?? req.query?.company ?? "").trim().slice(0, 200);
+    const description = String(req.body?.description ?? "").slice(0, 60000);
     if (!company) {
       return res.status(400).json({ success: false, error: "BAD_INPUT", message: "company is required" });
     }
     if (!dataStatus().loaded) {
       return res.status(503).json({ success: false, error: "US_SPONSOR_DATA_NOT_LOADED", message: "US H-1B sponsor data is not loaded on the server." });
     }
-    return res.json({ success: true, company, since: usSponsorStatus().since, ...lookupUsSponsor(company) });
+    // posting is null when no description was sent, so the shape never changes.
+    const posting = description.trim() ? detectNoSponsorship(description) : null;
+    return res.json({ success: true, company, since: usSponsorStatus().since, ...lookupUsSponsor(company), posting });
   } catch (err) {
     console.error("LookupUsSponsor error:", err);
     return res.status(500).json({ success: false, error: "INTERNAL", message: err.message });

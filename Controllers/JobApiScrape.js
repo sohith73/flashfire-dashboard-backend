@@ -194,7 +194,7 @@ export async function importJobs({
       const us = await usSponsorGate({ email: clientEmail, profile });
       if (us) {
         sponsorKind = "US H-1B";
-        gate = { check: async (company) => us.check(company) };
+        gate = { check: async (company, description) => us.check(company, description) };
       }
     }
     if (gate) {
@@ -203,7 +203,7 @@ export async function importJobs({
       // uncached lookup is a query; this keeps the pool free for the app.
       for (let i = 0; i < fresh.length; i += 10) {
         const slice = fresh.slice(i, i + 10);
-        const verdicts = await Promise.all(slice.map(({ job }) => gate.check(job.company)));
+        const verdicts = await Promise.all(slice.map(({ job }) => gate.check(job.company, job.description)));
         slice.forEach((entry, k) => { if (!verdicts[k]) kept.push(entry); });
       }
       counts.notSponsor = fresh.length - kept.length;
