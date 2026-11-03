@@ -542,6 +542,7 @@ app.get("/uk-visa-sponsors/lookup", LookupUkSponsor);
 app.get("/us-sponsor-only", GetUsSponsorOnly);
 app.post("/update-us-sponsor-only", UpdateUsSponsorOnly);
 app.get("/us-visa-sponsors/lookup", LookupUsSponsor);
+app.post("/us-visa-sponsors/lookup", LookupUsSponsor);
 app.post("/update-openai-key", UpdateOpenaiKey);
 app.get("/admin/global-openai-key", GetGlobalOpenaiKey);
 app.post("/admin/global-openai-key", SetGlobalOpenaiKey);

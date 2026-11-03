@@ -353,6 +353,7 @@ export default async function AddJob(req, res) {
                 usBlock = await usSponsorPushBlock({
                     email: clientForExclusions,
                     companyName: jobDetails?.companyName,
+                    jobDescription: jobDetails?.jobDescription,
                 });
             } catch (e) {
                 console.error('usSponsorPushBlock failed:', e.message);
@@ -370,6 +371,7 @@ export default async function AddJob(req, res) {
                     client: clientForExclusions,
                     company: jobDetails?.companyName || '',
                     reason: usBlock.sponsor?.reason || null,
+                    quote: usBlock.posting?.quote || null,
                     ts: new Date().toISOString(),
                 }));
                 return res.status(usBlock.status).json({
