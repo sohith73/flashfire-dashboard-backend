@@ -819,6 +819,21 @@ test("ingest refuses a Glassdoor link that never reached the employer", async ()
     "a Glassdoor page must not even reach the judge");
 });
 
+test("ingest accepts HiringCafe employer jobs and refuses both board domains", async () => {
+  reset();
+  judgeResult = judgeIds(["hc-3"]);
+  const r = await ingest({ provider: "hiringcafe", jobs: [
+    indeedJob(1, { jobId: "hc-1", applyUrl: "https://hiring.cafe/job/1" }),
+    indeedJob(2, { jobId: "hc-2", applyUrl: "https://www.hiringcafe.com/job/2" }),
+    indeedJob(3, { jobId: "hc-3" }),
+  ] });
+  assert.equal(r.code, 200);
+  assert.equal(r.body.invalid, 2);
+  assert.equal(r.body.pushed, 1);
+  assert.equal(created[0].importSource, "hiringcafe-scrape");
+  assert.deepEqual(judgeCalls.flatMap((c) => c.jobs.map((j) => j.jobId)), ["hc-3"]);
+});
+
 test("ingest refuses a provider it does not know", async () => {
   reset();
   const r = await ingest({ provider: "monster", jobs: [indeedJob(1)] });
