@@ -414,12 +414,12 @@ export const runJobApiScrape = async (req, res) => {
 // Only providers named below are accepted. Each one gets its own
 // importSource, so a card always says which API it came from.
 
-export const INGEST_PROVIDERS = Object.freeze({ indeed: "indeed-api", glassdoor: "glassdoor-scrape" });
+export const INGEST_PROVIDERS = Object.freeze({ indeed: "indeed-api", glassdoor: "glassdoor-scrape", hiringcafe: "hiringcafe-scrape" });
 
 // A provider's own pages are never an apply link. indeed.com is already on
 // the blocked-host list; glassdoor is not, so a Glassdoor link that never
 // resolved to the employer is refused here rather than pushed.
-const PROVIDER_OWN_HOST = Object.freeze({ glassdoor: /(^|\.)glassdoor\.[a-z.]+$/i });
+const PROVIDER_OWN_HOST = Object.freeze({ hiringcafe: /(^|\.)(hiring\.cafe|hiringcafe\.com)$/i, glassdoor: /(^|\.)glassdoor\.[a-z.]+$/i });
 
 function isProviderOwnLink(provider, applyUrl) {
   const re = PROVIDER_OWN_HOST[provider];
