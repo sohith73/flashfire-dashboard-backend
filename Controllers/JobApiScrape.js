@@ -11,6 +11,7 @@ import { usSponsorGate } from "../Utils/usVisaSponsor.js";
 import { companyAllowlistGate } from "../Utils/companyAllowlist.js";
 import { jobLinkKey } from "../Utils/jobLinkKey.js";
 import { classifyApplyUrl } from "../Utils/applyUrlPolicy.js";
+import { initialAutoOptimization } from "../Utils/autoOptimizationState.js";
 
 // "Scrape from Job APIs" - the server-side half of the autopilot's second mode.
 //
@@ -255,13 +256,17 @@ export async function importJobs({
   const pushedJobs = [];
   for (const { job, key } of picks) {
     const d = byId.get(job.jobId) || {};
+    const jobDescription = String(job.description || "").slice(0, MAX_DESCRIPTION_CHARS);
     try {
       await JobModel.create({
         userID: clientEmail,
         jobTitle: job.title.slice(0, 50),
         companyName: job.company,
         jobLocation: job.location,
-        jobDescription: String(job.description || "").slice(0, MAX_DESCRIPTION_CHARS),
+        jobDescription,
+        // Without this the card defaults to status null and the resume
+        // optimizer never picks it up.
+        autoOptimization: initialAutoOptimization(jobDescription),
         joblink: job.applyUrl,
         joblinkKey: key,
         currentStatus: "saved",
