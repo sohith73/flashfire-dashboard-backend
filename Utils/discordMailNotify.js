@@ -131,6 +131,11 @@ const AUTH_ERROR_PATTERNS = [
   /invalid authentication credentials/i,
   /login required/i,
   /missing required authentication/i,
+  // App-password mailboxes (IMAP / SMTP): Google refused the password, or it
+  // can no longer be decrypted. Either way an operator has to replace it.
+  /AUTHENTICATIONFAILED/,
+  /APP_PASSWORD_REJECTED/,
+  /SECRET_UNREADABLE/,
   status("401"),
   /\b401\s+unauthorized\b/i
 ];

@@ -30,7 +30,13 @@
 // Nothing here throws out of pollOnce(). One broken mailbox must not stop the rest.
 
 import cron from "node-cron";
-import { GmailUser } from "../../Schema_Models/GmailUser.js";
+import {
+  listPollableMailboxes,
+  markMailboxAuthFailed,
+  markMailboxHealthy,
+  MAILBOX_KIND
+} from "./mailbox/mailboxRegistry.js";
+import { GmailImapSession } from "./mailbox/gmailImap.js";
 import { GmailPollState } from "../../Schema_Models/GmailPollState.js";
 import { MailDigest } from "../../Schema_Models/MailDigest.js";
 import { UserModel } from "../../Schema_Models/UserModel.js";
@@ -352,6 +358,28 @@ async function retryPendingDigests({ user, client, state }) {
   return recovered;
 }
 
+// ─── Mail sources ───────────────────────────────────────────────────
+
+// A mailbox is read either over IMAP (app password) or the Gmail REST API
+// (OAuth). Both expose the same two calls and return the same shapes, and
+// both use Gmail's own message ids, so everything below this is unchanged.
+async function openMailSource(mailbox) {
+  if (mailbox.kind === MAILBOX_KIND.APP_PASSWORD) {
+    const session = await GmailImapSession.open({ gmailEmail: mailbox.email, password: mailbox.getPassword() });
+    return {
+      listNewMessageIds: (afterSec) => session.listNewInboxIds(afterSec, MAX_COLLECT),
+      fetchMessage: (id) => session.fetchMessageForScan(id, { maxAttachmentBytes: MAX_ATTACHMENT_BYTES }),
+      close: () => session.close()
+    };
+  }
+  const gmail = gmailClientForUser(mailbox);
+  return {
+    listNewMessageIds: (afterSec) => listNewMessageIds(gmail, afterSec),
+    fetchMessage: (id) => fetchMessage(gmail, id),
+    close: async () => {}
+  };
+}
+
 // ─── Per-mailbox poll ───────────────────────────────────────────────
 
 async function pollMailbox(user, clientCache) {
@@ -372,7 +400,6 @@ async function pollMailbox(user, clientCache) {
   if (!state) throw new Error(`could not load or create poll state for ${mailbox}`);
 
   const client = await resolveClient(mailbox, ownerEmail, clientCache);
-  const gmail = gmailClientForUser(user);
 
   // Deliver anything stranded from a previous tick before pulling new mail.
   await retryPendingDigests({ user, client, state }).catch((e) =>
@@ -388,11 +415,25 @@ async function pollMailbox(user, clientCache) {
     ? Math.max(0, Math.floor(state.lastInternalDate / 1000) - CURSOR_OVERLAP_SEC)
     : Math.floor((Date.now() - BOOTSTRAP_HOURS * 3600 * 1000) / 1000);
 
+  let source;
+  try {
+    source = await openMailSource(user);
+  } catch (err) {
+    return handleMailboxError({ err, state, client, mailbox, user });
+  }
+  try {
+    return await pollWithSource({ user, source, state, client, mailbox, ownerEmail, afterSec });
+  } finally {
+    await source.close().catch(() => {});
+  }
+}
+
+async function pollWithSource({ user, source, state, client, mailbox, ownerEmail, afterSec }) {
   let ids;
   try {
-    ids = await listNewMessageIds(gmail, afterSec);
+    ids = await source.listNewMessageIds(afterSec);
   } catch (err) {
-    return handleMailboxError({ err, state, client, mailbox });
+    return handleMailboxError({ err, state, client, mailbox, user });
   }
 
   if (!ids.length) {
@@ -409,6 +450,7 @@ async function pollMailbox(user, clientCache) {
         }
       }
     );
+    await markMailboxHealthy(user);
     return { mailbox, checked: 0, posted: 0 };
   }
 
@@ -430,7 +472,7 @@ async function pollMailbox(user, clientCache) {
 
   for (const messageId of fresh) {
     try {
-      const msg = await fetchMessage(gmail, messageId);
+      const msg = await source.fetchMessage(messageId);
 
       // Classify: rules (zero-cost, default) or AI (gpt-4o-mini) per config.
       const rawAi =
@@ -675,7 +717,7 @@ async function pollMailbox(user, clientCache) {
       // An auth failure mid-loop means every remaining message will fail too —
       // bail out of the mailbox rather than burning 24 more Gmail calls.
       if (isGmailAuthError(errorText(err))) {
-        return handleMailboxError({ err, state, client, mailbox, partialPosted: posted, maxInternalDate });
+        return handleMailboxError({ err, state, client, mailbox, user, partialPosted: posted, maxInternalDate });
       }
       console.warn(`[mail-poll] ${mailbox}: message ${messageId} failed: ${errorText(err)}`);
     }
@@ -697,14 +739,20 @@ async function pollMailbox(user, clientCache) {
     }
   );
 
-  console.log(`[mail-poll] ${mailbox}: checked=${fresh.length} posted=${posted}`);
+  await markMailboxHealthy(user);
+  console.log(`[mail-poll] ${mailbox}: checked=${fresh.length} posted=${posted} via=${user.kind || "oauth"}`);
   return { mailbox, checked: fresh.length, posted };
 }
 
 // handleMailboxError: classify, persist, and (for auth failures) alert Discord
 // under a DB-backed throttle so restarts don't re-spam the channel.
-async function handleMailboxError({ err, state, client, mailbox, partialPosted = 0, maxInternalDate }) {
+async function handleMailboxError({ err, state, client, mailbox, user, partialPosted = 0, maxInternalDate }) {
   const message = (errorText(err) || String(err)).slice(0, 400);
+  // A rejected app password needs an operator to replace it; the Profile
+  // popup shows "needs replacing" from this flag.
+  if (err?.isMailboxAuthError || err?.code === "SECRET_UNREADABLE" || isGmailAuthError(message)) {
+    await markMailboxAuthFailed(user, message);
+  }
 
   if (!isGmailAuthError(message)) {
     await GmailPollState.updateOne(
@@ -770,7 +818,8 @@ export async function pollOnce({ trigger = "cron" } = {}) {
     // resolves once they are built (and is memoized, so this is free after the first tick).
     await Promise.all([MailDigest.init(), GmailPollState.init()]);
 
-    const allMailboxes = await GmailUser.find({ refreshToken: { $exists: true, $ne: "" } }).lean();
+    // App-password mailboxes first; an OAuth mailbox on the same address is skipped.
+    const allMailboxes = await listPollableMailboxes();
 
     // Scope to active + unpaused clients: don't read the inbox of a paused or
     // inactive client. A mailbox belongs to an active client when its email OR

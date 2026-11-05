@@ -18,7 +18,7 @@
 //
 // Nothing here throws to its caller; a Discord/DB hiccup must not break the poll.
 
-import { GmailUser } from "../../Schema_Models/GmailUser.js";
+import { listConnectedMailboxSummaries } from "./mailbox/mailboxRegistry.js";
 import { GmailPollState } from "../../Schema_Models/GmailPollState.js";
 import { MailDigest } from "../../Schema_Models/MailDigest.js";
 import { getActiveUnpausedClients } from "../../Schema_Models/ClientPaymentLookup.js";
@@ -43,8 +43,9 @@ const lc = (s) => String(s || "").toLowerCase().trim();
 // mailbox email + ownerEmail) → the healthiest mailbox state for that address.
 // healthy = has a refresh token AND no recorded auth error.
 async function buildMailboxIndex() {
+  // App-password mailboxes count too (and win over OAuth on the same address).
   const [mailboxes, states] = await Promise.all([
-    GmailUser.find({ refreshToken: { $exists: true, $ne: "" } }).select("email ownerEmail").lean(),
+    listConnectedMailboxSummaries(),
     GmailPollState.find({}).select("gmailEmail authErrorAt").lean()
   ]);
   const authErrorByMailbox = new Map(states.map((s) => [lc(s.gmailEmail), !!s.authErrorAt]));
@@ -53,7 +54,7 @@ async function buildMailboxIndex() {
   const index = new Map();
   for (const m of mailboxes) {
     const mailbox = lc(m.email);
-    const dead = authErrorByMailbox.get(mailbox) === true;
+    const dead = m.authFailed === true || authErrorByMailbox.get(mailbox) === true;
     const entry = { connected: true, dead, mailbox };
     for (const addr of [mailbox, lc(m.ownerEmail)].filter(Boolean)) {
       const prev = index.get(addr);

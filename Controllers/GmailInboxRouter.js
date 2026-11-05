@@ -2,6 +2,15 @@ import express from "express";
 import mongoose from "mongoose";
 import multer from "multer";
 import { GmailUser } from "../Schema_Models/GmailUser.js";
+import {
+  resolveMailboxForOwner,
+  listPollableMailboxes,
+  markMailboxAuthFailed,
+  markMailboxHealthy,
+  MAILBOX_KIND
+} from "../src/services/mailbox/mailboxRegistry.js";
+import { GmailImapSession } from "../src/services/mailbox/gmailImap.js";
+import { sendViaGmailSmtp } from "../src/services/mailbox/gmailSmtp.js";
 import { InboxThread } from "../Schema_Models/InboxThread.js";
 import { InboxMessage } from "../Schema_Models/InboxMessage.js";
 import { MailDigest } from "../Schema_Models/MailDigest.js";
@@ -151,17 +160,52 @@ async function getAccessToken(refreshToken) {
   return data.access_token;
 }
 
+// The client's mailbox: the app password when there is one, else OAuth.
+// Same object for both: { kind, email, ownerEmail, refreshToken? , getPassword?() }.
 async function resolveGmailUser(ownerEmail, gmailEmail) {
-  const owner = (ownerEmail || "").toLowerCase().trim();
-  if (!owner) return null;
-  if (gmailEmail) {
-    return GmailUser.findOne({
-      ownerEmail: owner,
-      email: gmailEmail.toLowerCase().trim()
-    });
-  }
-  return GmailUser.findOne({ ownerEmail: owner }).sort({ createdAt: -1 });
+  return resolveMailboxForOwner(ownerEmail, gmailEmail);
 }
+
+const isAppPassword = (user) => user?.kind === MAILBOX_KIND.APP_PASSWORD;
+
+// Run fn with one IMAP session for an app-password mailbox, always closing it.
+// A rejected password is recorded so the Profile popup says "needs replacing".
+async function withImap(user, fn) {
+  let session;
+  try {
+    session = await GmailImapSession.open({ gmailEmail: user.email, password: user.getPassword() });
+    const out = await fn(session);
+    await markMailboxHealthy(user);
+    return out;
+  } catch (err) {
+    if (err?.isMailboxAuthError || err?.code === "SECRET_UNREADABLE") {
+      await markMailboxAuthFailed(user, err.message);
+      const e = new Error("APP_PASSWORD_REJECTED: Gmail refused this client's app password. Replace it on the client's Profile page or in Client Job Analysis.");
+      e.status = 502;
+      throw e;
+    }
+    throw err;
+  } finally {
+    if (session) await session.close();
+  }
+}
+
+// Send from an app-password mailbox over SMTP, recording a rejected password.
+async function sendWithAppPassword(user, mail) {
+  try {
+    return await sendViaGmailSmtp({ gmailEmail: user.email, password: user.getPassword(), mail });
+  } catch (err) {
+    if (err?.isMailboxAuthError || err?.code === "SECRET_UNREADABLE") {
+      await markMailboxAuthFailed(user, err.message);
+      const e = new Error("APP_PASSWORD_REJECTED: Gmail refused this client's app password. Replace it on the client's Profile page or in Client Job Analysis.");
+      e.status = 502;
+      throw e;
+    }
+    throw err;
+  }
+}
+
+const errStatus = (err) => (Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 500);
 
 // =========================
 // R2 helpers (tagged folder per user/gmail)
@@ -325,7 +369,45 @@ async function listAndCacheThreads({ user, ownerEmail, q, labelIds, pageToken, m
   };
 }
 
-async function getCachedOrFetchMessage({ user, ownerEmail, messageId }) {
+// Cache one thread summary exactly the way listAndCacheThreads() does, so the
+// local read / star / archive / trash state works the same for IMAP mailboxes.
+async function cacheThreadSummary({ user, ownerEmail, t }) {
+  const existingThread = await InboxThread.findOne({ ownerEmail, gmailEmail: user.email, threadId: t.threadId });
+  const local = applyLocalState(t.labels, existingThread, t.messageCount);
+  const unread = local.labels.includes("UNREAD") ? t.unreadCount : 0;
+  return InboxThread.findOneAndUpdate(
+    { ownerEmail, gmailEmail: user.email, threadId: t.threadId },
+    {
+      ownerEmail,
+      gmailEmail: user.email,
+      threadId: t.threadId,
+      historyId: null,
+      subject: t.subject,
+      snippet: t.snippet || "",
+      participants: t.participants,
+      fromLatest: t.fromLatest,
+      lastMessageAt: t.lastMessageAt,
+      messageCount: t.messageCount,
+      unreadCount: unread,
+      labels: local.labels,
+      localAdd: local.localAdd,
+      localRemove: local.localRemove,
+      hasAttachments: t.hasAttachments,
+      lastSyncedAt: new Date()
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+}
+
+async function listAndCacheThreadsImap({ user, ownerEmail, q, labelIds, pageToken, maxResults = 25 }) {
+  const labelId = Array.isArray(labelIds) && labelIds.length ? labelIds[0] : "";
+  const page = await withImap(user, (session) => session.listThreads({ labelId, q, pageToken, maxResults }));
+  const out = [];
+  for (const t of page.threads) out.push(await cacheThreadSummary({ user, ownerEmail, t }));
+  return { threads: out, nextPageToken: page.nextPageToken, resultSizeEstimate: page.resultSizeEstimate };
+}
+
+async function getCachedOrFetchMessage({ user, ownerEmail, messageId, imap }) {
   const existing = await InboxMessage.findOne({
     ownerEmail,
     gmailEmail: user.email,
@@ -333,6 +415,27 @@ async function getCachedOrFetchMessage({ user, ownerEmail, messageId }) {
   });
   if (existing && (existing.bodyHtmlR2Key || existing.bodyTextR2Key || existing.bodyTextInline)) {
     return existing;
+  }
+
+  // App password: read over IMAP, then cache exactly like the REST path.
+  if (imap) {
+    const m = await imap.fetchMessageForInbox(messageId);
+    if (!m) {
+      const e = new Error("message_not_found");
+      e.status = 404;
+      throw e;
+    }
+    return storeInboxMessage({
+      user,
+      ownerEmail,
+      messageId,
+      threadId: m.threadId,
+      meta: m.meta,
+      snippet: m.snippet,
+      html: m.html,
+      text: m.text,
+      attachments: m.attachments
+    });
   }
 
   const accessToken = await getAccessToken(user.refreshToken);
@@ -352,42 +455,57 @@ async function getCachedOrFetchMessage({ user, ownerEmail, messageId }) {
     }
   }
 
-  const htmlKey = bodies.html
+  return storeInboxMessage({
+    user,
+    ownerEmail,
+    messageId,
+    threadId: detailData.threadId,
+    meta,
+    snippet: detailData.snippet || "",
+    html: bodies.html,
+    text: bodies.text,
+    attachments: bodies.attachments
+  });
+}
+
+// Upload the bodies to R2 and upsert the InboxMessage row. Shared by the REST
+// and IMAP paths so a cached message looks the same whichever way it came in.
+async function storeInboxMessage({ user, ownerEmail, messageId, threadId, meta, snippet, html, text, attachments }) {
+  const htmlKey = html
     ? await uploadInboxBody({
         ownerEmail,
         gmailEmail: user.email,
         messageId,
         kind: "html",
-        content: bodies.html
+        content: html
       })
     : null;
-  const textKey = bodies.text
+  const textKey = text
     ? await uploadInboxBody({
         ownerEmail,
         gmailEmail: user.email,
         messageId,
         kind: "text",
-        content: bodies.text
+        content: text
       })
     : null;
 
-  const doc = await InboxMessage.findOneAndUpdate(
+  return InboxMessage.findOneAndUpdate(
     { ownerEmail, gmailEmail: user.email, messageId },
     {
       ownerEmail,
       gmailEmail: user.email,
-      threadId: detailData.threadId,
+      threadId,
       messageId,
       ...meta,
-      snippet: detailData.snippet || "",
+      snippet: snippet || "",
       bodyHtmlR2Key: htmlKey,
       bodyTextR2Key: textKey,
-      bodyTextInline: !htmlKey && !textKey ? bodies.text || "" : "",
-      attachments: bodies.attachments
+      bodyTextInline: !htmlKey && !textKey ? text || "" : "",
+      attachments
     },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
-  return doc;
 }
 
 // =========================
@@ -399,6 +517,10 @@ router.post("/labels", async (req, res) => {
     const { ownerEmail, gmailEmail } = req.body || {};
     const user = await resolveGmailUser(ownerEmail, gmailEmail);
     if (!user) return res.status(404).json({ error: "no_connected_gmail" });
+    if (isAppPassword(user)) {
+      const labels = await withImap(user, (session) => session.labels());
+      return res.json({ labels, gmailEmail: user.email });
+    }
     const accessToken = await getAccessToken(user.refreshToken);
     const r = await gmailGet(accessToken, "labels");
     const labels = (r.labels || []).map((l) => ({
@@ -411,7 +533,7 @@ router.post("/labels", async (req, res) => {
     res.json({ labels, gmailEmail: user.email });
   } catch (err) {
     console.error("[Inbox] labels error:", err?.response?.data || err.message);
-    res.status(500).json({ error: err?.message || "labels_failed" });
+    res.status(errStatus(err)).json({ error: err?.message || "labels_failed" });
   }
 });
 
@@ -421,7 +543,7 @@ router.post("/threads", async (req, res) => {
     const user = await resolveGmailUser(ownerEmail, gmailEmail);
     if (!user) return res.status(404).json({ error: "no_connected_gmail" });
 
-    const result = await listAndCacheThreads({
+    const result = await (isAppPassword(user) ? listAndCacheThreadsImap : listAndCacheThreads)({
       user,
       ownerEmail: user.ownerEmail,
       q,
@@ -457,7 +579,7 @@ router.post("/threads", async (req, res) => {
     });
   } catch (err) {
     console.error("[Inbox] threads error:", err?.response?.data || err.message);
-    res.status(500).json({ error: err?.message || "threads_failed" });
+    res.status(errStatus(err)).json({ error: err?.message || "threads_failed" });
   }
 });
 
@@ -468,17 +590,26 @@ router.post("/thread/:threadId", async (req, res) => {
     const user = await resolveGmailUser(ownerEmail, gmailEmail);
     if (!user) return res.status(404).json({ error: "no_connected_gmail" });
 
-    const accessToken = await getAccessToken(user.refreshToken);
-    const tDetail = await gmailGet(accessToken, `threads/${threadId}`, { format: "minimal" });
-    const msgIds = (tDetail.messages || []).map((m) => m.id);
+    // Fetch (or reuse cached) messages. IMAP keeps one session for the thread.
+    const loadDocs = async (imap) => {
+      let msgIds;
+      if (imap) {
+        msgIds = await imap.threadMessageIds(threadId);
+      } else {
+        const accessToken = await getAccessToken(user.refreshToken);
+        const tDetail = await gmailGet(accessToken, `threads/${threadId}`, { format: "minimal" });
+        msgIds = (tDetail.messages || []).map((m) => m.id);
+      }
+      const docs = [];
+      for (const id of msgIds) {
+        docs.push(await getCachedOrFetchMessage({ user, ownerEmail: user.ownerEmail, messageId: id, imap }));
+      }
+      return docs;
+    };
+    const docs = isAppPassword(user) ? await withImap(user, (session) => loadDocs(session)) : await loadDocs(null);
 
     const messages = [];
-    for (const id of msgIds) {
-      const doc = await getCachedOrFetchMessage({
-        user,
-        ownerEmail: user.ownerEmail,
-        messageId: id
-      });
+    for (const doc of docs) {
       const html = doc.bodyHtmlR2Key ? await fetchR2BodyText(doc.bodyHtmlR2Key) : "";
       const text = doc.bodyTextR2Key ? await fetchR2BodyText(doc.bodyTextR2Key) : doc.bodyTextInline || "";
       messages.push({
@@ -510,7 +641,7 @@ router.post("/thread/:threadId", async (req, res) => {
     res.json({ threadId, messages });
   } catch (err) {
     console.error("[Inbox] thread error:", err?.response?.data || err.message);
-    res.status(500).json({ error: err?.message || "thread_failed" });
+    res.status(errStatus(err)).json({ error: err?.message || "thread_failed" });
   }
 });
 
@@ -532,9 +663,16 @@ router.post("/message/:messageId/attachment/:attachmentId", async (req, res) => 
     if (!att) return res.status(404).json({ error: "attachment_not_found" });
 
     if (!att.r2Key) {
-      const accessToken = await getAccessToken(user.refreshToken);
-      const r = await gmailGet(accessToken, `messages/${messageId}/attachments/${attachmentId}`);
-      const buf = decodeBase64Url(r.data);
+      let buf;
+      if (isAppPassword(user)) {
+        const found = await withImap(user, (session) => session.attachmentContent(messageId, attachmentId));
+        if (!found) return res.status(404).json({ error: "attachment_not_found" });
+        buf = found.content;
+      } else {
+        const accessToken = await getAccessToken(user.refreshToken);
+        const r = await gmailGet(accessToken, `messages/${messageId}/attachments/${attachmentId}`);
+        buf = decodeBase64Url(r.data);
+      }
       const key = await uploadInboxAttachment({
         ownerEmail: user.ownerEmail,
         gmailEmail: user.email,
@@ -558,7 +696,7 @@ router.post("/message/:messageId/attachment/:attachmentId", async (req, res) => 
     });
   } catch (err) {
     console.error("[Inbox] attachment error:", err?.response?.data || err.message);
-    res.status(500).json({ error: err?.message || "attachment_failed" });
+    res.status(errStatus(err)).json({ error: err?.message || "attachment_failed" });
   }
 });
 
@@ -634,6 +772,19 @@ router.post("/reply", async (req, res) => {
     if (!user) return res.status(404).json({ error: "no_connected_gmail" });
     if (!to || !subject) return res.status(400).json({ error: "to_and_subject_required" });
 
+    if (isAppPassword(user)) {
+      const sent = await sendWithAppPassword(user, {
+        to: Array.isArray(to) ? to.join(", ") : to,
+        cc: cc ? (Array.isArray(cc) ? cc.join(", ") : cc) : undefined,
+        subject: subject.startsWith("Re:") ? subject : `Re: ${subject}`,
+        text: text || "",
+        html: html || undefined,
+        inReplyTo: inReplyTo || undefined,
+        references: references || undefined
+      });
+      return res.json({ ok: true, messageId: sent.messageId, threadId: threadId || null });
+    }
+
     const accessToken = await getAccessToken(user.refreshToken);
     const boundary = `----=_FF_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
     const headers = [
@@ -670,7 +821,7 @@ router.post("/reply", async (req, res) => {
     res.json({ ok: true, messageId: r.id, threadId: r.threadId });
   } catch (err) {
     console.error("[Inbox] reply error:", err?.response?.data || err.message);
-    res.status(500).json({ error: err?.message || "reply_failed" });
+    res.status(errStatus(err)).json({ error: err?.message || "reply_failed" });
   }
 });
 
@@ -702,6 +853,21 @@ router.post("/compose", composeUpload.array("attachments", 10), async (req, res)
       content: f.buffer
     }));
 
+    if (isAppPassword(user)) {
+      const sent = await sendWithAppPassword(user, {
+        to,
+        cc: cc || undefined,
+        bcc: bcc || undefined,
+        subject,
+        html: html || undefined,
+        text: text || undefined,
+        attachments,
+        inReplyTo: inReplyTo || undefined,
+        references: references || undefined
+      });
+      return res.json({ ok: true, messageId: sent.messageId, threadId: threadId || null });
+    }
+
     const mime = buildComposeMime({
       from: user.email,
       to,
@@ -721,7 +887,7 @@ router.post("/compose", composeUpload.array("attachments", 10), async (req, res)
     res.json({ ok: true, messageId: r.id, threadId: r.threadId });
   } catch (err) {
     console.error("[Inbox] compose error:", err?.response?.data || err.message);
-    res.status(500).json({ error: err?.message || "compose_failed" });
+    res.status(errStatus(err)).json({ error: err?.message || "compose_failed" });
   }
 });
 
@@ -1051,17 +1217,22 @@ router.get("/health", async (_req, res) => {
 
   // 6. Connected mailboxes — live token health
   try {
-    const mailboxes = await GmailUser.find({ refreshToken: { $exists: true, $ne: "" } }).select("email refreshToken").lean();
+    const mailboxes = await listPollableMailboxes();
     const perMailbox = [];
     for (const m of mailboxes) {
       try {
-        await getAccessToken(m.refreshToken);
-        perMailbox.push({ email: m.email, ok: true });
+        if (isAppPassword(m)) {
+          // A real IMAP login, the same thing the hourly scan does.
+          await withImap(m, async () => {});
+        } else {
+          await getAccessToken(m.refreshToken);
+        }
+        perMailbox.push({ email: m.email, ok: true, via: m.kind });
       } catch (e) {
         // Google's token error body is multi-line; collapse whitespace so the
         // JSON response stays valid and the error reads on one line.
         const msg = (errorText(e) || String(e?.message || e)).replace(/\s+/g, " ").trim();
-        perMailbox.push({ email: m.email, ok: false, dead: isGmailAuthError(msg), error: msg.slice(0, 200) });
+        perMailbox.push({ email: m.email, ok: false, via: m.kind, dead: isGmailAuthError(msg), error: msg.slice(0, 200) });
       }
     }
     const healthy = perMailbox.filter((x) => x.ok).length;
