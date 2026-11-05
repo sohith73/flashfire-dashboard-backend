@@ -10,6 +10,7 @@ import { classifyApplyUrl } from '../Utils/applyUrlPolicy.js';
 import { ukSponsorPushBlock } from '../Utils/ukVisaSponsor.js';
 import { usSponsorPushBlock } from '../Utils/usVisaSponsor.js';
 import { companyAllowlistBlock } from '../Utils/companyAllowlist.js';
+import { initialAutoOptimization } from '../Utils/autoOptimizationState.js';
 
 // Clamp the judge's verdict into the shape JobModel.aiDecision expects.
 // Returns null when there is nothing worth storing, so a push from an older
@@ -383,15 +384,7 @@ export default async function AddJob(req, res) {
         }
 
         // Always set an explicit auto-optimization state so ops can see what happened.
-        if (jobDetails.jobDescription?.trim()) {
-            jobDetails.autoOptimization = { status: 'pending', attempts: 0 };
-        } else {
-            jobDetails.autoOptimization = {
-                status: 'skipped',
-                attempts: 0,
-                error: 'Skipped: missing job description'
-            };
-        }
+        jobDetails.autoOptimization = initialAutoOptimization(jobDetails.jobDescription);
 
         // Second-stage screening: only jobs pushed by the JR-Direct extension
         // auto-judge flow get re-judged against the REAL employer-site text.

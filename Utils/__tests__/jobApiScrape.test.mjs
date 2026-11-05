@@ -403,6 +403,18 @@ test("only what the judge picked is written", async () => {
   assert.equal(r.body.pushedJobs.length, 1);
 });
 
+test("a pushed job is queued for resume optimization, or skipped when it has no description", async () => {
+  // Job API pushes used to leave autoOptimization.status null, and the
+  // optimizer only claims "pending" cards, so none of them got a resume.
+  reset();
+  pages = [{ ok: true, results: [adzJob(1, { description: "Care for patients." }), adzJob(2)] }, { ok: true, results: [] }];
+  judgeResult = judgeAll([1, 2], [1, 2]);
+  await run();
+  const byLink = Object.fromEntries(created.map((d) => [d.joblink, d.autoOptimization]));
+  assert.deepEqual(byLink["https://adzuna.test/job/1"], { status: "pending", attempts: 0 });
+  assert.equal(byLink["https://adzuna.test/job/2"].status, "skipped");
+});
+
 test("when nothing is good enough the closest job is reported, not pushed", async () => {
   reset();
   pages = [{ ok: true, results: [adzJob(1), adzJob(2)] }, { ok: true, results: [] }];

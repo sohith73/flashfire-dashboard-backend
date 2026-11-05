@@ -14,6 +14,7 @@ import { jobLinkKey, inspectJobLink, SHARED_FORM_COMPANY_LIMIT } from "../Utils/
 import { ukSponsorPushBlock } from "../Utils/ukVisaSponsor.js";
 import { usSponsorPushBlock } from "../Utils/usVisaSponsor.js";
 import { companyAllowlistBlock } from "../Utils/companyAllowlist.js";
+import { initialAutoOptimization } from "../Utils/autoOptimizationState.js";
 
 /**
  * Normalize job title/company for duplicate check: trim and collapse multiple spaces.
@@ -563,15 +564,7 @@ export async function saveToDashboard(req, res) {
                 };
 
                 // Always keep explicit status for ops visibility and debugging.
-                if (payload.jobDescription?.trim()) {
-                    payload.autoOptimization = { status: 'pending', attempts: 0 };
-                } else {
-                    payload.autoOptimization = {
-                        status: 'skipped',
-                        attempts: 0,
-                        error: 'Skipped: missing job description'
-                    };
-                }
+                payload.autoOptimization = initialAutoOptimization(payload.jobDescription);
 
                 const newJob = await JobModel.create(payload);
 
