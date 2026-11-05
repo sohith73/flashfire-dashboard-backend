@@ -2,6 +2,14 @@ import express from "express";
 import multer from "multer";
 import { google } from "googleapis";
 import { GmailUser } from "../Schema_Models/GmailUser.js";
+import {
+  sendingMailboxesForOwner,
+  accountsForOwner,
+  ownerHasMailbox,
+  markMailboxAuthFailed,
+  MAILBOX_KIND
+} from "../src/services/mailbox/mailboxRegistry.js";
+import { sendViaGmailSmtp } from "../src/services/mailbox/gmailSmtp.js";
 import { RecruiterEmailGroup } from "../Schema_Models/RecruiterEmailGroup.js";
 import { RecruiterEmailTemplate } from "../Schema_Models/RecruiterEmailTemplate.js";
 import { RecruiterEmailAutomation } from "../Schema_Models/RecruiterEmailAutomation.js";
@@ -174,8 +182,8 @@ router.post("/status", async (req, res) => {
     if (!email) {
       return res.status(400).json({ connected: false, error: "Email is required" });
     }
-    const existing = await GmailUser.exists({ ownerEmail: email.toLowerCase() });
-    return res.json({ connected: !!existing });
+    // Connected by app password or by Google OAuth.
+    return res.json({ connected: await ownerHasMailbox(email) });
   } catch (error) {
     console.error("Gmail status error:", error);
     return res.status(500).json({ connected: false, error: "Failed to check Gmail status" });
@@ -188,10 +196,8 @@ router.post("/accounts", async (req, res) => {
     if (!email) {
       return res.status(400).json({ error: "Email is required" });
     }
-    const users = await GmailUser.find({ ownerEmail: email.toLowerCase() })
-      .select("email createdAt")
-      .sort({ createdAt: -1 });
-    return res.json({ accounts: users });
+    // The app-password mailbox alone when there is one, else the OAuth accounts.
+    return res.json({ accounts: await accountsForOwner(email) });
   } catch (error) {
     console.error("Gmail accounts error:", error);
     return res.status(500).json({ error: "Failed to load Gmail accounts" });
@@ -243,15 +249,8 @@ router.post("/send", upload.single("attachment"), handleMulterError, async (req,
       fromEmails = [fromEmails];
     }
 
-    let users;
-    if (fromEmails && fromEmails.length > 0) {
-      users = await GmailUser.find({
-        ownerEmail: ownerEmail.toLowerCase(),
-        email: { $in: fromEmails }
-      });
-    } else {
-      users = await GmailUser.find({ ownerEmail: ownerEmail.toLowerCase() });
-    }
+    // App password first; it is the only sender while it exists.
+    const users = await sendingMailboxesForOwner(ownerEmail, { fromEmails });
 
     if (!users.length) {
       return res.status(404).json({ error: "No connected Gmail accounts for this user" });
@@ -662,11 +661,11 @@ router.post("/automation/resend", async (req, res) => {
       return res.status(400).json({ error: "No template configured for this user — cannot resend." });
     }
 
-    // Prefer the original sending account; otherwise any connected one.
-    let gmailUser = await GmailUser.findOne({ ownerEmail: ownerEmailLc, email: log.fromEmail });
-    if (!gmailUser) {
-      gmailUser = await GmailUser.findOne({ ownerEmail: ownerEmailLc });
-    }
+    // Prefer the original sending account; otherwise the current sender
+    // (the app password when there is one).
+    const senders = await sendingMailboxesForOwner(ownerEmailLc);
+    const gmailUser =
+      senders.find((m) => m.email === String(log.fromEmail || "").toLowerCase()) || senders[0] || null;
     if (!gmailUser) {
       return res.status(400).json({ error: "No Gmail account connected for this user." });
     }
@@ -811,9 +810,32 @@ async function getAccessToken(refreshToken) {
 }
 
 async function sendGmail(user, { to, subject, text, attachment = null }) {
-  const accessToken = await getAccessToken(user.refreshToken);
+  // App password: the same mail, sent over Gmail SMTP as the client.
+  if (user.kind === MAILBOX_KIND.APP_PASSWORD) {
+    try {
+      await sendViaGmailSmtp({
+        gmailEmail: user.email,
+        password: user.getPassword(),
+        mail: {
+          to,
+          subject,
+          text,
+          attachments: attachment
+            ? [{ filename: attachment.filename, content: attachment.content, contentType: attachment.mimetype }]
+            : []
+        }
+      });
+    } catch (err) {
+      if (err?.isMailboxAuthError || err?.code === "SECRET_UNREADABLE") {
+        await markMailboxAuthFailed(user, err.message);
+      }
+      throw err;
+    }
+    return;
+  }
 
   const mimeMessage = createMimeMessage(user.email, to, subject, text, attachment);
+  const accessToken = await getAccessToken(user.refreshToken);
   const raw = Buffer.from(mimeMessage)
     .toString("base64")
     .replace(/\+/g, "-")
@@ -959,7 +981,7 @@ async function processAutomation(automation, { force = false } = {}) {
   }
   if (!selected.length) return { status: "no_recipients" };
 
-  const gmailUsers = await GmailUser.find({ ownerEmail: ownerEmailLc });
+  const gmailUsers = await sendingMailboxesForOwner(ownerEmailLc);
   if (!gmailUsers.length) return { status: "no_gmail" };
 
   // Atomic once-per-day claim: only the first request that flips lastRunDayKey

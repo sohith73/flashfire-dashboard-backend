@@ -28,6 +28,7 @@ process.env.ONE_MAIN_DISCORD_FOR_MAIL_NOTIFICATIONS = `http://127.0.0.1:${srv.ad
 
 const { MailDigest } = await import("../../Schema_Models/MailDigest.js");
 const { GmailUser } = await import("../../Schema_Models/GmailUser.js");
+const { MailAppPassword } = await import("../../Schema_Models/MailAppPassword.js");
 const { GmailPollState } = await import("../../Schema_Models/GmailPollState.js");
 const { ClientPaymentLookup } = await import("../../Schema_Models/ClientPaymentLookup.js");
 const { sendDailySummary } = await import("../../src/services/mailClientMonitor.js");
@@ -74,12 +75,14 @@ before(() => {
   orig.count = MailDigest.countDocuments;
   orig.update = MailDigest.updateOne;
   orig.gmail = GmailUser.find;
+  orig.appPw = MailAppPassword.find;
   orig.state = GmailPollState.find;
   orig.clients = ClientPaymentLookup.find;
   MailDigest.find = (q) => { captured.find.push(q); return thenable(() => DIGESTS.filter((d) => matches(d, q))); };
   MailDigest.countDocuments = (q) => { captured.count.push(q); return thenable(() => DIGESTS.filter((d) => matches(d, q)).length); };
   MailDigest.updateOne = (f, u) => { captured.updates.push({ f, u }); return thenable(() => ({ modifiedCount: 1 })); };
   GmailUser.find = () => thenable(() => [{ email: "a@c.com", ownerEmail: "a@c.com" }]);
+  MailAppPassword.find = () => thenable(() => []);
   GmailPollState.find = () => thenable(() => []);
   ClientPaymentLookup.find = () => thenable(() => [{ email: "a@c.com", name: "Asha", paymentEmail: "pay@c.com", gmailCredentials: { email: "a@c.com" } }]);
 });
@@ -88,6 +91,7 @@ after(() => {
   MailDigest.countDocuments = orig.count;
   MailDigest.updateOne = orig.update;
   GmailUser.find = orig.gmail;
+  MailAppPassword.find = orig.appPw;
   GmailPollState.find = orig.state;
   ClientPaymentLookup.find = orig.clients;
   srv.close();
