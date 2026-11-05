@@ -180,7 +180,7 @@ async function withImap(user, fn) {
   } catch (err) {
     if (err?.isMailboxAuthError || err?.code === "SECRET_UNREADABLE") {
       await markMailboxAuthFailed(user, err.message);
-      const e = new Error("APP_PASSWORD_REJECTED: Gmail refused this client's app password. Replace it on the client's Profile page.");
+      const e = new Error("APP_PASSWORD_REJECTED: Gmail refused this client's app password. Replace it on the client's Profile page or in Client Job Analysis.");
       e.status = 502;
       throw e;
     }
@@ -197,7 +197,7 @@ async function sendWithAppPassword(user, mail) {
   } catch (err) {
     if (err?.isMailboxAuthError || err?.code === "SECRET_UNREADABLE") {
       await markMailboxAuthFailed(user, err.message);
-      const e = new Error("APP_PASSWORD_REJECTED: Gmail refused this client's app password. Replace it on the client's Profile page.");
+      const e = new Error("APP_PASSWORD_REJECTED: Gmail refused this client's app password. Replace it on the client's Profile page or in Client Job Analysis.");
       e.status = 502;
       throw e;
     }

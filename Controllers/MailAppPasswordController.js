@@ -64,6 +64,10 @@ export async function getAppPassword(req, res) {
 export async function putAppPassword(req, res) {
   const owner = operatorClient(req, res);
   if (!owner) return;
+  return saveFor(owner, req, res);
+}
+
+async function saveFor(owner, req, res) {
   const { gmailEmail, appPassword } = req.body || {};
   if (typeof gmailEmail !== "string" || typeof appPassword !== "string") {
     return res.status(400).json({ error: "invalid_body", message: "Send gmailEmail and appPassword." });
@@ -83,4 +87,43 @@ export async function putAppPassword(req, res) {
     console.error(`[app-password] connect failed for ${owner}: ${err.message}`);
     return res.status(500).json({ error: "connect_failed", message: "Could not save the app password." });
   }
+}
+
+// ─── Server-to-server: the clients-tracking portal ──────────────────
+//
+//   GET /gmail/app-password/ops/:email
+//   PUT /gmail/app-password/ops/:email  { gmailEmail, appPassword }
+//
+// Mounted behind requireOpsKey (x-ops-key). Only the clients-tracking
+// backend calls these, after checking its own login and role (admin or team
+// lead), so Client Job Analysis can connect a client's app password with the
+// same verification, encryption and storage as the Profile popup. The key
+// never reaches a browser.
+
+const EMAIL_PARAM_RE = /^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/;
+
+function paramClient(req, res) {
+  const email = String(req.params.email || "").toLowerCase().trim();
+  if (!EMAIL_PARAM_RE.test(email)) {
+    res.status(400).json({ error: "invalid_client_email" });
+    return null;
+  }
+  return email;
+}
+
+export async function getAppPasswordForOps(req, res) {
+  const owner = paramClient(req, res);
+  if (!owner) return;
+  try {
+    return res.json(await appPasswordStatus(owner));
+  } catch (err) {
+    console.error(`[app-password] ops status failed for ${owner}: ${err.message}`);
+    return res.status(500).json({ error: "status_failed" });
+  }
+}
+
+export async function putAppPasswordForOps(req, res) {
+  const owner = paramClient(req, res);
+  if (!owner) return;
+  return saveFor(owner, req, res);
 }

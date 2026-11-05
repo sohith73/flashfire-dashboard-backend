@@ -146,7 +146,7 @@ import ScrapeCostHistory from "./Controllers/ScrapeCostHistory.js";
 import { generateSessionKey, listSessionKeys, revokeSession, revokeUserSessions, listActiveSessions, verifySessionKey } from "./Controllers/operations/SessionKeys.js";
 import gmailRouter from "./Controllers/GmailRouter.js";
 import gmailInboxRouter from "./Controllers/GmailInboxRouter.js";
-import { getAppPassword, putAppPassword } from "./Controllers/MailAppPasswordController.js";
+import { getAppPassword, putAppPassword, getAppPasswordForOps, putAppPasswordForOps } from "./Controllers/MailAppPasswordController.js";
 import { listGroups, createGroup, getGroup, updateGroup } from "./Controllers/RecruiterAutomation.js";
 import { aiGenerateTemplateHandler } from "./Controllers/RecruiterAiTemplate.js";
 import { getWhatsAppGroups, linkUserToGroup, getUserGroupMapping, sendCustomNotification, checkNotificationCooldown } from "./Controllers/whatsapp/WhatsAppController.js";
@@ -891,6 +891,8 @@ app.delete("/admin/geo/backfill", verifyAdminForActivity, cancelBackfill);
 // Takes precedence over the OAuth connection below for reading and sending.
 app.get("/gmail/app-password", LocalTokenValidator, getAppPassword);
 app.put("/gmail/app-password", LocalTokenValidator, putAppPassword);
+app.get("/gmail/app-password/ops/:email", requireOpsKey, getAppPasswordForOps);
+app.put("/gmail/app-password/ops/:email", requireOpsKey, putAppPasswordForOps);
 app.use("/gmail", gmailRouter);
 app.use("/gmail/inbox", gmailInboxRouter);
 app.post("/gmail/automation/template/ai-generate", aiGenerateTemplateHandler);
