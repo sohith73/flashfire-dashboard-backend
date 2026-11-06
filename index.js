@@ -164,6 +164,7 @@ import { sendDailySummary } from "./src/services/mailClientMonitor.js";
 import { startOnboardingMailWorker } from "./src/services/onboardingMailWorker.js";
 import { startClientReminderWorker } from "./src/services/clientReminderWorker.js";
 import { startScrapeCostSnapshotWorker } from "./Utils/scrapeCostNotifier.js";
+import { startEuropeRunReminder } from "./Utils/europeRunReminder.js";
 import { startAutoOptimizationWorker } from "./src/services/autoOptimizationWorker.js";
 import { geoStats } from "./Utils/ipGeo.js";
 import { refreshOverrides } from "./Utils/ipGeoOverrides.js";
@@ -488,6 +489,12 @@ app.use((err, req, res, next) => {
       // unconditionally (not gated on a Discord milestone) so low-volume days
       // still get a row.
       startScrapeCostSnapshotWorker();
+
+      // Europe run: 03:00 IST Mon-Fri Discord reminder to press "Run Europe
+      // clients" in Autopilot and click Allow. Off unless
+      // DISCORD_EUROPE_RUN_WEBHOOK_URL is set. Instance 0 only, so PM2
+      // cluster workers do not each post it.
+      startEuropeRunReminder();
 
       // Inbound mail pipeline: hourly, reads each connected client mailbox,
       // summarizes new INBOX mail with gpt-4o-mini, and posts a rich embed
