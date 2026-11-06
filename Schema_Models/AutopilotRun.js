@@ -51,7 +51,8 @@ const AutopilotRunSchema = new mongoose.Schema(
     // and possibly two later, a run with no host is unattributable.
     host: { type: String, default: "" },
     // "schedule" (nightly), "manual" (someone pressed Scrape in the autopilot
-    // UI) or "portal" (the Scrape button in Client Tracking).
+    // UI), "portal" (the Scrape button in Client Tracking) or "europe" (one
+    // client of the weekday Europe run; why says what each board found).
     trigger: { type: String, default: "manual" },
     requestedBy: { type: String, default: "" },
 

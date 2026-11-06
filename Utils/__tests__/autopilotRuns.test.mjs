@@ -155,6 +155,21 @@ test("recordAutopilotRun clamps severity and trigger to their allowed values", a
   assert.equal(saved.trigger, "manual", "an unknown trigger falls back to manual");
 });
 
+test("recordAutopilotRun keeps the europe trigger so the portal can tag Europe runs", async () => {
+  let saved = null;
+  await withStub(AutopilotRun, "create", async (doc) => {
+    saved = doc;
+    return { _id: "run6" };
+  }, async () => {
+    await recordAutopilotRun(
+      { body: { clientEmail: "a@b.com", trigger: "europe", why: "0 pushed: Indeed: robot check" } },
+      fakeRes()
+    );
+  });
+  assert.equal(saved.trigger, "europe");
+  assert.equal(saved.why, "0 pushed: Indeed: robot check");
+});
+
 test("recordAutopilotRun records a failed run rather than dropping it", async () => {
   // A failed run is exactly the row ops needs to see.
   let saved = null;
