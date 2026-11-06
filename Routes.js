@@ -7,6 +7,7 @@ import GoogleOAuth from "./Controllers/GoogleOAuth.js";
 import { getAllClients } from './Controllers/ClientController.js';
 import { getClientTrackingStatus } from './Controllers/ClientTrackingStatus.js';
 import { listAutopilotCreds, getAutopilotCreds, putAutopilotCreds, provisionAutopilotCreds } from './Controllers/AutopilotCreds.js';
+import { listEuropeClients, notifyEuropeRun, remindEuropeRun } from './Controllers/EuropeRun.js';
 import { getJobApiSettings, putJobApiSettings, runJobApiScrape, ingestJobApiJobs } from "./Controllers/JobApiScrape.js";
 import {
   recordAutopilotRun,
@@ -168,6 +169,9 @@ app.post("/api/clients/register", AdminKeyVerify, RegisterVerify, Register);
 app.get("/api/clients/all", getAllClients);
 app.get("/api/clients/tracking-status", getClientTrackingStatus);
 // Autopilot credential store - shared-secret gated, see Controllers/AutopilotCreds.js
+app.get("/autopilot/europe-clients", requireOpsKey, listEuropeClients);
+app.post("/autopilot/europe-run/notify", requireOpsKey, notifyEuropeRun);
+app.post("/autopilot/europe-run/remind", requireOpsKey, remindEuropeRun);
 app.get("/autopilot/creds", requireOpsKey, listAutopilotCreds);
 app.get("/autopilot/creds/:email", requireOpsKey, getAutopilotCreds);
 app.put("/autopilot/creds/:email", requireOpsKey, putAutopilotCreds);

@@ -98,7 +98,7 @@ export const startAutopilotRun = async (req, res) => {
       profile: String(body.profile || "").trim(),
       cap: num(body.cap),
       host: cleanStr(body.host, 120),
-      trigger: ["schedule", "manual", "portal"].includes(body.trigger) ? body.trigger : "manual",
+      trigger: ["schedule", "manual", "portal", "europe"].includes(body.trigger) ? body.trigger : "manual",
       requestedBy: cleanStr(body.requestedBy, 200),
       status: "running",
       outcome: "running",
@@ -216,7 +216,7 @@ export const recordAutopilotRun = async (req, res) => {
       errorText: String(body.errorText || "").slice(0, 600),
 
       host: String(body.host || "").slice(0, 120),
-      trigger: ["schedule", "manual", "portal"].includes(body.trigger) ? body.trigger : "manual",
+      trigger: ["schedule", "manual", "portal", "europe"].includes(body.trigger) ? body.trigger : "manual",
       requestedBy: String(body.requestedBy || "").slice(0, 200),
 
       pageUrl: cleanStr(body.pageUrl, 500),
