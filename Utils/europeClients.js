@@ -95,19 +95,33 @@ export function roleTerms(preferredRoles, max = 8) {
   return out.slice(0, max);
 }
 
+// The boards the Europe run works through. A Europe client gets all three on
+// its scrape-source allowlist (profile.scrapeSources), added to whatever is
+// already there and never removing anything.
+export const EUROPE_SOURCES = ["indeed", "glassdoor", "hiringcafe"];
+
+/** The allowlist with the Europe boards added. No list saved means JobRight only. */
+export function withEuropeSources(current) {
+  const base = Array.isArray(current) && current.length
+    ? [...new Set(current.map((s) => String(s || "").toLowerCase().trim()).filter(Boolean))]
+    : ["jobright"];
+  return [...base, ...EUROPE_SOURCES.filter((s) => !base.includes(s))];
+}
+
 /**
  * Every active, unpaused Europe client with what to search.
+ * A client is a Europe client when its preferred locations name a European
+ * place, or when Client Tracking has its country set to Europe.
  * Models are passed in so the function can be tested without a database.
  */
 export async function getEuropeClients({ ProfileModel, ClientPaymentLookup }) {
-  const [profiles, statuses] = await Promise.all([
-    ProfileModel.find(
-      { "preferredLocations.0": { $exists: true } },
-      { email: 1, firstName: 1, lastName: 1, preferredLocations: 1, preferredRoles: 1 }
-    ).lean(),
-    ClientPaymentLookup.find({}).select("email name status isPaused").lean(),
-  ]);
+  const statuses = await ClientPaymentLookup.find({}).select("email name status isPaused clientCountry").lean();
   const byEmail = new Map(statuses.filter((s) => s.email).map((s) => [String(s.email).toLowerCase().trim(), s]));
+  const markedEurope = [...byEmail].filter(([, s]) => s.clientCountry === "Europe").map(([e]) => e);
+  const profiles = await ProfileModel.find(
+    { $or: [{ "preferredLocations.0": { $exists: true } }, { email: { $in: markedEurope } }] },
+    { email: 1, firstName: 1, lastName: 1, preferredLocations: 1, preferredRoles: 1, scrapeSources: 1 }
+  ).lean();
 
   const out = [];
   for (const p of profiles) {
@@ -115,8 +129,8 @@ export async function getEuropeClients({ ProfileModel, ClientPaymentLookup }) {
     if (!email) continue;
     const st = byEmail.get(email);
     if (!st || String(st.status || "").toLowerCase() !== "active" || st.isPaused === true) continue;
-    const loc = europeanLocations(p.preferredLocations);
-    if (!loc.isEurope) continue;
+    const loc = europeanLocations(p.preferredLocations || []);
+    if (!loc.isEurope && st.clientCountry !== "Europe") continue;
     out.push({
       email,
       name: st.name || [p.firstName, p.lastName].filter(Boolean).join(" ") || email,
@@ -124,8 +138,26 @@ export async function getEuropeClients({ ProfileModel, ClientPaymentLookup }) {
       places: loc.places,
       countries: loc.countries,
       country: loc.countries[0] || "",
-      preferredLocations: p.preferredLocations,
+      preferredLocations: p.preferredLocations || [],
+      scrapeSources: Array.isArray(p.scrapeSources) ? p.scrapeSources : [],
     });
   }
   return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Turn Indeed, Glassdoor and HiringCafe on for these clients. One bulkWrite,
+ * only for clients missing one of them. Returns how many profiles changed.
+ */
+export async function ensureEuropeSources({ ProfileModel, clients }) {
+  const ops = [];
+  for (const c of clients) {
+    const next = withEuropeSources(c.scrapeSources);
+    const had = Array.isArray(c.scrapeSources) ? c.scrapeSources : [];
+    if (had.length && next.length === had.length) continue;
+    ops.push({ updateOne: { filter: { email: c.email }, update: { $set: { scrapeSources: next } } } });
+  }
+  if (!ops.length) return 0;
+  const r = await ProfileModel.bulkWrite(ops, { ordered: false });
+  return r.modifiedCount ?? ops.length;
 }

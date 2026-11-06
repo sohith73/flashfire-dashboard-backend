@@ -1,7 +1,7 @@
 // Europe run: who counts as a Europe client, and the reminder text.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { europeanLocations, roleTerms, getEuropeClients } from "../europeClients.js";
+import { europeanLocations, roleTerms, getEuropeClients, withEuropeSources, ensureEuropeSources } from "../europeClients.js";
 import { reminderText } from "../europeRunReminder.js";
 
 test("countries, cities and Europe/EU all count; the UK counts", () => {
@@ -70,4 +70,36 @@ test("reminder names every client and stays under Discord's limit", () => {
   const many = reminderText(Array.from({ length: 400 }, (_, i) => ({ name: `Client number ${i}`, countries: ["de"] })));
   assert.ok(many.length <= 1900, `length ${many.length}`);
   assert.match(many, /…and \d+ more/);
+});
+
+test("a client set to Europe in Client Tracking counts even without European locations", async () => {
+  const ProfileModel = fakeModel([
+    { email: "eu@x.com", firstName: "Eu", lastName: "C", preferredLocations: [], preferredRoles: ["Buyer"] },
+  ]);
+  const ClientPaymentLookup = fakeModel([{ email: "eu@x.com", status: "active", clientCountry: "Europe" }]);
+  const out = await getEuropeClients({ ProfileModel, ClientPaymentLookup });
+  assert.deepEqual(out.map((c) => c.email), ["eu@x.com"]);
+  assert.equal(out[0].country, "");
+});
+
+test("Europe sources are added to what is there, never removing anything", () => {
+  assert.deepEqual(withEuropeSources(undefined), ["jobright", "indeed", "glassdoor", "hiringcafe"]);
+  assert.deepEqual(withEuropeSources([]), ["jobright", "indeed", "glassdoor", "hiringcafe"]);
+  assert.deepEqual(withEuropeSources(["reed", "Indeed"]), ["reed", "indeed", "glassdoor", "hiringcafe"]);
+  assert.deepEqual(withEuropeSources(["hiringcafe", "glassdoor", "indeed"]), ["hiringcafe", "glassdoor", "indeed"]);
+});
+
+test("ensureEuropeSources writes once, only for clients missing a board", async () => {
+  const calls = [];
+  const ProfileModel = { bulkWrite: async (ops) => { calls.push(ops); return { modifiedCount: ops.length }; } };
+  const clients = [
+    { email: "done@x.com", scrapeSources: ["jobright", "indeed", "glassdoor", "hiringcafe"] },
+    { email: "none@x.com", scrapeSources: [] },
+    { email: "some@x.com", scrapeSources: ["reed"] },
+  ];
+  assert.equal(await ensureEuropeSources({ ProfileModel, clients }), 2);
+  assert.equal(calls.length, 1, "one bulkWrite, not one call per client");
+  assert.deepEqual(calls[0].map((o) => o.updateOne.filter.email), ["none@x.com", "some@x.com"]);
+  assert.equal(await ensureEuropeSources({ ProfileModel, clients: [clients[0]] }), 0);
+  assert.equal(calls.length, 1, "nothing to change means no write");
 });

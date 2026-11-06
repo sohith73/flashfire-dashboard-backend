@@ -21,7 +21,7 @@ import axios from "axios";
 import cron from "node-cron";
 import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { ClientPaymentLookup } from "../Schema_Models/ClientPaymentLookup.js";
-import { getEuropeClients } from "./europeClients.js";
+import { getEuropeClients, ensureEuropeSources } from "./europeClients.js";
 
 export const EUROPE_RUN_CRON = "0 3 * * 1-5"; // 03:00, Monday-Friday
 export const EUROPE_RUN_TZ = "Asia/Kolkata";
@@ -62,6 +62,13 @@ export function reminderText(clients) {
 
 export async function sendEuropeRunReminder() {
   const clients = await getEuropeClients({ ProfileModel, ClientPaymentLookup });
+  // New Europe clients get Indeed, Glassdoor and HiringCafe before the run.
+  try {
+    const changed = await ensureEuropeSources({ ProfileModel, clients });
+    if (changed) console.log(`[europe-run] enabled Indeed/Glassdoor/HiringCafe for ${changed} client(s)`);
+  } catch (error) {
+    console.error("[europe-run] could not enable Europe sources:", error.message);
+  }
   if (!clients.length) {
     console.log("[europe-run] no active Europe clients today; no reminder sent");
     return { sent: false, reason: "no clients" };
@@ -72,9 +79,10 @@ export async function sendEuropeRunReminder() {
 }
 
 export function startEuropeRunReminder() {
+  // Scheduled even without the webhook: the same job keeps every Europe
+  // client's sources on. postToDiscord reports the missing webhook itself.
   if (!webhookUrl()) {
-    console.log("[europe-run] DISCORD_EUROPE_RUN_WEBHOOK_URL not set; 3 AM reminder is off");
-    return;
+    console.log("[europe-run] DISCORD_EUROPE_RUN_WEBHOOK_URL not set; 3 AM job only enables sources");
   }
   cron.schedule(EUROPE_RUN_CRON, async () => {
     try {
