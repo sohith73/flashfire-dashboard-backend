@@ -74,6 +74,45 @@ export async function countPushedDuring(clientEmail, from, to) {
   });
 }
 
+// Which portal each pushed job came from. A card's importSource is set by the
+// job-api ingest ("indeed-api", "glassdoor-scrape", "hiringcafe-scrape",
+// "adzuna-api"); a JobRight push from the extension has none, so an unset
+// source is JobRight. Same window and same rule as countPushedDuring, so the
+// per-portal numbers sum to the run's pushed count.
+export const SOURCE_LABELS = Object.freeze({
+  jobright: "JobRight",
+  "indeed-api": "Indeed",
+  "glassdoor-scrape": "Glassdoor",
+  "hiringcafe-scrape": "HiringCafe",
+  "adzuna-api": "Adzuna",
+});
+
+export async function pushedBySourceDuring(clientEmail, from, to) {
+  if (!(from instanceof Date) || Number.isNaN(from.getTime())) return null;
+  const end = to instanceof Date && !Number.isNaN(to.getTime()) ? to : new Date();
+  const rows = await JobModel.aggregate([
+    { $match: {
+        userID: clientEmail,
+        createdByRole: "operations",
+        _id: { $gte: oidAt(from), $lt: oidAt(end, 1) },
+    } },
+    { $group: { _id: { $ifNull: ["$importSource", "jobright"] }, n: { $sum: 1 } } },
+  ]);
+  const out = {};
+  for (const r of rows) out[r._id || "jobright"] = r.n;
+  return out;
+}
+
+// Sum several {source: n} maps into one.
+export function mergeSourceCounts(maps) {
+  const out = {};
+  for (const m of maps) {
+    if (!m) continue;
+    for (const [k, v] of Object.entries(m)) out[k] = (out[k] || 0) + v;
+  }
+  return out;
+}
+
 // A "running" row whose last progress is older than this is a run whose
 // machine went away (closed laptop, crashed app). Reported as interrupted.
 export const STALE_RUNNING_MS = 15 * 60 * 1000;
@@ -366,9 +405,28 @@ export const getAutopilotRunsSummary = async (req, res) => {
       { clients: 0, runs: 0, captured: 0, pushed: 0, rejected: 0, failedRuns: 0 }
     );
 
+    // Jobs added per portal across the whole window, in one aggregation over
+    // the jobs themselves (not per client), so 293 clients stay one round trip.
+    // importSource is the portal; an unset source is a JobRight extension push.
+    // The breakdown is a nice-to-have: if it fails, the report still returns.
+    try {
+      const sourceRows = await JobModel.aggregate([
+        { $match: {
+            createdByRole: "operations",
+            _id: { $gte: oidAt(since), $lt: oidAt(until, 1) },
+        } },
+        { $group: { _id: { $ifNull: ["$importSource", "jobright"] }, n: { $sum: 1 } } },
+      ]);
+      totals.bySource = {};
+      for (const r of sourceRows) totals.bySource[r._id || "jobright"] = r.n;
+    } catch (err) {
+      console.error("getAutopilotRunsSummary bySource failed:", err.message);
+    }
+
     res.status(200).json({
       success: true,
       days,
+      sourceLabels: SOURCE_LABELS,
       // The client renders these, so it never has to re-derive the boundary
       // and can never disagree with the server about where "today" starts.
       windowStart: since.toISOString(),
@@ -416,7 +474,23 @@ export const getAutopilotRunsForClient = async (req, res) => {
     );
     totals.minutes = Math.round(totals.minutes * 10) / 10;
 
-    res.status(200).json({ success: true, clientEmail: email, totals, runs, requests });
+    // Per-portal split of the pushed jobs, by importSource within each run's
+    // own window. Only runs that pushed are queried (a login failure pushed 0,
+    // so it needs no lookup), which keeps a client of mostly-failed runs cheap.
+    // A nice-to-have: a failure here must not break the run history.
+    try {
+      await Promise.all(
+        runs.map(async (r) => {
+          if (!(r.pushed > 0) || !r.startedAt) return;
+          r.bySource = await pushedBySourceDuring(r.clientEmail, r.startedAt, r.finishedAt);
+        })
+      );
+      totals.bySource = mergeSourceCounts(runs.map((r) => r.bySource));
+    } catch (err) {
+      console.error("getAutopilotRunsForClient bySource failed:", err.message);
+    }
+
+    res.status(200).json({ success: true, clientEmail: email, totals, runs, requests, sourceLabels: SOURCE_LABELS });
   } catch (error) {
     console.error("getAutopilotRunsForClient failed:", error);
     res.status(500).json({ success: false, message: error.message });

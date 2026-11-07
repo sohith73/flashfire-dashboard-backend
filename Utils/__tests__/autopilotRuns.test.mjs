@@ -13,13 +13,16 @@ import assert from "node:assert/strict";
 
 import { AutopilotRun } from "../../Schema_Models/AutopilotRun.js";
 import { AutopilotRunRequest } from "../../Schema_Models/AutopilotRunRequest.js";
+import { JobModel } from "../../Schema_Models/JobModel.js";
 import {
   recordAutopilotRun,
   getAutopilotRunsSummary,
   queueAutopilotRun,
   claimAutopilotRequests,
   cancelAutopilotRequest,
-  finishAutopilotRequest
+  finishAutopilotRequest,
+  mergeSourceCounts,
+  SOURCE_LABELS
 } from "../../Controllers/AutopilotRuns.js";
 
 /** Minimal Express res double that records what the controller sent. */
@@ -460,4 +463,51 @@ test("finishAutopilotRequest keeps a failed status and ignores a bogus runId", a
   assert.equal(update.$set.status, "failed");
   assert.equal(update.$set.outcome, "jr-login-failed");
   assert.equal(update.$set.runId, undefined, "an invalid runId is dropped, not written");
+});
+
+
+// ── per-portal breakdown ──────────────────────────────────────────────
+
+test("mergeSourceCounts sums per-portal maps and ignores null", () => {
+  assert.deepEqual(
+    mergeSourceCounts([{ jobright: 3, "indeed-api": 2 }, null, { jobright: 1, "glassdoor-scrape": 4 }]),
+    { jobright: 4, "indeed-api": 2, "glassdoor-scrape": 4 },
+  );
+  assert.deepEqual(mergeSourceCounts([]), {});
+});
+
+test("getAutopilotRunsSummary adds totals.bySource and sourceLabels", async () => {
+  const groups = [{
+    _id: "a@b.com",
+    lastRun: { clientName: "Ann", finishedAt: new Date("2026-11-07T10:00:00Z"), severity: "good" },
+    runs: 1, totalCaptured: 10, totalPushed: 7, totalRejected: 3, totalMinutes: 2, failedRuns: 0,
+  }];
+  const sourceRows = [
+    { _id: "jobright", n: 5 }, { _id: "hiringcafe-scrape", n: 2 },
+  ];
+  const res = fakeRes();
+  await withStub(AutopilotRun, "aggregate", async () => groups, async () => {
+    await withStub(JobModel, "aggregate", async () => sourceRows, async () => {
+      await getAutopilotRunsSummary({ query: { days: "7" } }, res);
+    });
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.totals.bySource, { jobright: 5, "hiringcafe-scrape": 2 });
+  assert.equal(res.body.sourceLabels["indeed-api"], "Indeed");
+});
+
+test("getAutopilotRunsSummary still returns when the breakdown query throws", async () => {
+  const res = fakeRes();
+  await withStub(AutopilotRun, "aggregate", async () => [], async () => {
+    await withStub(JobModel, "aggregate", async () => { throw new Error("no mongo"); }, async () => {
+      await getAutopilotRunsSummary({ query: { days: "7" } }, res);
+    });
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.totals.bySource, undefined);
+});
+
+test("SOURCE_LABELS names every portal, JobRight for the unset source", () => {
+  assert.equal(SOURCE_LABELS.jobright, "JobRight");
+  assert.equal(SOURCE_LABELS["glassdoor-scrape"], "Glassdoor");
 });
