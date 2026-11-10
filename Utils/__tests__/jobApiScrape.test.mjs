@@ -29,6 +29,11 @@ let savedSettings = null;
 
 let capResult = { remaining: 30 };
 let capThrows = null;
+// Lifetime plan cap. cap:null = uncapped (the default, so older tests are
+// unaffected). planKeepUpTo: the post-insert check keeps inserts until the
+// client holds this many created jobs, then rolls back.
+let planResult = { allowed: true, cap: null };
+let planKeepUpTo = Infinity;
 
 let profileDoc = null;
 let existingLinks = [];
@@ -150,6 +155,12 @@ mock.module("../../Utils/apiJudge.js", {
 mock.module("../../Utils/dailyCapGuard.js", {
   namedExports: {
     checkCap: async () => { if (capThrows) throw capThrows; return capResult; },
+    checkPlanCap: async () => planResult,
+    enforcePlanCapPostInsert: async () => {
+      if (created.length <= planKeepUpTo) return { kept: true, count: created.length, cap: planResult.cap };
+      created.pop(); // the rolled-back job is gone from the board
+      return { kept: false, count: created.length + 1, cap: planResult.cap };
+    },
   },
 });
 
@@ -216,6 +227,7 @@ function reset() {
   settingsDoc = { clientEmail: CLIENT, provider: "adzuna", what: "registered nurse", maxPages: 5 };
   settingsUpdate = null; savedSettings = null;
   capResult = { remaining: 30 }; capThrows = null;
+  planResult = { allowed: true, cap: null }; planKeepUpTo = Infinity;
   profileDoc = { email: CLIENT, aiThreshold: 50, aiSummary: "RN, 5 years" };
   existingLinks = []; existingOwner = CLIENT; created = []; createThrowsFor = new Set();
   pages = []; termPages = {}; fetchCalls = []; judgeResult = null; judgeCalls = [];
@@ -950,4 +962,56 @@ test("ingest keeps one response shape whether it pushes or not", async () => {
 test("the ingest route needs the ops key", () => {
   const routes = readFileSync(new URL("../../Routes.js", import.meta.url), "utf8");
   assert.match(routes, /app\.post\("\/job-api\/ingest\/:email", requireOpsKey, ingestJobApiJobs\)/);
+});
+
+
+// ── lifetime plan cap (Prime 160, Ignite 250, ...) ────────────────────
+// These routes used to check only the daily cap, so a Europe/Indeed run kept
+// pushing after a client's plan was used up (Prime client at 175/160).
+
+test("a client at their plan limit gets nothing, even with daily room left", async () => {
+  reset();
+  capResult = { remaining: 25 };
+  planResult = { allowed: false, cap: 160, count: 160, reason: "PLAN_LIMIT_REACHED",
+                 message: "Plan limit reached: 160/160 applications for Prime." };
+  pages = [{ ok: true, results: [adzJob(1)] }, { ok: true, results: [] }];
+  judgeResult = judgeAll([1]);
+  const r = await run();
+  assert.equal(r.body.outcome, "plan-limit");
+  assert.match(r.body.message, /Plan limit reached/);
+  assert.equal(created.length, 0);
+  assert.equal(fetchCalls.length, 0, "nothing is fetched for a client who cannot receive jobs");
+});
+
+test("the plan's remaining room caps a run below the daily allowance", async () => {
+  reset();
+  capResult = { remaining: 25 };
+  planResult = { allowed: true, cap: 160, count: 157, remaining: 3 };
+  pages = [{ ok: true, results: [1, 2, 3, 4, 5].map(adzJob) }, { ok: true, results: [] }];
+  judgeResult = judgeAll([1, 2, 3, 4, 5]);
+  const r = await run();
+  assert.equal(created.length, 3);
+  assert.equal(r.body.remainingBefore, 3);
+});
+
+test("ingest refuses a client at their plan limit", async () => {
+  reset();
+  planResult = { allowed: false, cap: 500, count: 500, reason: "PLAN_LIMIT_REACHED",
+                 message: "Plan limit reached: 500/500 applications for Professional." };
+  judgeResult = judgeIds(["ind-1"]);
+  const r = await ingest({ provider: "indeed", jobs: [indeedJob(1)] });
+  assert.equal(r.code, 200);
+  assert.equal(r.body.outcome, "plan-limit");
+  assert.equal(r.body.pushed, 0);
+  assert.equal(created.length, 0);
+});
+
+test("ingest stops and rolls back when a parallel push filled the plan mid-run", async () => {
+  reset();
+  planResult = { allowed: true, cap: 160, count: 158, remaining: 2 };
+  planKeepUpTo = 1;   // another run took the other slot after our pre-check
+  judgeResult = judgeIds(["ind-1", "ind-2"]);
+  const r = await ingest({ provider: "indeed", jobs: [indeedJob(1), indeedJob(2)] });
+  assert.equal(r.body.pushed, 1);
+  assert.equal(created.length, 1, "the job that crossed the plan is rolled back");
 });

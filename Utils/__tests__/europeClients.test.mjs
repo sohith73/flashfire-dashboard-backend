@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { europeanLocations, roleTerms, getEuropeClients, withEuropeSources, ensureEuropeSources } from "../europeClients.js";
-import { reminderText } from "../europeRunReminder.js";
+import { reminderText, postToDiscord } from "../europeRunReminder.js";
 
 test("countries, cities and Europe/EU all count; the UK counts", () => {
   assert.deepEqual(europeanLocations(["Netherlands"]).countries, ["nl"]);
@@ -19,6 +19,25 @@ test("non-European locations are not Europe clients", () => {
   for (const loc of [["United States"], ["Dubai, UAE"], ["Toronto, Canada"], ["India"], [], [""]]) {
     assert.equal(europeanLocations(loc).isEurope, false, JSON.stringify(loc));
   }
+});
+
+test("a European city name beside non-European places is not Europe (Cambridge, Ontario)", () => {
+  const gta = europeanLocations(["Greater Toronto Area, Toronto, Oakville, Etobicoke, Cambridge."]);
+  assert.equal(gta.isEurope, false);
+  assert.deepEqual(gta.countries, []);
+  assert.equal(europeanLocations(["London, Ontario"]).isEurope, false);
+  assert.equal(europeanLocations(["Birmingham, Alabama"]).isEurope, false);
+  // City alone, city lists, city + Remote, and city + European country still count.
+  assert.deepEqual(europeanLocations(["Cambridge"]).countries, ["gb"]);
+  assert.deepEqual(europeanLocations(["Berlin, Munich"]).countries, ["de"]);
+  assert.deepEqual(europeanLocations(["Berlin, Remote"]).countries, ["de"]);
+  assert.deepEqual(europeanLocations(["Cambridge, UK"]).countries, ["gb"]);
+  assert.equal(europeanLocations(["Toronto", "London"]).isEurope, false, "Toronto anywhere makes a bare London ambiguous");
+  assert.deepEqual(europeanLocations(["Toronto", "London, UK"]).countries, ["gb"], "a European country still counts");
+  assert.equal(europeanLocations(["Greater Boston", "MA; Cambridge", "MA"]).isEurope, false);
+  // UK lists with towns the city table does not know stay Europe.
+  assert.deepEqual(europeanLocations(["London, Nottingham, Reading, Rugby, Coventry"]).countries, ["gb"]);
+  assert.deepEqual(europeanLocations(["Paris, Le havre"]).countries, ["fr"]);
 });
 
 test("places keep the client's wording for HiringCafe, minus non-European entries", () => {
@@ -39,26 +58,33 @@ function fakeModel(rows) {
   return { find: () => q };
 }
 
-test("only active, unpaused Europe clients are returned, new ones included automatically", async () => {
+test("only active, unpaused clients with clientCountry \"Europe\" are returned", async () => {
   const ProfileModel = fakeModel([
     { email: "nl@x.com", firstName: "Vipin", lastName: "S", preferredLocations: ["Netherlands"], preferredRoles: ["QA"] },
     { email: "us@x.com", firstName: "Us", lastName: "A", preferredLocations: ["United States"], preferredRoles: ["QA"] },
     { email: "paused@x.com", firstName: "P", lastName: "Z", preferredLocations: ["Germany"], preferredRoles: ["QA"] },
     { email: "gone@x.com", firstName: "G", lastName: "Z", preferredLocations: ["France"], preferredRoles: ["QA"] },
     { email: "new@x.com", firstName: "New", lastName: "C", preferredLocations: ["Ireland"], preferredRoles: [] },
+    { email: "uk@x.com", firstName: "Uk", lastName: "C", preferredLocations: ["London, UK"], preferredRoles: [] },
+    { email: "ca@x.com", firstName: "Ca", lastName: "C", preferredLocations: ["Toronto, Cambridge"], preferredRoles: [] },
+    { email: "nocountry@x.com", firstName: "N", lastName: "C", preferredLocations: ["Germany"], preferredRoles: [] },
   ]);
   const ClientPaymentLookup = fakeModel([
-    { email: "nl@x.com", name: "Vipin Saxena", status: "active" },
-    { email: "us@x.com", status: "active" },
-    { email: "paused@x.com", status: "active", isPaused: true },
-    { email: "gone@x.com", status: "inactive" },
-    { email: "new@x.com", status: "Active" },
+    { email: "nl@x.com", name: "Vipin Saxena", status: "active", clientCountry: "Europe" },
+    { email: "us@x.com", status: "active", clientCountry: "USA" },
+    { email: "paused@x.com", status: "active", isPaused: true, clientCountry: "Europe" },
+    { email: "gone@x.com", status: "inactive", clientCountry: "Europe" },
+    { email: "new@x.com", status: "Active", clientCountry: "Europe" },
+    { email: "uk@x.com", status: "active", clientCountry: "UK" },
+    { email: "ca@x.com", status: "active", clientCountry: "Canada" },
+    { email: "nocountry@x.com", status: "active" },
   ]);
   const out = await getEuropeClients({ ProfileModel, ClientPaymentLookup });
+  // UK, Canada and a client with no country set are out, whatever their locations say.
   assert.deepEqual(out.map((c) => c.email), ["new@x.com", "nl@x.com"]);
   const v = out.find((c) => c.email === "nl@x.com");
   assert.equal(v.name, "Vipin Saxena");
-  assert.equal(v.country, "nl");
+  assert.equal(v.country, "nl", "locations still pick where to search");
   assert.deepEqual(v.roles, ["QA"]);
 });
 
@@ -102,4 +128,15 @@ test("ensureEuropeSources writes once, only for clients missing a board", async 
   assert.deepEqual(calls[0].map((o) => o.updateOne.filter.email), ["none@x.com", "some@x.com"]);
   assert.equal(await ensureEuropeSources({ ProfileModel, clients: [clients[0]] }), 0);
   assert.equal(calls.length, 1, "nothing to change means no write");
+});
+
+test("Europe-run Discord posts are off unless EUROPE_RUN_DISCORD_ENABLED=1", async () => {
+  const calls = [];
+  const post = async (...a) => { calls.push(a); };
+  const off = await postToDiscord("hi", { post, env: {} });
+  assert.equal(off.sent, false);
+  assert.equal(calls.length, 0, "nothing reaches Discord by default");
+  const still = await postToDiscord("hi", { post, env: { EUROPE_RUN_DISCORD_ENABLED: "0" } });
+  assert.equal(still.sent, false);
+  assert.equal(calls.length, 0);
 });

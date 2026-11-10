@@ -31,7 +31,17 @@ function webhookUrl() {
   return String(process.env.DISCORD_EUROPE_RUN_WEBHOOK_URL || "").trim();
 }
 
-export async function postToDiscord(content, { post = axios.post } = {}) {
+// Europe-run Discord posts (the 03:00 IST "@everyone Europe run: N clients
+// today" list, and the Autopilot's started / click-Allow / summary notices)
+// are OFF unless EUROPE_RUN_DISCORD_ENABLED=1. The ops team asked for them to
+// stop (2026-11-10). The 3 AM job still runs, so Europe clients keep their
+// Indeed / Glassdoor / HiringCafe sources; it just no longer posts.
+export function discordEnabled(env = process.env) {
+  return String(env.EUROPE_RUN_DISCORD_ENABLED || "").trim() === "1";
+}
+
+export async function postToDiscord(content, { post = axios.post, env = process.env } = {}) {
+  if (!discordEnabled(env)) return { sent: false, reason: "Europe-run Discord posts are off (EUROPE_RUN_DISCORD_ENABLED is not 1)" };
   const url = webhookUrl();
   if (!url) return { sent: false, reason: "DISCORD_EUROPE_RUN_WEBHOOK_URL is not set" };
   const text = String(content || "").slice(0, DISCORD_LIMIT);
@@ -81,8 +91,8 @@ export async function sendEuropeRunReminder() {
 export function startEuropeRunReminder() {
   // Scheduled even without the webhook: the same job keeps every Europe
   // client's sources on. postToDiscord reports the missing webhook itself.
-  if (!webhookUrl()) {
-    console.log("[europe-run] DISCORD_EUROPE_RUN_WEBHOOK_URL not set; 3 AM job only enables sources");
+  if (!discordEnabled() || !webhookUrl()) {
+    console.log("[europe-run] Discord posts off; 3 AM job only enables sources");
   }
   cron.schedule(EUROPE_RUN_CRON, async () => {
     try {
