@@ -5,6 +5,7 @@ import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { DiscordConnect } from "../Utils/DiscordConnect.js";
 import { validateOperatorRemovalReason } from "../Utils/operatorRemovalReason.js";
 import { shouldSetAppliedDate, isBlankAppliedDate } from "../Utils/appliedDate.js";
+import { checkPlanCap } from "../Utils/dailyCapGuard.js";
 // isPureLogisticalReason: duplicate/already-applied/posting-closed reasons
 // carry zero preference signal — they still land on the job + Discord, but
 // never enter removalFeedback or trigger a rebuild. Duplicates are already
@@ -236,6 +237,24 @@ const scheduleDebouncedRebuild = (userEmail) => {
   pendingRebuilds.set(key, timer);
 };
 
+// Bringing a card back from Deleted/Removed makes it count toward the plan
+// cap again (countTotalJobs skips removal statuses). Nothing checked this, so
+// a client whose freed headroom had since been refilled could be restored past
+// their plan - 713 cards across 187 clients have made that trip. Refuse the
+// restore when the client is already at the cap; any other move is untouched.
+const assertRestoreWithinPlan = async (userEmail, fromStatus, toStatus) => {
+  if (!toStatus || !isRemovalStatus(fromStatus) || isRemovalStatus(toStatus)) return;
+  let plan;
+  try {
+    plan = await checkPlanCap(userEmail);
+  } catch (e) {
+    throw { status: 503, message: "Could not verify plan limit. Try again shortly.", error: "PLAN_CAP_CHECK_FAILED" };
+  }
+  if (!plan.allowed) {
+    throw { status: 403, message: `${plan.message} Restoring this card would take the client past their plan.`, error: "PLAN_LIMIT_REACHED" };
+  }
+};
+
 // Action Handlers
 const handleUpdateStatus = async (req, res, jobID, userEmail, userDetails) => {
   const { status: baseStatus = '', role, removalReason } = req.body;
@@ -266,6 +285,8 @@ const handleUpdateStatus = async (req, res, jobID, userEmail, userDetails) => {
   if (!currentJob) {
     throw { status: 404, message: "Job not found for this user" };
   }
+
+  await assertRestoreWithinPlan(userEmail, currentJob.currentStatus, trimmedStatus);
 
   const actorName = getActorName(role, userDetails, req.body);
   const statusToSet = formatStatusWithAttribution(trimmedStatus, actorName);
@@ -365,6 +386,8 @@ const handleEdit = async (req, res, jobID, userEmail, userDetails) => {
   } else {
     nextStatus = existingJob.currentStatus;
   }
+
+  await assertRestoreWithinPlan(userEmail, existingJob.currentStatus, nextStatus);
 
   // Build update fields
   const updateFields = {

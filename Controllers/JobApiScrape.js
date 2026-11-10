@@ -5,13 +5,30 @@ import { JobModel } from "../Schema_Models/JobModel.js";
 import { UserModel } from "../Schema_Models/UserModel.js";
 import { fetchPage, mapJob, adzunaCredentials, searchLadder } from "../Utils/adzunaClient.js";
 import { judgeJobs } from "../Utils/apiJudge.js";
-import { checkCap } from "../Utils/dailyCapGuard.js";
+import { checkCap, checkPlanCap, enforcePlanCapPostInsert } from "../Utils/dailyCapGuard.js";
 import { ukSponsorGate } from "../Utils/ukVisaSponsor.js";
 import { usSponsorGate } from "../Utils/usVisaSponsor.js";
 import { companyAllowlistGate } from "../Utils/companyAllowlist.js";
 import { jobLinkKey } from "../Utils/jobLinkKey.js";
 import { classifyApplyUrl } from "../Utils/applyUrlPolicy.js";
 import { initialAutoOptimization } from "../Utils/autoOptimizationState.js";
+
+// How many jobs this client may still receive: the smaller of today's daily
+// allowance and the lifetime PLAN allowance (Prime 160, Ignite 250, ...).
+// /addjob has always checked both; these routes checked only the daily cap,
+// so a Europe/Indeed/HiringCafe run kept pushing after the plan was used up.
+// Reported 2026-11-10 on Ashutosh Taparia (Prime): 157 applied + 3 JobRight
+// pushes reached 160, then the Europe run added 15 more through /job-api/ingest
+// -> 175/160. Throws on DB error so callers fail closed.
+async function remainingAllowance(clientEmail) {
+  const cap = await checkCap(clientEmail);
+  const daily = Math.max(0, Number(cap?.remaining) || 0);
+  const plan = await checkPlanCap(clientEmail);
+  if (!plan.allowed) return { remaining: 0, planHit: true, plan };
+  const planLeft = plan.cap == null ? Infinity : Math.max(0, Number(plan.remaining) || 0);
+  return { remaining: Math.min(daily, planLeft), planHit: planLeft === 0, plan };
+}
+
 
 // "Scrape from Job APIs" - the server-side half of the autopilot's second mode.
 //
@@ -258,7 +275,7 @@ export async function importJobs({
     const d = byId.get(job.jobId) || {};
     const jobDescription = String(job.description || "").slice(0, MAX_DESCRIPTION_CHARS);
     try {
-      await JobModel.create({
+      const created = await JobModel.create({
         userID: clientEmail,
         jobTitle: job.title.slice(0, 50),
         companyName: job.company,
@@ -283,6 +300,14 @@ export async function importJobs({
           judgedAt: new Date(),
         },
       });
+      // Same race guard as /addjob: two runs for one client can both pass the
+      // pre-check, so re-count after the insert and roll back our own job if
+      // it took the client past their plan. Then stop - the plan is full.
+      const enforce = await enforcePlanCapPostInsert(clientEmail, created._id);
+      if (!enforce.kept) {
+        failures.push(`plan limit reached (${enforce.count}/${enforce.cap}) - stopped`);
+        break;
+      }
       counts.pushed += 1;
       pushedJobs.push({ title: job.title, company: job.company, score: Number.isInteger(d.score) ? d.score : null });
     } catch (e) {
@@ -326,11 +351,16 @@ export const runJobApiScrape = async (req, res) => {
     // enforces and manual operator pushes share, so an API run cannot spend
     // an allowance the operator already used by hand.
     let remaining = 0;
+    let allowance;
     try {
-      const cap = await checkCap(clientEmail);
-      remaining = Math.max(0, Number(cap?.remaining) || 0);
+      allowance = await remainingAllowance(clientEmail);
+      remaining = allowance.remaining;
     } catch (e) {
       return res.status(503).json({ success: false, error: "CAP_UNAVAILABLE", message: e.message });
+    }
+    if (allowance.planHit) {
+      return res.status(200).json({ success: true, outcome: "plan-limit", fetched: 0, judged: 0,
+        picked: 0, pushed: 0, message: allowance.plan.message || "Plan limit reached. No more jobs can be added for this client." });
     }
     if (remaining <= 0) {
       return res.status(200).json({ success: true, outcome: "cap-hit", fetched: 0, judged: 0,
@@ -507,11 +537,18 @@ export const ingestJobApiJobs = async (req, res) => {
 
     // The same daily cap /addjob enforces and manual pushes share.
     let remaining = 0;
+    let allowance;
     try {
-      const cap = await checkCap(clientEmail);
-      remaining = Math.max(0, Number(cap?.remaining) || 0);
+      allowance = await remainingAllowance(clientEmail);
+      remaining = allowance.remaining;
     } catch (e) {
       return res.status(503).json({ success: false, error: "CAP_UNAVAILABLE", message: e.message, ...base });
+    }
+    if (allowance.planHit) {
+      return res.status(200).json({ success: true, outcome: "plan-limit", ...base,
+        alreadyHad: 0, blockedByPolicy: 0, notOnList: 0, notSponsor: 0,
+        judged: 0, picked: 0, pushed: 0, remainingBefore: 0, minutes: elapsed(),
+        message: allowance.plan.message || "Plan limit reached. No more jobs can be added for this client." });
     }
     if (remaining <= 0) {
       return res.status(200).json({ success: true, outcome: "cap-hit", ...base,

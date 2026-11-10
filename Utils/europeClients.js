@@ -6,10 +6,10 @@
 // (Utils/europeRunReminder.js) tells the team to press it. Both read this list,
 // so "who counts as Europe" has exactly one definition.
 //
-// A client is a Europe client when any of their dashboard preferredLocations
-// names a European country, a well-known European city, or Europe/EU itself.
-// The UK counts. Nothing is stored: a new client with "Netherlands" in their
-// profile is on tomorrow's list automatically.
+// A client is a Europe client only when Client Tracking has their country
+// (dashboardtrackings.clientCountry) set to "Europe". "UK" is its own country
+// there and is NOT part of the Europe run. The client's preferredLocations are
+// used only to choose where to search (country codes, place names).
 //
 // Only active, unpaused clients (the operations status in dashboardtrackings)
 // are returned, so a paused or churned client is never scraped by accident.
@@ -41,6 +41,52 @@ const EUROPE_CITIES = {
 
 const EUROPE_WORDS = new Set(["europe", "eu", "european union", "emea", "eea", "schengen"]);
 
+// Clear signs a client is looking OUTSIDE Europe. A European city name on its
+// own is weak evidence: Cambridge, London, Dublin and Birmingham also exist in
+// Canada and the US ("Greater Toronto Area, Toronto, Oakville, Cambridge" is
+// Cambridge, Ontario). When any of these appears in a client's locations, bare
+// city names stop counting; a European country or Europe/EU still does.
+const NON_EUROPE_PHRASES = [
+  // countries and regions
+  "united states", "usa", "america", "canada", "india", "australia", "new zealand", "singapore",
+  "uae", "united arab emirates", "dubai", "abu dhabi", "saudi", "qatar", "japan", "china", "hong kong",
+  "mexico", "brazil", "south africa", "north america", "latam", "apac",
+  // Canadian provinces and cities
+  "ontario", "quebec", "british columbia", "alberta", "manitoba", "saskatchewan", "nova scotia",
+  "new brunswick", "toronto", "gta", "mississauga", "oakville", "etobicoke", "brampton", "markham",
+  "vancouver", "montreal", "calgary", "ottawa", "edmonton", "waterloo", "kitchener", "winnipeg",
+  // US states
+  "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut", "delaware",
+  "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa", "kansas", "kentucky",
+  "louisiana", "maine", "maryland", "massachusetts", "michigan", "minnesota", "mississippi",
+  "missouri", "montana", "nebraska", "nevada", "new hampshire", "new jersey", "new mexico",
+  "new york", "north carolina", "north dakota", "ohio", "oklahoma", "oregon", "pennsylvania",
+  "rhode island", "south carolina", "south dakota", "tennessee", "texas", "utah", "vermont",
+  "virginia", "washington", "west virginia", "wisconsin", "wyoming",
+  // big US metros people write instead of the state
+  "nyc", "bay area", "san francisco", "san jose", "los angeles", "san diego", "seattle", "boston",
+  "chicago", "austin", "dallas", "houston", "atlanta", "denver", "phoenix", "miami", "silicon valley",
+  // Indian and Australian cities
+  "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "pune", "chennai", "gurgaon", "noida",
+  "sydney", "melbourne", "brisbane", "perth",
+];
+const NON_EUROPE_RX = new RegExp(`\\b(${NON_EUROPE_PHRASES.join("|")})\\b`, "i");
+// Two-letter US state / Canadian province codes, only as a whole token ("MA",
+// "ON"). Codes that are also ordinary words (in, me, or, ok, hi, oh) are left out.
+const NON_EUROPE_CODES = new Set([
+  "al", "ak", "az", "ar", "ca", "co", "ct", "fl", "ga", "ia", "id", "il", "ks", "ky", "la", "ma",
+  "md", "mi", "mn", "mo", "ms", "mt", "nc", "nd", "ne", "nh", "nj", "nm", "nv", "ny", "pa", "ri",
+  "sc", "sd", "tn", "tx", "ut", "va", "vt", "wa", "wi", "wv", "wy", "dc",
+  "on", "qc", "bc", "ab", "mb", "sk", "ns", "nb",
+]);
+
+/** True when the locations clearly point somewhere outside Europe. */
+export function hasNonEuropeSignal(preferredLocations) {
+  return locationTokens(preferredLocations).some(
+    (t) => NON_EUROPE_CODES.has(t) || (!EUROPE_COUNTRIES[t] && NON_EUROPE_RX.test(t))
+  );
+}
+
 /** Split "EU/ Australia/Canada" or "London, UK; Berlin" into trimmed tokens. */
 export function locationTokens(values) {
   const list = Array.isArray(values) ? values : [values];
@@ -60,11 +106,13 @@ export function europeanLocations(preferredLocations) {
   const countries = [];
   const places = [];
   let isEurope = false;
+  // Bare city names only count when nothing points outside Europe.
+  const citiesTrusted = !hasNonEuropeSignal(preferredLocations);
   for (const raw of Array.isArray(preferredLocations) ? preferredLocations : [preferredLocations]) {
     const tokens = locationTokens(raw);
     let rawIsEurope = false;
     for (const t of tokens) {
-      const iso = EUROPE_COUNTRIES[t] || EUROPE_CITIES[t];
+      const iso = EUROPE_COUNTRIES[t] || (citiesTrusted ? EUROPE_CITIES[t] : undefined);
       if (iso) {
         rawIsEurope = true;
         if (!countries.includes(iso)) countries.push(iso);
@@ -76,7 +124,7 @@ export function europeanLocations(preferredLocations) {
       isEurope = true;
       // Keep the concrete European parts only ("EU/ Australia/Canada" -> nothing
       // concrete; "Maribor, Slovenia" -> "Maribor, Slovenia").
-      const concrete = tokens.filter((t) => EUROPE_COUNTRIES[t] || EUROPE_CITIES[t]);
+      const concrete = tokens.filter((t) => EUROPE_COUNTRIES[t] || (citiesTrusted && EUROPE_CITIES[t]));
       if (concrete.length) places.push(String(raw).trim());
     }
   }
@@ -110,16 +158,18 @@ export function withEuropeSources(current) {
 
 /**
  * Every active, unpaused Europe client with what to search.
- * A client is a Europe client when its preferred locations name a European
- * place, or when Client Tracking has its country set to Europe.
+ * A client is a Europe client ONLY when Client Tracking has its country
+ * (dashboardtrackings.clientCountry) set to "Europe". "UK" is a separate
+ * country and is not included.
  * Models are passed in so the function can be tested without a database.
  */
 export async function getEuropeClients({ ProfileModel, ClientPaymentLookup }) {
   const statuses = await ClientPaymentLookup.find({}).select("email name status isPaused clientCountry").lean();
   const byEmail = new Map(statuses.filter((s) => s.email).map((s) => [String(s.email).toLowerCase().trim(), s]));
   const markedEurope = [...byEmail].filter(([, s]) => s.clientCountry === "Europe").map(([e]) => e);
+  if (!markedEurope.length) return [];
   const profiles = await ProfileModel.find(
-    { $or: [{ "preferredLocations.0": { $exists: true } }, { email: { $in: markedEurope } }] },
+    { email: { $in: markedEurope } },
     { email: 1, firstName: 1, lastName: 1, preferredLocations: 1, preferredRoles: 1, scrapeSources: 1 }
   ).lean();
 
@@ -129,8 +179,9 @@ export async function getEuropeClients({ ProfileModel, ClientPaymentLookup }) {
     if (!email) continue;
     const st = byEmail.get(email);
     if (!st || String(st.status || "").toLowerCase() !== "active" || st.isPaused === true) continue;
+    if (st.clientCountry !== "Europe") continue;
+    // Locations only decide WHERE to search, never WHO is in the run.
     const loc = europeanLocations(p.preferredLocations || []);
-    if (!loc.isEurope && st.clientCountry !== "Europe") continue;
     out.push({
       email,
       name: st.name || [p.firstName, p.lastName].filter(Boolean).join(" ") || email,

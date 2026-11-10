@@ -4,12 +4,12 @@ import { ClientPaymentLookup } from "../Schema_Models/ClientPaymentLookup.js";
 //
 // Consumed by the Flashfire Autopilot desktop app: maps every client email to
 // the operations status kept in dashboardtrackings (status "active"/"inactive"
-// + isPaused), so the app can show and filter the same Active/Inactive state
+// + isPaused + clientCountry), so the app can show and filter the same Active/Inactive state
 // the operations dashboard shows. Read-only, no payment or credential fields.
 export const getClientTrackingStatus = async (_req, res) => {
   try {
     const docs = await ClientPaymentLookup.find({})
-      .select("email status isPaused")
+      .select("email status isPaused clientCountry")
       .lean();
     res.status(200).json({
       success: true,
@@ -19,7 +19,11 @@ export const getClientTrackingStatus = async (_req, res) => {
         .map((d) => ({
           email: String(d.email).toLowerCase().trim(),
           status: String(d.status || "").toLowerCase() || "unknown",
-          isPaused: d.isPaused === true
+          isPaused: d.isPaused === true,
+          // USA | Canada | UK | Australia | Europe. The app routes on this:
+          // "Europe" clients go to the HiringCafe/Indeed/Glassdoor run, every
+          // other client to JobRight. Empty when Client Tracking has none set.
+          clientCountry: String(d.clientCountry || "").trim()
         }))
     });
   } catch (error) {
