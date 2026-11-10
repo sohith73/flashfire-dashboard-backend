@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { europeanLocations, roleTerms, getEuropeClients, withEuropeSources, ensureEuropeSources } from "../europeClients.js";
-import { reminderText } from "../europeRunReminder.js";
+import { reminderText, postToDiscord } from "../europeRunReminder.js";
 
 test("countries, cities and Europe/EU all count; the UK counts", () => {
   assert.deepEqual(europeanLocations(["Netherlands"]).countries, ["nl"]);
@@ -128,4 +128,15 @@ test("ensureEuropeSources writes once, only for clients missing a board", async 
   assert.deepEqual(calls[0].map((o) => o.updateOne.filter.email), ["none@x.com", "some@x.com"]);
   assert.equal(await ensureEuropeSources({ ProfileModel, clients: [clients[0]] }), 0);
   assert.equal(calls.length, 1, "nothing to change means no write");
+});
+
+test("Europe-run Discord posts are off unless EUROPE_RUN_DISCORD_ENABLED=1", async () => {
+  const calls = [];
+  const post = async (...a) => { calls.push(a); };
+  const off = await postToDiscord("hi", { post, env: {} });
+  assert.equal(off.sent, false);
+  assert.equal(calls.length, 0, "nothing reaches Discord by default");
+  const still = await postToDiscord("hi", { post, env: { EUROPE_RUN_DISCORD_ENABLED: "0" } });
+  assert.equal(still.sent, false);
+  assert.equal(calls.length, 0);
 });
