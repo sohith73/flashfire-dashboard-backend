@@ -30,6 +30,7 @@ export const AI_USAGE_SOURCES = {
     MAIL_VERIFY: "mail-verify",       // mailMilestoneVerifier second-stage check
     MAIL_REGEX: "mail-regex",         // mailRegexLearner exclusion-pattern proposals
     SPEEDYAPPLY_ASK: "speedyapply-ask", // SpeedyApply sidebar Ask AI / answer suggestions
+    SPEEDYAPPLY_COVER_LETTER: "speedyapply-cover-letter", // SpeedyApply per-job cover letter writer
 };
 
 const aiUsageDailySchema = new mongoose.Schema({

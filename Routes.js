@@ -112,6 +112,7 @@ import { getSpeedyApplyProfile, saveSpeedyApplyProfile } from "./Controllers/Ext
 import { speedyApplyLogin, getSpeedyApplyAccessCode, rotateSpeedyApplyAccessCode } from "./Controllers/Extensions/speedyApplyAccess.js";
 import { listSpeedyApplyOptimizedResumes, getSpeedyApplyOptimizedResumePdf } from "./Controllers/Extensions/speedyApplyResumes.js";
 import { listSpeedyApplyCoverLetters, getSpeedyApplyCoverLetterFile } from "./Controllers/Extensions/speedyApplyCoverLetters.js";
+import { generateSpeedyApplyCoverLetter } from "./Controllers/Extensions/speedyApplyCoverLetterWriter.js";
 import SpeedyApplyAuth from "./Middlewares/SpeedyApplyAuth.js";
 import { onboardingTick } from "./src/services/onboardingMailWorker.js";
 import { OnboardingMailStatus, SendOnboardingMailStep } from "./Controllers/OnboardingMailStatus.js";
@@ -812,6 +813,9 @@ app.get('/extension/speedyapply/optimized-resumes/:jobId/pdf', SpeedyApplyAuth, 
 // stored (not rebuilt by the PDF server).
 app.get('/extension/speedyapply/cover-letters', SpeedyApplyAuth, listSpeedyApplyCoverLetters);
 app.get('/extension/speedyapply/cover-letters/:id/file', SpeedyApplyAuth, getSpeedyApplyCoverLetterFile);
+// SpeedyApply cover letter writer (Executive plan): gpt-4o-mini writes a one-page
+// letter for the job on the page and returns it as text; the extension builds the PDF.
+app.post('/extension/speedyapply/cover-letters/generate', SpeedyApplyAuth, generateSpeedyApplyCoverLetter);
 // Shared learning: label aliases merged across all clients (daily, src/services/speedyApplyLearningWorker.js).
 // app.get('/extension/speedyapply/shared-learning', SpeedyApplyAuth, getSpeedyApplySharedLearning);
 // Onboarding email sequence — manual trigger (runs backfill → detect → send-due).
