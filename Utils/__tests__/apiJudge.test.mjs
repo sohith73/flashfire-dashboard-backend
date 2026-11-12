@@ -248,3 +248,11 @@ test("the gloss reaches the prompt next to the original title", () => {
   assert.match(prompt, /"titleEnglish": "Buyer Projects"/);
   assert.equal((prompt.match(/titleEnglish/g) || []).length, 1, "only titles that changed get one");
 });
+
+test("FTC is defined as a fixed-term contract and deferred to the brief's employment stance", () => {
+  assert.match(API_JUDGE_PROMPT, /"FTC" in a title means Fixed-Term Contract/);
+  assert.match(API_JUDGE_PROMPT, /Read every one of them as the Contract\s+employment type/);
+  // An FTC title the client declines is a contract-term skip, not a role mismatch.
+  assert.match(API_JUDGE_PROMPT, /An FTC title is NOT a role-mismatch/);
+  assert.match(API_JUDGE_PROMPT, /skip the FTC\s+title with skipKind "excluded"/);
+});
