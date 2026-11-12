@@ -1,6 +1,7 @@
 import { JobModel } from "../../Schema_Models/JobModel.js";
 import { uploadJSONToR2, getJSONFromR2, extractR2Key, isR2Url } from "../../Utils/r2Storage.js";
 import { sectionTitlesFrom } from "../../Utils/sectionTitles.js";
+import { enqueueCoverLetterIfEligible } from "../../Utils/coverLetterAutoWriter.js";
 
 // Test endpoint to verify the controller is working
 export const testJobController = async (req, res) => {
@@ -167,6 +168,12 @@ export const saveChangedSession = async (req, res) => {
           );
 
           console.log('saveChangedSession - Changes saved successfully for job:', updatedJob.jobTitle);
+
+          // A hand-saved optimized resume gets its cover letter (re)written for
+          // Executive clients with a base letter. Never throws.
+          if (updateData.optimizedResume?.hasResume) {
+               await enqueueCoverLetterIfEligible(job, { reason: 'optimized resume saved by hand' });
+          }
           return res.json({ 
                message: "Changes saved successfully", 
                changesMade,

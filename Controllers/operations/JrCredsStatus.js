@@ -2,6 +2,7 @@ import Operations from "../../Schema_Models/Operations.js";
 import { UserModel } from "../../Schema_Models/UserModel.js";
 import { AutopilotCreds } from "../../Schema_Models/AutopilotCreds.js";
 import { ClientTrackingModel } from "../../Schema_Models/ClientTrackingModel.js";
+import { operatorManagesClient } from "../../Utils/operatorAccess.js";
 
 // Do two hand-typed names refer to the same person?
 //
@@ -84,12 +85,7 @@ export default async function JrCredsStatus(req, res) {
         const client = await UserModel.findOne({ email: clientEmail }).select("_id").lean();
         if (!client) return deny();
 
-        if (operator.role !== "admin") {
-            const managed = (operator.managedUsers || []).some(
-                (id) => String(id) === String(client._id),
-            );
-            if (!managed) return deny();
-        }
+        if (!operatorManagesClient(operator, client._id)) return deny();
 
         // WHO IS THIS PROMPT FOR
         // Only the dashboard manager (team lead) who owns this client, per

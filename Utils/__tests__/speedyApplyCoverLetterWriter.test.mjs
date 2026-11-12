@@ -323,7 +323,7 @@ test("validation: too few paragraphs, too many words, too short, placeholders, b
 // Handler (models, R2 loader, usage recorder and OpenAI mocked)
 // ---------------------------------------------------------------------------
 
-const db = { user: null, sa: null, dash: null, job: null, optimized: null };
+const db = { user: null, sa: null, dash: null, job: null, optimized: null, r2: {} };
 const seen = { jobQuery: null, usage: 0 };
 
 const chain = (value, onQuery) => (query) => {
@@ -352,6 +352,14 @@ mock.module("../aiUsage.js", {
   namedExports: {
     AI_USAGE_SOURCES: { SPEEDYAPPLY_COVER_LETTER: "speedyapply-cover-letter" },
     recordAiUsage: () => { seen.usage++; },
+  },
+});
+// R2 holds the operator-approved base letter (Utils/baseCoverLetter.js).
+mock.module("../r2Storage.js", {
+  namedExports: {
+    getJSONFromR2: async (key) => (db.r2[key] ? { success: true, data: db.r2[key] } : { success: false, error: "NoSuchKey" }),
+    putJSONToR2: async (key) => ({ success: true, key }),
+    deleteFromR2: async (key) => ({ success: true, key }),
   },
 });
 mock.module("../optimizedResumeData.js", {
@@ -396,6 +404,7 @@ function reset() {
   db.dash = DASH;
   db.job = null;
   db.optimized = null;
+  db.r2 = {};
   seen.jobQuery = null;
   seen.usage = 0;
   process.env.auto_fill_chatgpt_API = "test-key";
@@ -556,4 +565,47 @@ test("handler: 500 server_error when the database throws", async () => {
   Object.defineProperty(db, "dash", { value: original, writable: true, configurable: true, enumerable: true });
   assert.equal(r.code, 500);
   assert.equal(r.body.error, "server_error");
+});
+
+// ---------------------------------------------------------------------------
+// Operator-approved base letter (R2) wins over the profile's defaultCoverLetter
+// ---------------------------------------------------------------------------
+
+const BASE_KEY = "flashfirejobs/approved_example.com/cover-letter/base.json";
+const APPROVED = "I turn messy retail data into forecasts that store managers trust.\n\nAt Acme I rebuilt the reporting stack in dbt.";
+
+test("handler: the R2 base letter switches the prompt to tailor mode", async () => {
+  reset();
+  db.user.baseCoverLetter = { key: BASE_KEY, updatedAt: new Date("2026-11-01T00:00:00Z"), hash: "abcd" };
+  db.r2[BASE_KEY] = { text: APPROVED, updatedAt: "2026-11-01T00:00:00.000Z", updatedBy: "Sarah" };
+  mockOpenAi(reply(paras(4, 80)));
+  const r = res();
+  await generateSpeedyApplyCoverLetter(req(JOB), r);
+  assert.equal(r.code, 200, JSON.stringify(r.body));
+  const [system, user] = fetchCalls[0].body.messages;
+  assert.match(system.content, /tailor one real job candidate's approved cover letter/);
+  assert.match(user.content, /APPROVED BASE LETTER/);
+  assert.ok(user.content.includes("forecasts that store managers trust"), "the R2 text is the base");
+  assert.ok(!user.content.includes(SA_PROFILE.defaultCoverLetter), "the profile letter is not used when R2 has one");
+});
+
+test("handler: without an R2 base letter the profile letter stays the voice reference", async () => {
+  reset();
+  mockOpenAi(reply(paras(4, 80)));
+  const r = res();
+  await generateSpeedyApplyCoverLetter(req(JOB), r);
+  assert.equal(r.code, 200);
+  const [system, user] = fetchCalls[0].body.messages;
+  assert.equal(system.content, COVER_LETTER_SYSTEM_PROMPT);
+  assert.ok(user.content.includes(SA_PROFILE.defaultCoverLetter));
+});
+
+test("handler: R2 unreadable falls back to the profile letter instead of failing", async () => {
+  reset();
+  db.user.baseCoverLetter = { key: "flashfirejobs/missing/cover-letter/base.json", updatedAt: new Date(), hash: "x" };
+  mockOpenAi(reply(paras(4, 80)));
+  const r = res();
+  await generateSpeedyApplyCoverLetter(req(JOB), r);
+  assert.equal(r.code, 200);
+  assert.equal(fetchCalls[0].body.messages[0].content, COVER_LETTER_SYSTEM_PROMPT);
 });

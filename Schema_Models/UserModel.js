@@ -85,6 +85,16 @@ export const userSchema = new mongoose.Schema(
       ],
       default: []
     },
+    // Base cover letter pasted by an operator (Operations tab). The text lives
+    // in R2 at `key` (flashfirejobs/<client>/cover-letter/base.json); `hash` is
+    // the first 16 hex of sha256(normalized text). See Utils/baseCoverLetter.js.
+    baseCoverLetter: {
+      key: { type: String },
+      updatedAt: { type: Date },
+      updatedBy: { type: String },
+      words: { type: Number },
+      hash: { type: String },
+    },
     amountPaid: { type: String, default: "0" },
     currency: { type: String, default: "USD" }, // "USD", "CAD", "GBP", "AUD", "EUR"
   },
