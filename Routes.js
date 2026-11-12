@@ -48,6 +48,8 @@ import GetAiRemovedJobs from "./Controllers/GetAiRemovedJobs.js";
 import ResolveSecondJudgeFlag from "./Controllers/ResolveSecondJudgeFlag.js";
 import PlanSelect from "./Controllers/PlanSelect.js";
 import { arePerksDisabled } from "./Utils/clientPerks.js";
+import { clientCurrency } from "./Utils/clientCurrency.js";
+import { ClientTrackingModel } from "./Schema_Models/ClientTrackingModel.js";
 import { hasOpsTools } from "./Utils/opsToolsAccess.js";
 import mongoose from "mongoose";
 import { backfillSectionTitles, resumeServiceTitleReader } from "./Utils/backfillSectionTitles.js";
@@ -267,7 +269,13 @@ app.post('/get-updated-user', async (req, res) => {
     // by Utils/clientPerks.js). The portal calls this endpoint on every load and
     // merges the result into the session, so this is where the flag reaches the
     // client. It fails open, so a lookup error leaves the buttons alone.
-    const perksDisabled = await arePerksDisabled(existanceOfUser.email);
+    // The plan page prices in the client's country, as clients-tracking has it.
+    const [perksDisabled, tracking] = await Promise.all([
+      arePerksDisabled(existanceOfUser.email),
+      ClientTrackingModel.findOne({ email: existanceOfUser.email })
+        .select("clientCountry amountPaid")
+        .lean(),
+    ]);
 
     return res.status(200).json({
       name: existanceOfUser.name,
@@ -281,7 +289,7 @@ app.post('/get-updated-user', async (req, res) => {
       transcript: existanceOfUser.transcript,
       portfolioLinks: existanceOfUser.portfolioLinks || [],
       dashboardManager: existanceOfUser.dashboardManager,
-      currency: existanceOfUser.currency || "USD",
+      currency: clientCurrency(tracking, existanceOfUser.currency),
       addons: existanceOfUser.addons || [],
       amountPaid: existanceOfUser.amountPaid || "0",
       perksDisabled,

@@ -1,6 +1,7 @@
 import { UserModel } from "../Schema_Models/UserModel.js";
 import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { ClientTrackingModel } from "../Schema_Models/ClientTrackingModel.js";
+import { clientCurrency } from "../Utils/clientCurrency.js";
 import dotenv from 'dotenv';
 import { signAuthToken, normalizeEmail, CLIENT_SESSION_EXPIRY } from "../Utils/AuthToken.js";
 import { decrypt } from "../Utils/CryptoHelper.js";
@@ -76,7 +77,7 @@ export default async function Login(req, res) {
                          portfolioLinks: existanceOfUser.portfolioLinks || [],
                          dashboardManager: existanceOfUser.dashboardManager,
                          amountPaid,
-                         currency: existanceOfUser.currency || "USD",
+                         currency: clientCurrency(tracking, existanceOfUser.currency),
                     },
                     // Signed with JWT_SECRET so the token is accepted by
                     // LocalTokenValidator; it used to use JWT_SECRET_KEY, which
