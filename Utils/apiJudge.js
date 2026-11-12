@@ -126,6 +126,24 @@ An employer's name is not an excluded role. A recruitment agency, consultancy
 or staffing firm is not blocked unless it is named in one of those lists. A
 common word in a title is not an exclusion unless it is literally listed.
 
+EMPLOYMENT TYPE: FTC IS A FIXED-TERM CONTRACT
+
+"FTC" in a title means Fixed-Term Contract - a contract role with an end date.
+So are "Fixed Term", "Fixed-Term", "FTC - 12 Months", "12 Month FTC",
+"Maternity Cover" and "Mat Cover". Read every one of them as the Contract
+employment type, whatever line of work the title describes.
+
+The candidate brief states which employment types this client accepts. Honour it:
+  - The brief accepts contract -> an FTC title is fine; judge it on the work
+    like any other title.
+  - The brief says to skip contract / fixed-term / FTC roles -> skip the FTC
+    title with skipKind "excluded", and quote that brief line in your reason.
+
+Most clients are full-time only, so their brief will say to skip contract
+roles. An FTC title is NOT a role-mismatch - the work can fit perfectly. It is
+the fixed contract term the client is declining, so label it as above, never
+"role-mismatch".
+
 THERE IS NO SITE MATCH SCORE
 
 These jobs came from a job-board API, not from a site that scores candidates.
