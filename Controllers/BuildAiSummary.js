@@ -1045,7 +1045,7 @@ function buildUserPrompt(profile, resume, existingSummary, profileDiff, overlay 
   const EMP_WORDING = {
     "Full-time":  { accept: "Open to full-time roles.",                          reject: "Skip full-time roles." },
     "Part-time":  { accept: "Open to part-time roles.",                          reject: "Skip part-time roles." },
-    "Contract":   { accept: "Open to contract / contract-to-hire roles.",        reject: "Skip contract / contract-to-hire roles." },
+    "Contract":   { accept: "Open to contract, contract-to-hire, and fixed-term contract (FTC) roles.",  reject: "Skip contract, contract-to-hire, FTC, and fixed-term contract roles." },
     "Internship": { accept: "Open to internships.",                              reject: "Skip internships." },
   };
   const empPerType = allEmp.map((t) => {
