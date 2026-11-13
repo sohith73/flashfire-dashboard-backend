@@ -95,7 +95,8 @@ import {
   sendClientReminderNow,
   testClientReminderMattermost,
   previewClientReminder,
-  getClientReminderHistory
+  getClientReminderHistory,
+  listReminderDeliveries
 } from "./Controllers/operations/ClientReminders.js";
 import ForgotPassword from "./Controllers/ForgotPassword.js";
 import ExtensionLogin from "./Controllers/Extensions/login.js";
@@ -778,6 +779,7 @@ app.post('/operations/reminders/send-now', requireOpsKey, sendClientReminderNow)
 app.post('/operations/reminders/test-mattermost', requireOpsKey, testClientReminderMattermost);
 app.post('/operations/reminders/preview', requireOpsKey, previewClientReminder);
 app.post('/operations/reminders/history', requireOpsKey, getClientReminderHistory);
+app.post('/operations/reminders/deliveries', requireOpsKey, listReminderDeliveries);
 
 //extensions
 app.post('/extension/login', ExtensionLogin);

@@ -43,7 +43,8 @@ import {
   QUIET_HOURS_IST,
   reminderItemMeta,
   parseSendAt,
-  defaultItemConfig
+  defaultItemConfig,
+  defaultItems
 } from "../../Utils/reminderItems.js";
 import {
   ClientReminderConfig,
@@ -66,7 +67,8 @@ import {
 import { renderReminderEmail, renderReminderMattermost } from "../../Utils/reminderTemplates.js";
 import { sendViaSmtp, isSmtpConfigured } from "../../Utils/smtpSender.js";
 import { sendToMattermost, isValidWebhookUrl, normalizeWebhookUrl } from "../../Utils/mattermostSender.js";
-import { resolvePaymentEmail } from "../../Schema_Models/ClientPaymentLookup.js";
+import { resolvePaymentEmail, getActiveUnpausedClients } from "../../Schema_Models/ClientPaymentLookup.js";
+import { ReminderDelivery } from "../../Schema_Models/ReminderDelivery.js";
 import { unsubscribeHeaders, UNSUB_STREAMS } from "../../Utils/unsubscribe.js";
 
 const LOG = "[client-reminders]";
@@ -80,6 +82,7 @@ const CRON_EXPR = "*/5 * * * *";
 const MAX_SENDS_PER_TICK = 50;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const IST_OFFSET_MS = 330 * 60 * 1000;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // Reasons that a forced send-now is allowed to override. Force exists so an
@@ -333,6 +336,36 @@ export function isItemDue(item, meta, now = new Date()) {
 }
 
 /**
+ * When a daily item will next go out, by the same rule isItemDue applies, for
+ * the "Scheduled" line in Operations > Reminders. Returns null when the item
+ * cannot send (switched off, no channel, bad time, or not a daily item).
+ *
+ *   dueNow true  the time has passed and today is not decided yet, so the
+ *                next tick (within five minutes) takes it
+ *   at           the scheduled instant: today's sendAtIST, or tomorrow's once
+ *                today's period key has been used
+ *
+ * Activity-gated items (the daily summary) still skip a day with nothing
+ * added; the caller says so next to the time.
+ */
+export function nextScheduledSend(item, meta, now = new Date()) {
+  if (!item || !meta || meta.cadence !== "daily") return null;
+  if (item.enabled !== true || !hasEnabledChannel(item.channels)) return null;
+  const sendAt = parseSendAt(item.sendAtIST);
+  if (!sendAt) return null;
+
+  const atOn = (day) =>
+    new Date(Date.parse(`${istDayKey(day)}T00:00:00Z`) - IST_OFFSET_MS + (sendAt.hour * 60 + sendAt.minute) * 60000);
+
+  const todayDone = periodKeyFor(meta.key, now) === String(item.lastPeriodKey || "");
+  if (todayDone) return { itemKey: meta.key, at: atOn(new Date(now.getTime() + DAY_MS)), dueNow: false };
+  if (istMinuteOfDay(now) < sendAt.hour * 60 + sendAt.minute) {
+    return { itemKey: meta.key, at: atOn(now), dueNow: false };
+  }
+  return { itemKey: meta.key, at: atOn(now), dueNow: true };
+}
+
+/**
  * The threshold auto-send: "once N roles are added, mail an hour later".
  *
  * An ALTERNATIVE way for a daily item to become due, never a replacement. The
@@ -532,7 +565,7 @@ async function resolveDestinationEmail(config) {
  * either: force is the "prove the template works" button, and consuming the
  * period to prove it would cost the client the real message.
  */
-async function persistOutcome({ clientEmail, itemKey, periodKey, writePeriodKey, result, sentAt }) {
+async function persistOutcome({ clientEmail, clientName = "", itemKey, periodKey, writePeriodKey, result, sentAt }) {
   const historyRow = {
     at: sentAt || new Date(),
     itemKey,
@@ -599,6 +632,20 @@ async function persistOutcome({ clientEmail, itemKey, periodKey, writePeriodKey,
     // error. Worst case we re-send this period once; that is strictly better
     // than a crashed tick.
     console.error(`${LOG} persist failed for ${clientEmail}/${itemKey}:`, err?.message || err);
+  }
+
+  // The audit trail the Operations history pages through. Separate from the
+  // config write above so a failure in one never loses the other.
+  try {
+    await ReminderDelivery.create({
+      ...historyRow,
+      clientEmail,
+      clientName: String(clientName || ""),
+      reason: trim300(result.reason),
+      subject: String(result.subject || "").slice(0, 300)
+    });
+  } catch (err) {
+    console.error(`${LOG} delivery log write failed for ${clientEmail}/${itemKey}:`, err?.message || err);
   }
 }
 
@@ -701,6 +748,7 @@ export async function deliverReminder({
     // See persistOutcome: a cron skip consumes the period so we stop asking.
     await persistOutcome({
       clientEmail,
+      clientName: merged.clientName,
       itemKey: key,
       periodKey,
       writePeriodKey: consumesPeriod,
@@ -828,6 +876,7 @@ export async function deliverReminder({
 
   await persistOutcome({
     clientEmail,
+    clientName: client.name,
     itemKey: key,
     periodKey,
     // A forced send is a test. It records history but never consumes the real
@@ -866,8 +915,72 @@ export async function deliverReminder({
  *
  * @returns {Promise<{evaluated:number, sent:number, skipped:number, failed:number}>}
  */
+/**
+ * Give every active, unpaused client a reminder config with the catalogue
+ * defaults (daily summary on, 21:30 IST, email + Mattermost), so the daily
+ * summary reaches every active client and not only the ones an operator
+ * happened to open in Operations > Reminders. Until 2026-11-13 only 9 of 79
+ * active clients had a config, and the tick below never sees a client
+ * without one.
+ *
+ * $setOnInsert only: an existing config is never touched. That matters for
+ * opt-outs. The unsubscribe link writes a config with every item switched off
+ * (or with no items at all, which the tick query also skips), so a client who
+ * opted out already has a row and is left alone here.
+ *
+ * Exported for tests. Returns how many configs were created; never throws.
+ */
+export async function ensureActiveClientConfigs({
+  listActive = getActiveUnpausedClients,
+  model = ClientReminderConfig
+} = {}) {
+  try {
+    const active = (await listActive()).filter((c) => EMAIL_RE.test(c.email));
+    if (active.length === 0) return 0;
+
+    const existing = await model
+      .find({ clientEmail: { $in: active.map((c) => c.email) } })
+      .select("clientEmail")
+      .lean();
+    const have = new Set(existing.map((d) => String(d.clientEmail || "").toLowerCase()));
+    const missing = active.filter((c) => !have.has(c.email));
+    if (missing.length === 0) return 0;
+
+    const now = getCurrentISTTime();
+    const res = await model.bulkWrite(
+      missing.map((c) => ({
+        updateOne: {
+          filter: { clientEmail: c.email },
+          update: {
+            $setOnInsert: {
+              clientEmail: c.email,
+              clientName: c.name || "",
+              items: defaultItems(),
+              history: [],
+              updatedBy: "auto: active client",
+              createdAt: now,
+              updatedAt: now
+            }
+          },
+          upsert: true
+        }
+      })),
+      { ordered: false }
+    );
+    const created = Number(res?.upsertedCount) || 0;
+    if (created > 0) console.log(`${LOG} created default reminder configs for ${created} active client(s)`);
+    return created;
+  } catch (err) {
+    console.error(`${LOG} could not seed configs for active clients:`, err?.message || err);
+    return 0;
+  }
+}
+
 export async function runReminderTick({ now = new Date() } = {}) {
   const summary = { evaluated: 0, sent: 0, skipped: 0, failed: 0 };
+
+  // Before the query, so a client who just became active is in this pass.
+  await ensureActiveClientConfigs();
 
   let configs = [];
   try {

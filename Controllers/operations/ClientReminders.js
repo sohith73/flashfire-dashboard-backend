@@ -27,6 +27,8 @@ import {
   sendToMattermost
 } from "../../Utils/mattermostSender.js";
 import { renderReminderEmail, renderReminderMattermost } from "../../Utils/reminderTemplates.js";
+import { ReminderDelivery } from "../../Schema_Models/ReminderDelivery.js";
+import { parseDeliveryQuery, DELIVERY_STATUSES } from "../../Utils/reminderDeliveryQuery.js";
 import {
   getClientActivityStats,
   getClientLifetimeStats,
@@ -552,8 +554,79 @@ export const getClientReminderHistory = async (req, res) => {
   }
 };
 
+/* ------------------------------------------------------------------ */
+/* POST /operations/reminders/deliveries                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One client's reminder history, newest first and paginated, from the
+ * ReminderDelivery log, plus when each enabled item is next scheduled.
+ *
+ * Body: { clientEmail, status?, itemKey?, from?, to?, page?, pageSize? }
+ *   status  all | delivered | sent | partial | failed | skipped
+ *   from/to IST calendar days, "YYYY-MM-DD", both inclusive
+ *
+ * Always answers the same shape:
+ *   { success, rows, page, pageSize, total, totalPages,
+ *     counts: { sent, partial, failed, skipped },  same filters, any status
+ *     scheduled: [{ itemKey, at, dueNow, activityGated, autoOnThreshold }] }
+ */
+export const listReminderDeliveries = async (req, res) => {
+  const q = parseDeliveryQuery(req.body || {}, isReminderItemKey);
+  if (!q.ok) return res.status(400).json({ success: false, message: q.message });
+
+  try {
+    const [rows, total, grouped, config, worker] = await Promise.all([
+      ReminderDelivery.find(q.filter)
+        .sort({ at: -1, _id: -1 })
+        .skip((q.page - 1) * q.pageSize)
+        .limit(q.pageSize)
+        .lean(),
+      ReminderDelivery.countDocuments(q.filter),
+      ReminderDelivery.aggregate([{ $match: q.countsFilter }, { $group: { _id: "$status", n: { $sum: 1 } } }]),
+      ClientReminderConfig.findOne({ clientEmail: q.filter.clientEmail }).select("clientEmail items").lean(),
+      loadWorker()
+    ]);
+
+    const counts = Object.fromEntries(DELIVERY_STATUSES.map((s) => [s, 0]));
+    for (const g of grouped) if (g._id in counts) counts[g._id] = g.n;
+
+    // No config row means the worker has not picked this client up yet, so
+    // nothing is scheduled. Never show the catalogue defaults as a promise.
+    const now = new Date();
+    const scheduled = [];
+    if (config && worker?.nextScheduledSend) {
+      for (const item of mergeWithDefaults(config).items) {
+        const meta = reminderItemMeta(item.key);
+        const next = worker.nextScheduledSend(item, meta, now);
+        if (next) {
+          scheduled.push({
+            ...next,
+            activityGated: meta.activityGated === true,
+            autoOnThreshold: item.autoOnThreshold === true
+          });
+        }
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      rows: rows.map(({ _id, ...row }) => ({ id: String(_id), ...row })),
+      page: q.page,
+      pageSize: q.pageSize,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / q.pageSize)),
+      counts,
+      scheduled
+    });
+  } catch (err) {
+    return fail(res, err, "listReminderDeliveries", "Failed to load reminder history");
+  }
+};
+
 export default {
   getClientReminderConfig,
+  listReminderDeliveries,
   updateClientReminderConfig,
   setClientReminderPaymentEmail,
   sendClientReminderNow,
