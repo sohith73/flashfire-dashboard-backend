@@ -304,6 +304,38 @@ export async function uploadJSONToR2(jsonData, options = {}) {
 }
 
 /**
+ * Upload JSON to an exact R2 key. uploadJSONToR2 always writes under
+ * `<folder>/<client>/resume-data/`; this sibling is for the other JSON objects
+ * (the base cover letter and the per-job cover letters) whose key the caller
+ * builds itself (see Utils/baseCoverLetter.js).
+ * @param {string} key - Full object key, e.g. flashfirejobs/a_b.com/cover-letter/base.json
+ * @param {Object} jsonData - Serialisable data
+ * @param {Object} [metadata] - Extra string metadata on the object
+ * @returns {Promise<{success: true, key: string, size: number} | {success: false, error: string}>}
+ */
+export async function putJSONToR2(key, jsonData, metadata = {}) {
+  try {
+    if (!key || typeof key !== 'string') throw new Error('key is required for JSON upload');
+    const jsonBuffer = Buffer.from(JSON.stringify(jsonData), 'utf-8');
+    const meta = { uploadedAt: new Date().toISOString() };
+    for (const [k, v] of Object.entries(metadata || {})) {
+      if (v !== undefined && v !== null) meta[k] = String(v);
+    }
+    await r2Client.send(new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      Body: jsonBuffer,
+      ContentType: 'application/json',
+      Metadata: meta,
+    }));
+    return { success: true, key, size: jsonBuffer.length, storage: 'r2' };
+  } catch (error) {
+    console.error('R2 JSON put error:', error?.message || error);
+    return { success: false, error: error?.message || String(error), storage: 'r2' };
+  }
+}
+
+/**
  * Retrieve JSON data from Cloudflare R2
  * @param {string} key - The R2 key for the JSON file
  * @returns {Promise<Object>} The JSON data or error

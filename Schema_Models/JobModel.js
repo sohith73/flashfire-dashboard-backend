@@ -278,6 +278,33 @@ export const JobSchema = new mongoose.Schema({
     retryAfter: { type: Date, default: null },
     error: { type: String, default: null }
   },
+  // Cover letter tailored to this card from the client's base letter
+  // (Executive only). The paragraphs live in R2 at dataKey
+  // (flashfirejobs/<client>/cover-letter-data/<card _id>.json); baseHash is
+  // the base letter it was written from. See Utils/coverLetterAutoWriter.js.
+  optimizedCoverLetter: {
+    dataKey: { type: String, default: null },
+    hasLetter: { type: Boolean, default: false },
+    version: { type: Number, default: 0 },
+    createdAt: { type: Date, default: null },
+    baseHash: { type: String, default: null },
+    model: { type: String, default: null }
+  },
+  // Cover letter queue tracking (same worker as autoOptimization, resume jobs
+  // first). Independent of autoOptimization: a failure here never touches it.
+  coverLetterOptimization: {
+    status: {
+      type: String,
+      enum: ['pending', 'processing', 'completed', 'failed', 'skipped'],
+      default: null
+    },
+    attempts: { type: Number, default: 0 },
+    startedAt: { type: Date, default: null },
+    completedAt: { type: Date, default: null },
+    lastFailedAt: { type: Date, default: null },
+    retryAfter: { type: Date, default: null },
+    error: { type: String, default: null }
+  },
   // Second-stage screening tracking (secondJudgeWorker). Only set to
   // 'pending' for jobs pushed by the JR-Direct extension auto-judge flow.
   // The worker opens the real employer site via the scraper and re-judges the
@@ -336,6 +363,8 @@ JobSchema.index({ userID: 1, joblinkKey: 1 });
 JobSchema.index({ joblinkKey: 1 });
 // Index for auto-optimization worker polling
 JobSchema.index({ 'autoOptimization.status': 1, 'autoOptimization.retryAfter': 1, _id: 1 });
+// Index for the cover letter queue claim (same worker, after resume jobs)
+JobSchema.index({ 'coverLetterOptimization.status': 1, 'coverLetterOptimization.retryAfter': 1, _id: 1 });
 // Index for second-judge worker polling
 JobSchema.index({ 'secondJudge.status': 1, 'secondJudge.retryAfter': 1, _id: 1 });
 
