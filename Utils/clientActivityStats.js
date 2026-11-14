@@ -546,7 +546,7 @@ export async function daysSinceLastActivity(clientEmail, maxLookbackDays = 30) {
   } catch (err) {
     console.error(`${LOG_PREFIX} daysSinceLastActivity failed for ${email}:`, err?.message || err);
     // Fail towards "we do not know", which for the inverted inactivity_alert
-    // means it will fire. That is the internal-only Mattermost warning, and a
+    // means it will fire. That is the internal-only team warning, and a
     // spurious warning is cheaper than missing a genuinely stalled client.
     return lookback;
   }

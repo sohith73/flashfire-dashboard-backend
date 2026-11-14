@@ -36,7 +36,6 @@ import { OnboardingMailState, ONBOARDING_BACKFILL_MARKER } from "../../Schema_Mo
 import { sendViaSmtp, isSmtpConfigured, isMailCategoryPaused, MAIL_CATEGORY } from "../../Utils/smtpSender.js";
 import { renderOnboardingEmail } from "../../Utils/onboardingMailTemplates.js";
 import { unsubscribeHeaders, UNSUB_STREAMS } from "../../Utils/unsubscribe.js";
-import { mirrorOnboardingStep, recordMirrorOnStep } from "./onboardingMattermost.js";
 
 // ── Fixed config (hard-coded; no env sprawl) ──
 const CRON_EXPR = "*/15 * * * *"; // every 15 min
@@ -282,14 +281,6 @@ export async function sendDue() {
       // If that was the last step, close out the sequence.
       if (doc.steps.every((s) => s.sentAt)) doc.status = "done";
       console.log(`[onboarding-mail] sent '${step.key}' to ${doc.paymentEmail} (${doc.clientEmail})`);
-      // Mirror into the client's Mattermost channel, only once the email is
-      // accepted so a retried send can never double-post. Never throws; a
-      // missing webhook or a dead server is recorded on the step and that is
-      // all - sentAt above is already set, the email stands on its own.
-      recordMirrorOnStep(
-        step,
-        await mirrorOnboardingStep({ clientEmail: doc.clientEmail, clientName: doc.clientName, key: step.key })
-      );
     } else {
       step.error = String(result.error || "send_failed").slice(0, 300);
       console.warn(`[onboarding-mail] send '${step.key}' to ${doc.paymentEmail} failed: ${step.error}`);

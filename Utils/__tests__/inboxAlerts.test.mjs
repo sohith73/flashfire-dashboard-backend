@@ -7,9 +7,8 @@
 //      re-query the same 24h window WITHOUT that filter and post every one of
 //      them again, so the same offer mail appeared twice, hours apart.
 //
-//   2. ONE SHARED "notified" FLAG. Email and Mattermost fail independently. A
-//      single stamp would mean a webhook outage blocks the email forever, or a
-//      retry re-posts a channel message that already landed.
+//   2. DOUBLE MAILING. clientNotifiedAt is flipped only while it is still
+//      null, so two racing workers cannot both send-and-count.
 //
 // Pure/structural checks only. No Mongo, no network.
 
@@ -46,29 +45,22 @@ test("inbox milestone alerts", async (t) => {
     assert.match(src, /usefulMails: usefulInWindow/, "summary must report the full window count");
   });
 
-  await t.test("each channel has its own independent dedupe stamp", () => {
+  await t.test("the email has a guarded dedupe stamp", () => {
     const schema = read("../../Schema_Models/MailDigest.js");
-    for (const field of ["clientNotifiedAt", "clientMattermostAt"]) {
-      assert.ok(schema.includes(field), `${field} must exist on the digest`);
-    }
+    assert.ok(schema.includes("clientNotifiedAt"), "clientNotifiedAt must exist on the digest");
+    assert.ok(!/mattermost/i.test(schema), "the digest no longer carries Mattermost state");
     const notifier = read("../../src/services/clientMailNotifier.js");
-    // Both flips are conditional on the stamp still being null, so two racing
+    // The flip is conditional on the stamp still being null, so two racing
     // workers cannot both send-and-count.
     assert.match(notifier, /clientNotifiedAt: null\s*\}/, "email flip must be guarded");
-    assert.match(notifier, /clientMattermostAt: null\s*\}/, "mattermost flip must be guarded");
-    // And the Mattermost half must bail early when already sent.
-    assert.match(
-      notifier,
-      /if \(digestDoc\?\.clientMattermostAt\) return "already"/,
-      "mattermost must short-circuit once sent"
-    );
+    assert.ok(!/mattermost/i.test(notifier), "inbox alerts go by email only");
   });
 
   await t.test("forwarding reaches every client, and a read failure fails closed", async () => {
     const notifier = read("../../src/services/clientMailNotifier.js");
     // A config read failure must not be read as consent to mail somebody who
     // may have opted out.
-    assert.match(notifier, /return \{ enabled: false, webhookUrl: "" \};/, "must fail closed");
+    assert.match(notifier, /return \{ enabled: false \};/, "must fail closed");
     assert.match(
       notifier,
       /cfg\?\.inboxAlertsOptOut !== true/,
@@ -86,17 +78,6 @@ test("inbox milestone alerts", async (t) => {
     ]) {
       assert.equal(rolloutAllows(who), true, `${JSON.stringify(who)} must not be gated out`);
     }
-  });
-
-  await t.test("a skipped or disabled email never leaks to Mattermost", () => {
-    const notifier = read("../../src/services/clientMailNotifier.js");
-    // The gates (false positive, stale, allowlist, opt-out) protect the client
-    // on BOTH channels, not just the inbox.
-    assert.match(
-      notifier,
-      /if \(email === "disabled" \|\| email === "skipped"\) return \{ email, mattermost: "skipped" \};/,
-      "mattermost must be suppressed whenever the email half was gated"
-    );
   });
 
   await t.test("the config default is ON, and only an explicit opt-out is off", async () => {
@@ -170,14 +151,10 @@ test("inbox milestone alerts", async (t) => {
     assert.ok(out.subject.includes("<script>"), "subject header stays verbatim");
   });
 
-  await t.test("both channels stamp the same mail with the same IST time", async () => {
-    // The email used to format in America/New_York and print "ET" while its own
-    // Mattermost message printed IST, so one mail was announced at two
-    // different times depending on which the client read first. Every
+  await t.test("the email stamps the mail in IST, not Eastern time", async () => {
+    // The email used to format in America/New_York and print "ET". Every
     // client-facing timestamp in this product is IST.
-    const { renderClientMilestoneEmail, renderClientMilestoneMattermost } = await import(
-      "../clientMailTemplates.js"
-    );
+    const { renderClientMilestoneEmail } = await import("../clientMailTemplates.js");
     const digest = {
       category: "offer",
       clientNotifyCategory: "offer",
@@ -186,30 +163,9 @@ test("inbox milestone alerts", async (t) => {
       date: "2026-08-25T15:21:00Z" // 20:51 IST
     };
     const email = renderClientMilestoneEmail({ client: { email: "a@b.com" }, digest });
-    const mm = renderClientMilestoneMattermost({ digest });
-
     assert.ok(email.html.includes("IST"), "email stamps IST");
     assert.ok(!email.html.includes(" ET"), "email must not stamp Eastern time");
-    for (const out of [email.html, mm.text]) {
-      assert.ok(out.includes("8:51"), `both channels agree on the clock time: ${out.slice(0, 0)}`);
-      assert.ok(out.includes("25 Aug"), "both channels agree on the date");
-    }
-  });
-
-  await t.test("the Mattermost milestone render escapes scraped mail content", async () => {
-    const { renderClientMilestoneMattermost } = await import("../clientMailTemplates.js");
-    assert.equal(renderClientMilestoneMattermost({ digest: { category: "promo" } }), null, "unknown category");
-
-    const out = renderClientMilestoneMattermost({
-      digest: {
-        category: "offer",
-        subject: "Offer](https://phish.example/login",
-        from: "Recruiter <r@acme.com>"
-      },
-      dashboardUrl: "https://portal.flashfirejobs.com"
-    });
-    assert.ok(out.text.includes("\\]\\("), "a crafted subject cannot forge a link");
-    assert.ok(!out.text.includes("<r@acme.com>"), "angle brackets escaped so nothing autolinks");
-    assert.ok(out.text.includes("portal.flashfirejobs.com"), "the one real link survives");
+    assert.ok(email.html.includes("8:51"), "IST clock time");
+    assert.ok(email.html.includes("25 Aug"), "IST date");
   });
 });

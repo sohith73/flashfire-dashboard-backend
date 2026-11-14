@@ -1,10 +1,11 @@
 // clientReminderWorker - delivers the operator-configured "Client Reminders"
-// to a client's payment email and/or their Mattermost channel.
+// to a client's payment email. Email is the only channel; Mattermost was
+// removed on 2026-11-14.
 //
 // One ClientReminderConfig document per client (Schema_Models/ClientReminderConfig.js),
 // one row per catalogue item (Utils/reminderItems.js). Every five minutes this
-// worker walks the configs that have at least one enabled item with at least
-// one enabled channel, asks the pure scheduling functions below whether each
+// worker walks the configs of active, unpaused clients that have at least one
+// enabled item, asks the pure scheduling functions below whether each
 // row is due, and hands the due ones to deliverReminder().
 //
 // THE PRODUCT RULE that shapes everything here: an activity-gated report with
@@ -43,7 +44,8 @@ import {
   QUIET_HOURS_IST,
   reminderItemMeta,
   parseSendAt,
-  defaultItemConfig
+  defaultItemConfig,
+  defaultItems
 } from "../../Utils/reminderItems.js";
 import {
   ClientReminderConfig,
@@ -63,10 +65,10 @@ import {
   daysSinceLastActivity,
   nthRoleAddedTodayIST
 } from "../../Utils/clientActivityStats.js";
-import { renderReminderEmail, renderReminderMattermost } from "../../Utils/reminderTemplates.js";
+import { renderReminderEmail } from "../../Utils/reminderTemplates.js";
 import { sendViaSmtp, isSmtpConfigured } from "../../Utils/smtpSender.js";
-import { sendToMattermost, isValidWebhookUrl, normalizeWebhookUrl } from "../../Utils/mattermostSender.js";
-import { resolvePaymentEmail } from "../../Schema_Models/ClientPaymentLookup.js";
+import { resolvePaymentEmail, getActiveUnpausedClients } from "../../Schema_Models/ClientPaymentLookup.js";
+import { ReminderDelivery } from "../../Schema_Models/ReminderDelivery.js";
 import { unsubscribeHeaders, UNSUB_STREAMS } from "../../Utils/unsubscribe.js";
 
 const LOG = "[client-reminders]";
@@ -80,6 +82,7 @@ const CRON_EXPR = "*/5 * * * *";
 const MAX_SENDS_PER_TICK = 50;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const IST_OFFSET_MS = 330 * 60 * 1000;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // Reasons that a forced send-now is allowed to override. Force exists so an
@@ -209,8 +212,7 @@ export function periodKeyFor(itemKey, now = new Date()) {
 
 /**
  * The reporting window an item covers, as UTC instants bounding IST calendar
- * days, plus a human label that goes verbatim into the email and the
- * Mattermost post.
+ * days, plus a human label that goes verbatim into the email.
  *
  * The label matters more than it looks: "your daily summary" is ambiguous the
  * moment a send slips past midnight, so every reminder states the exact dates
@@ -333,6 +335,36 @@ export function isItemDue(item, meta, now = new Date()) {
 }
 
 /**
+ * When a daily item will next go out, by the same rule isItemDue applies, for
+ * the "Scheduled" line in Operations > Reminders. Returns null when the item
+ * cannot send (switched off, no channel, bad time, or not a daily item).
+ *
+ *   dueNow true  the time has passed and today is not decided yet, so the
+ *                next tick (within five minutes) takes it
+ *   at           the scheduled instant: today's sendAtIST, or tomorrow's once
+ *                today's period key has been used
+ *
+ * Activity-gated items (the daily summary) still skip a day with nothing
+ * added; the caller says so next to the time.
+ */
+export function nextScheduledSend(item, meta, now = new Date()) {
+  if (!item || !meta || meta.cadence !== "daily") return null;
+  if (item.enabled !== true || !hasEnabledChannel(item.channels)) return null;
+  const sendAt = parseSendAt(item.sendAtIST);
+  if (!sendAt) return null;
+
+  const atOn = (day) =>
+    new Date(Date.parse(`${istDayKey(day)}T00:00:00Z`) - IST_OFFSET_MS + (sendAt.hour * 60 + sendAt.minute) * 60000);
+
+  const todayDone = periodKeyFor(meta.key, now) === String(item.lastPeriodKey || "");
+  if (todayDone) return { itemKey: meta.key, at: atOn(new Date(now.getTime() + DAY_MS)), dueNow: false };
+  if (istMinuteOfDay(now) < sendAt.hour * 60 + sendAt.minute) {
+    return { itemKey: meta.key, at: atOn(now), dueNow: false };
+  }
+  return { itemKey: meta.key, at: atOn(now), dueNow: true };
+}
+
+/**
  * The threshold auto-send: "once N roles are added, mail an hour later".
  *
  * An ALTERNATIVE way for a daily item to become due, never a replacement. The
@@ -378,7 +410,7 @@ export function isThresholdAutoDue({ item, meta, addedCount, nthAt, now = new Da
 }
 
 function hasEnabledChannel(channels) {
-  return channels?.mattermost === true || channels?.email === true;
+  return channels?.email === true;
 }
 
 /**
@@ -457,7 +489,6 @@ function blankResult(itemKey, extraFields = {}) {
     reason: "",
     itemKey,
     email: { attempted: false, ok: false, to: "", error: "" },
-    mattermost: { attempted: false, ok: false, error: "" },
     stats: { added: 0, applied: 0 },
     periodKey: "",
     subject: "",
@@ -532,7 +563,7 @@ async function resolveDestinationEmail(config) {
  * either: force is the "prove the template works" button, and consuming the
  * period to prove it would cost the client the real message.
  */
-async function persistOutcome({ clientEmail, itemKey, periodKey, writePeriodKey, result, sentAt }) {
+async function persistOutcome({ clientEmail, clientName = "", itemKey, periodKey, writePeriodKey, result, sentAt }) {
   const historyRow = {
     at: sentAt || new Date(),
     itemKey,
@@ -543,11 +574,6 @@ async function persistOutcome({ clientEmail, itemKey, periodKey, writePeriodKey,
       ok: result.email.ok,
       to: result.email.to,
       error: trim300(result.email.error)
-    },
-    mattermost: {
-      attempted: result.mattermost.attempted,
-      ok: result.mattermost.ok,
-      error: trim300(result.mattermost.error)
     },
     stats: { added: result.stats.added, applied: result.stats.applied },
     trigger: result.trigger || "cron"
@@ -565,7 +591,7 @@ async function persistOutcome({ clientEmail, itemKey, periodKey, writePeriodKey,
     updatedAt: getCurrentISTTime()
   };
   if (writePeriodKey && periodKey) set["items.$[it].lastPeriodKey"] = periodKey;
-  if (result.status === "sent" || result.status === "partial") set["items.$[it].lastSentAt"] = historyRow.at;
+  if (result.status === "sent") set["items.$[it].lastSentAt"] = historyRow.at;
 
   try {
     // The item row may not exist yet on a document saved before this item
@@ -600,6 +626,20 @@ async function persistOutcome({ clientEmail, itemKey, periodKey, writePeriodKey,
     // than a crashed tick.
     console.error(`${LOG} persist failed for ${clientEmail}/${itemKey}:`, err?.message || err);
   }
+
+  // The audit trail the Operations history pages through. Separate from the
+  // config write above so a failure in one never loses the other.
+  try {
+    await ReminderDelivery.create({
+      ...historyRow,
+      clientEmail,
+      clientName: String(clientName || ""),
+      reason: trim300(result.reason),
+      subject: String(result.subject || "").slice(0, 300)
+    });
+  } catch (err) {
+    console.error(`${LOG} delivery log write failed for ${clientEmail}/${itemKey}:`, err?.message || err);
+  }
 }
 
 /**
@@ -612,9 +652,9 @@ async function persistOutcome({ clientEmail, itemKey, periodKey, writePeriodKey,
  * @param {string} a.itemKey
  * @param {string} [a.trigger]          'cron' | 'manual' | anything the caller wants in the audit row
  * @param {boolean} [a.force]           bypass the empty-skip decision only
- * @param {object|null} [a.channelsOverride]  {mattermost, email} for a one-off test send
+ * @param {object|null} [a.channelsOverride]  {email} for a one-off test send
  * @param {Date} [a.now]
- * @returns {Promise<{status:string, reason:string, email:object, mattermost:object, stats:object, periodKey:string, subject:string}>}
+ * @returns {Promise<{status:string, reason:string, email:object, stats:object, periodKey:string, subject:string}>}
  *          Never throws.
  */
 export async function deliverReminder({
@@ -645,8 +685,8 @@ export async function deliverReminder({
 
   // A channel override applies to THIS delivery only; it is never written back.
   const channels = channelsOverride
-    ? { mattermost: channelsOverride.mattermost === true, email: channelsOverride.email === true }
-    : { mattermost: item.channels?.mattermost === true, email: item.channels?.email === true };
+    ? { email: channelsOverride.email === true }
+    : { email: item.channels?.email === true };
   const effectiveItem = { ...item, channels };
 
   const window = reportWindowFor(key, now);
@@ -701,6 +741,7 @@ export async function deliverReminder({
     // See persistOutcome: a cron skip consumes the period so we stop asking.
     await persistOutcome({
       clientEmail,
+      clientName: merged.clientName,
       itemKey: key,
       periodKey,
       writePeriodKey: consumesPeriod,
@@ -727,7 +768,7 @@ export async function deliverReminder({
 
     if (!dest.to) {
       // Not forceable and not a failure of ours: there is simply no address on
-      // file. Reported, logged, and the Mattermost half still goes out.
+      // file. Reported and logged as a skip.
       out.email = {
         attempted: false,
         ok: false,
@@ -773,54 +814,15 @@ export async function deliverReminder({
     }
   }
 
-  // ── Mattermost ──
-  if (channels.mattermost) {
-    const webhook = normalizeWebhookUrl(merged.mattermostWebhookUrl);
-    if (!isValidWebhookUrl(webhook)) {
-      out.mattermost = { attempted: false, ok: false, error: "no_webhook_url" };
-    } else {
-      const rendered = renderReminderMattermost({ kind: key, client, stats, lifetime, period, extra });
-      if (!rendered?.text) {
-        out.mattermost = { attempted: false, ok: false, error: "template_unavailable" };
-      } else {
-        const res = await sendToMattermost({ webhookUrl: webhook, text: rendered.text, username: "FlashFire" });
-        out.mattermost = {
-          attempted: true,
-          ok: res?.ok === true,
-          error: res?.ok === true ? "" : trim300(res?.error || "post_failed")
-        };
-      }
-    }
-  }
-
-  const attempted = [out.email.attempted, out.mattermost.attempted].filter(Boolean).length;
-  const succeeded = [out.email.attempted && out.email.ok, out.mattermost.attempted && out.mattermost.ok].filter(
-    Boolean
-  ).length;
-
-  // The reason must name why a channel that WAS tried failed. Reading
-  // out.email.error unconditionally would report "no_payment_email" for a run
-  // whose only real problem was a 404 from the webhook, which sends an
-  // operator chasing the wrong thing.
-  const attemptedErrors = [
-    out.email.attempted && !out.email.ok ? `email: ${out.email.error}` : "",
-    out.mattermost.attempted && !out.mattermost.ok ? `mattermost: ${out.mattermost.error}` : ""
-  ].filter(Boolean);
-  const unusableErrors = [
-    !out.email.attempted && out.email.error ? `email: ${out.email.error}` : "",
-    !out.mattermost.attempted && out.mattermost.error ? `mattermost: ${out.mattermost.error}` : ""
-  ].filter(Boolean);
-
-  if (attempted === 0) {
-    // Every enabled channel was unusable (no address, no webhook, no SMTP).
+  // One channel, so the outcome is the email's outcome. An address we could
+  // not use (none on file, SMTP not configured, no template) is a skip with
+  // that reason; a send the provider refused is a failure.
+  if (!out.email.attempted) {
     out.status = "skipped";
-    out.reason = unusableErrors.join("; ") || "no_destination";
-  } else if (succeeded === 0) {
+    out.reason = out.email.error ? `email: ${out.email.error}` : "no_destination";
+  } else if (!out.email.ok) {
     out.status = "failed";
-    out.reason = attemptedErrors.join("; ") || "delivery_failed";
-  } else if (succeeded < attempted) {
-    out.status = "partial";
-    out.reason = attemptedErrors.join("; ") || "partial_delivery";
+    out.reason = `email: ${out.email.error || "send_failed"}`;
   } else {
     out.status = "sent";
     if (!forcedThrough) out.reason = "ok";
@@ -828,6 +830,7 @@ export async function deliverReminder({
 
   await persistOutcome({
     clientEmail,
+    clientName: client.name,
     itemKey: key,
     periodKey,
     // A forced send is a test. It records history but never consumes the real
@@ -837,12 +840,8 @@ export async function deliverReminder({
     sentAt: now
   });
 
-  if (out.status === "sent" || out.status === "partial") {
-    console.log(
-      `${LOG} ${out.status} '${key}' for ${clientEmail} (${periodKey || "event"}) ` +
-        `email=${out.email.attempted ? (out.email.ok ? "ok" : "fail") : "-"} ` +
-        `mm=${out.mattermost.attempted ? (out.mattermost.ok ? "ok" : "fail") : "-"}`
-    );
+  if (out.status === "sent") {
+    console.log(`${LOG} sent '${key}' for ${clientEmail} (${periodKey || "event"}) to ${out.email.to}`);
   } else if (out.status === "failed") {
     console.warn(`${LOG} failed '${key}' for ${clientEmail}: ${out.reason}`);
   }
@@ -866,18 +865,94 @@ export async function deliverReminder({
  *
  * @returns {Promise<{evaluated:number, sent:number, skipped:number, failed:number}>}
  */
+/**
+ * Give every active, unpaused client a reminder config with the catalogue
+ * defaults (daily summary on, 21:30 IST, by email), so the daily
+ * summary reaches every active client and not only the ones an operator
+ * happened to open in Operations > Reminders. Until 2026-11-13 only 9 of 79
+ * active clients had a config, and the tick below never sees a client
+ * without one.
+ *
+ * $setOnInsert only: an existing config is never touched. That matters for
+ * opt-outs. The unsubscribe link writes a config with every item switched off
+ * (or with no items at all, which the tick query also skips), so a client who
+ * opted out already has a row and is left alone here.
+ *
+ * Exported for tests. Returns how many configs were created; never throws.
+ */
+export async function ensureActiveClientConfigs({
+  listActive = getActiveUnpausedClients,
+  model = ClientReminderConfig,
+  active: given = null
+} = {}) {
+  try {
+    const active = (given || (await listActive())).filter((c) => EMAIL_RE.test(c.email));
+    if (active.length === 0) return 0;
+
+    const existing = await model
+      .find({ clientEmail: { $in: active.map((c) => c.email) } })
+      .select("clientEmail")
+      .lean();
+    const have = new Set(existing.map((d) => String(d.clientEmail || "").toLowerCase()));
+    const missing = active.filter((c) => !have.has(c.email));
+    if (missing.length === 0) return 0;
+
+    const now = getCurrentISTTime();
+    const res = await model.bulkWrite(
+      missing.map((c) => ({
+        updateOne: {
+          filter: { clientEmail: c.email },
+          update: {
+            $setOnInsert: {
+              clientEmail: c.email,
+              clientName: c.name || "",
+              items: defaultItems(),
+              history: [],
+              updatedBy: "auto: active client",
+              createdAt: now,
+              updatedAt: now
+            }
+          },
+          upsert: true
+        }
+      })),
+      { ordered: false }
+    );
+    const created = Number(res?.upsertedCount) || 0;
+    if (created > 0) console.log(`${LOG} created default reminder configs for ${created} active client(s)`);
+    return created;
+  } catch (err) {
+    console.error(`${LOG} could not seed configs for active clients:`, err?.message || err);
+    return 0;
+  }
+}
+
 export async function runReminderTick({ now = new Date() } = {}) {
   const summary = { evaluated: 0, sent: 0, skipped: 0, failed: 0 };
 
+  // Reminders go to active, unpaused clients only. Pausing a client or
+  // marking them inactive in clients-tracking stops their mail on the next
+  // tick, and marking them active (unpaused) starts it, with no operator
+  // visiting Operations > Reminders.
+  let active = [];
+  try {
+    active = (await getActiveUnpausedClients()).filter((c) => EMAIL_RE.test(c.email));
+  } catch (err) {
+    console.error(`${LOG} active client lookup failed:`, err?.message || err);
+    return summary;
+  }
+  if (active.length === 0) return summary;
+
+  // Before the query, so a client who just became active is in this pass.
+  await ensureActiveClientConfigs({ active });
+
   let configs = [];
   try {
+    // Channel checks happen in memory after mergeWithDefaults, which also
+    // reads legacy Mattermost-only rows as email-on.
     configs = await ClientReminderConfig.find({
-      items: {
-        $elemMatch: {
-          enabled: true,
-          $or: [{ "channels.mattermost": true }, { "channels.email": true }]
-        }
-      }
+      clientEmail: { $in: active.map((c) => c.email) },
+      items: { $elemMatch: { enabled: true } }
     })
       .lean();
   } catch (err) {
@@ -927,7 +1002,7 @@ export async function runReminderTick({ now = new Date() } = {}) {
 
         deliveries += 1;
         const res = await deliverReminder({ config: raw, itemKey: meta.key, trigger, now });
-        if (res.status === "sent" || res.status === "partial") summary.sent += 1;
+        if (res.status === "sent") summary.sent += 1;
         else if (res.status === "failed") summary.failed += 1;
         else summary.skipped += 1;
       }

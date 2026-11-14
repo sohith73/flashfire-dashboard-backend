@@ -51,8 +51,10 @@ const reminderItemSchema = new mongoose.Schema(
   {
     key: { type: String, enum: REMINDER_ITEM_KEYS, required: true },
     enabled: { type: Boolean, default: false },
+    // Email is the only channel. Mattermost was removed on 2026-11-14; old
+    // documents may still hold channels.mattermost, which emailChannelOn()
+    // reads as "this item was meant to deliver".
     channels: {
-      mattermost: { type: Boolean, default: false },
       email: { type: Boolean, default: false }
     },
     sendAtIST: { type: String, default: "09:00" },
@@ -89,11 +91,6 @@ const reminderHistorySchema = new mongoose.Schema(
       attempted: { type: Boolean, default: false },
       ok: { type: Boolean, default: false },
       to: { type: String, default: "" },
-      error: { type: String, default: "" }
-    },
-    mattermost: {
-      attempted: { type: Boolean, default: false },
-      ok: { type: Boolean, default: false },
       error: { type: String, default: "" }
     },
     stats: {
@@ -147,8 +144,6 @@ const clientReminderConfigSchema = new mongoose.Schema(
     // backend, so it stays the source of truth wherever it has an answer.
     paymentEmailOverride: { type: String, default: "", lowercase: true, trim: true },
 
-    mattermostWebhookUrl: { type: String, default: "" },
-
     items: { type: [reminderItemSchema], default: [] },
     history: { type: [reminderHistorySchema], default: [] },
 
@@ -200,16 +195,27 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, Math.round(n)));
 }
 
+/**
+ * Is the email channel on for a stored or posted row?
+ *
+ * Mattermost was the second channel until 2026-11-14. A row that had only
+ * Mattermost switched on was an operator saying "send this", so it reads as
+ * email on now; otherwise the client would silently stop hearing from us.
+ */
+function emailChannelOn(channels, fallback) {
+  const email = boolOr(channels?.email, undefined);
+  if (email === true) return true;
+  if (boolOr(channels?.mattermost, false) === true) return true;
+  return email === false ? false : fallback;
+}
+
 function normaliseItemRow(raw, key) {
   const base = defaultItemConfig(key);
   const src = raw && typeof raw === "object" ? raw : {};
   return {
     key,
     enabled: boolOr(src.enabled, base.enabled),
-    channels: {
-      mattermost: boolOr(src.channels?.mattermost, base.channels.mattermost),
-      email: boolOr(src.channels?.email, base.channels.email)
-    },
+    channels: { email: emailChannelOn(src.channels, base.channels.email) },
     sendAtIST: isValidSendAt(src.sendAtIST) ? String(src.sendAtIST) : base.sendAtIST,
     dayOfWeek: clampInt(src.dayOfWeek, DAY_OF_WEEK_MIN, DAY_OF_WEEK_MAX, base.dayOfWeek),
     dayOfMonth: clampInt(src.dayOfMonth, DAY_OF_MONTH_MIN, DAY_OF_MONTH_MAX, base.dayOfMonth),
@@ -237,11 +243,6 @@ function normaliseHistoryRow(raw) {
       ok: src.email?.ok === true,
       to: String(src.email?.to || ""),
       error: String(src.email?.error || "")
-    },
-    mattermost: {
-      attempted: src.mattermost?.attempted === true,
-      ok: src.mattermost?.ok === true,
-      error: String(src.mattermost?.error || "")
     },
     stats: {
       added: Number.isFinite(Number(src.stats?.added)) ? Number(src.stats.added) : 0,
@@ -295,7 +296,6 @@ export function mergeWithDefaults(doc) {
     inboxAlertsEnabled: src.inboxAlertsOptOut !== true,
     inboxAlertsOptOut: src.inboxAlertsOptOut === true,
     paymentEmailOverride: String(src.paymentEmailOverride || "").toLowerCase().trim(),
-    mattermostWebhookUrl: String(src.mattermostWebhookUrl || "").trim(),
     items,
     history,
     updatedBy: String(src.updatedBy || ""),
@@ -355,22 +355,19 @@ export function sanitizeItemsInput(items, existingItems = []) {
 
     const enabled = boolOr(pick("enabled", base.enabled), base.enabled);
 
-    const rawMattermost =
-      next?.channels?.mattermost !== undefined
-        ? next.channels.mattermost
-        : prev?.channels?.mattermost;
-    const rawEmail =
-      next?.channels?.email !== undefined ? next.channels.email : prev?.channels?.email;
+    // A posted email value wins; otherwise the stored row, legacy
+    // Mattermost-only rows included, decides.
+    const email =
+      next?.channels?.email !== undefined && next?.channels?.email !== null
+        ? boolOr(next.channels.email, emailChannelOn(prev?.channels, base.channels.email))
+        : emailChannelOn(prev?.channels, base.channels.email);
 
     const rawSendAt = pick("sendAtIST", base.sendAtIST);
 
     return {
       key,
       enabled,
-      channels: {
-        mattermost: boolOr(rawMattermost, base.channels.mattermost),
-        email: boolOr(rawEmail, base.channels.email)
-      },
+      channels: { email },
       sendAtIST: isValidSendAt(rawSendAt) ? String(rawSendAt) : base.sendAtIST,
       dayOfWeek: clampInt(pick("dayOfWeek", base.dayOfWeek), DAY_OF_WEEK_MIN, DAY_OF_WEEK_MAX, base.dayOfWeek),
       dayOfMonth: clampInt(

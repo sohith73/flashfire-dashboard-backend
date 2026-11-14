@@ -1,7 +1,6 @@
 // Shared-secret gate for the operator-only Client Reminders endpoints.
 //
-// These routes can email a client and post to a customer Mattermost channel,
-// so they must not be reachable with nothing but a URL. The Operations UI
+// These routes can email a client, so they must not be reachable with nothing but a URL. The Operations UI
 // already asks for the operations key (SecretKeyModal, "flashfire@2025") before
 // it will render the tab; this middleware makes that gate real on the server
 // instead of decorative in the browser.

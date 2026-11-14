@@ -25,13 +25,13 @@ test("internal alert routing", async (t) => {
     );
   });
 
-  await t.test("its email channel ships OFF by default", () => {
-    // Mattermost-first. Email to the team inbox is an opt-in, and email to the
-    // client is impossible regardless (the worker routes internal items away
-    // from the payment address before any send).
+  await t.test("it ships switched off, with email to the team as its only channel", () => {
+    // Email is the only channel since Mattermost was removed. It goes to the
+    // team inbox; email to the client is impossible regardless (the worker
+    // routes internal items away from the payment address before any send).
     const d = defaultItemConfig("inactivity_alert");
-    assert.equal(d.channels.email, false);
-    assert.equal(d.channels.mattermost, true);
+    assert.equal(d.channels.email, true);
+    assert.equal("mattermost" in d.channels, false);
     assert.equal(d.enabled, false, "the whole item is off until an operator turns it on");
   });
 

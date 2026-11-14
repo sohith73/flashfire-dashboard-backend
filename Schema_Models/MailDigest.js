@@ -93,19 +93,7 @@ const MailDigestSchema = new mongoose.Schema(
     clientNotifyMessageId: { type: String, default: "" }, // SMTP message-id = proof of send
     clientNotifyError: { type: String, default: "" },
     clientNotifyAttempts: { type: Number, default: 0 },
-    clientNotifySkippedReason: { type: String, default: "" },
-
-    // Client milestone-alert state for the MATTERMOST half.
-    //
-    // Deliberately a separate stamp from clientNotifiedAt rather than one
-    // shared "notified" flag: the two channels fail independently. A webhook
-    // 5xx must not block the email, and an SMTP bounce must not suppress the
-    // Mattermost post - and neither may be re-sent once it has succeeded. One
-    // flag would force an all-or-nothing retry that either double-mails or
-    // never posts.
-    clientMattermostAt: { type: Date, default: null },
-    clientMattermostError: { type: String, default: "" },
-    clientMattermostAttempts: { type: Number, default: 0 }
+    clientNotifySkippedReason: { type: String, default: "" }
   },
   { timestamps: true }
 );

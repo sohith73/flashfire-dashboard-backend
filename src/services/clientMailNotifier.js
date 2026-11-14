@@ -23,11 +23,9 @@ import { sendEmail, isSendgridConfigured } from "../../Utils/sendgridClient.js";
 import { sendViaSmtp, isSmtpConfigured, isMailCategoryPaused, MAIL_CATEGORY } from "../../Utils/smtpSender.js";
 import {
   renderClientMilestoneEmail,
-  renderClientMilestoneMattermost,
   NOTIFIABLE_CATEGORIES
 } from "../../Utils/clientMailTemplates.js";
 import { ClientReminderConfig } from "../../Schema_Models/ClientReminderConfig.js";
-import { sendToMattermost, isValidWebhookUrl, normalizeWebhookUrl } from "../../Utils/mattermostSender.js";
 import { unsubscribeHeaders, UNSUB_STREAMS } from "../../Utils/unsubscribe.js";
 
 // ─── Fixed config (hard-coded; the only runtime input is SMTP_USER/SMTP_PASS) ──
@@ -117,67 +115,27 @@ function resolveRecipient(client) {
  * a stored `false` on that field cannot tell "never opted in" apart from
  * "asked us to stop" - see the field comment in the schema.
  *
- * @returns {Promise<{enabled: boolean, webhookUrl: string}>}
+ * @returns {Promise<{enabled: boolean}>}
  */
 export async function readInboxAlertConfig(clientEmail) {
   const email = String(clientEmail || "").trim().toLowerCase();
-  if (!email) return { enabled: false, webhookUrl: "" };
+  if (!email) return { enabled: false };
   try {
     const cfg = await ClientReminderConfig.findOne({ clientEmail: email })
-      .select("inboxAlertsOptOut mattermostWebhookUrl")
+      .select("inboxAlertsOptOut")
       .lean();
     return {
       // Strict === true. A stray string or a missing field must never read as
       // "this client asked us to stop".
-      enabled: cfg?.inboxAlertsOptOut !== true,
-      webhookUrl: normalizeWebhookUrl(cfg?.mattermostWebhookUrl || "")
+      enabled: cfg?.inboxAlertsOptOut !== true
     };
   } catch (err) {
     // Fail CLOSED. A read failure is not consent: mailing somebody who opted
     // out is the one mistake this function must never make, and a skipped
     // digest is retried on the next tick with no attempt burned.
     console.error(`[client-notify] inbox-alert config read failed for ${email}:`, err?.message || err);
-    return { enabled: false, webhookUrl: "" };
+    return { enabled: false };
   }
-}
-
-/**
- * Post the milestone to the client's Mattermost channel, at most once.
- *
- * Its own stamp (clientMattermostAt), independent of the email half, so a
- * webhook outage never blocks the email and a bounced email never re-posts a
- * channel message that already landed.
- *
- * @returns {Promise<"sent"|"skipped"|"failed"|"already">}
- */
-export async function notifyClientMattermostForDigest({ digestDoc, webhookUrl }) {
-  if (digestDoc?.clientMattermostAt) return "already";
-  if (!isValidWebhookUrl(webhookUrl)) return "skipped";
-  if ((digestDoc.clientMattermostAttempts || 0) >= MAX_ATTEMPTS) return "failed";
-
-  const rendered = renderClientMilestoneMattermost({ digest: digestDoc, dashboardUrl: DASHBOARD_URL });
-  if (!rendered) return "skipped";
-
-  const res = await sendToMattermost({ webhookUrl, text: rendered.text, username: "FlashFire" });
-
-  if (res.ok) {
-    // Same guarded flip as the email half: the update only matches while the
-    // stamp is still null, so two racing workers cannot both post-and-count.
-    await MailDigest.updateOne(
-      { _id: digestDoc._id, clientMattermostAt: null },
-      { $set: { clientMattermostAt: new Date(), clientMattermostError: "" }, $inc: { clientMattermostAttempts: 1 } }
-    ).catch(() => {});
-    return "sent";
-  }
-
-  await MailDigest.updateOne(
-    { _id: digestDoc._id },
-    {
-      $set: { clientMattermostError: String(res.error || "unknown").slice(0, 300) },
-      $inc: { clientMattermostAttempts: 1 }
-    }
-  ).catch(() => {});
-  return "failed";
 }
 
 /**
@@ -319,42 +277,6 @@ export async function notifyClientForDigest({ digestDoc, client, mailbox }) {
 }
 
 /**
- * Deliver one milestone to the client over BOTH configured channels.
- *
- * This is what the poll and the retry sweep call. The two halves are run
- * independently and neither can suppress the other:
- *
- *   - the email half dedupes on clientNotifiedAt
- *   - the Mattermost half dedupes on clientMattermostAt
- *
- * Sharing one "notified" flag would mean a webhook 5xx blocks the email
- * forever, or a retry that re-posts a channel message which already landed.
- * Each channel is at-most-once on its own stamp.
- *
- * @returns {Promise<{email: string, mattermost: string}>} per-channel outcome
- */
-export async function notifyClientForDigestAllChannels({ digestDoc, client, mailbox }) {
-  const email = await notifyClientForDigest({ digestDoc, client, mailbox });
-
-  // Only post to the channel when the mail actually cleared every gate. A
-  // digest skipped as a false positive, stale, or opted-out must not reach
-  // Mattermost either - the gates protect the client, not just the inbox.
-  if (email === "disabled" || email === "skipped") return { email, mattermost: "skipped" };
-
-  const inbox = await readInboxAlertConfig(client?.email || mailbox);
-  if (!inbox.enabled || !inbox.webhookUrl) return { email, mattermost: "skipped" };
-
-  // Re-read: the email half just stamped the document, and posting from a
-  // stale in-memory copy would re-run against the wrong dedupe state.
-  const fresh = await MailDigest.findById(digestDoc._id).lean().catch(() => null);
-  const mattermost = fresh
-    ? await notifyClientMattermostForDigest({ digestDoc: fresh, webhookUrl: inbox.webhookUrl })
-    : "failed";
-
-  return { email, mattermost };
-}
-
-/**
  * Retry sweep: eligible digests not yet emailed (a prior send failed or the
  * worker crashed between claim and send). Bounded per call.
  *
@@ -376,8 +298,8 @@ export async function retryPendingClientNotifications({ gmailEmail, client, limi
 
   let sent = 0;
   for (const doc of pending) {
-    const outcome = await notifyClientForDigestAllChannels({ digestDoc: doc, client, mailbox: gmailEmail });
-    if (outcome.email === "sent") sent++;
+    const outcome = await notifyClientForDigest({ digestDoc: doc, client, mailbox: gmailEmail });
+    if (outcome === "sent") sent++;
   }
   if (sent) console.log(`[client-notify] ${gmailEmail}: recovered ${sent} pending milestone alert(s)`);
   return sent;

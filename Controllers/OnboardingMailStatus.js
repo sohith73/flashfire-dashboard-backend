@@ -20,7 +20,6 @@ import { ClientPaymentLookup } from "../Schema_Models/ClientPaymentLookup.js";
 import { OnboardingMailState } from "../Schema_Models/OnboardingMailState.js";
 import { stepsForPlan, planIncludesStep } from "../src/services/onboardingMailWorker.js";
 import { renderOnboardingEmail, isOnboardingStep } from "../Utils/onboardingMailTemplates.js";
-import { mirrorOnboardingStep, recordMirrorOnStep } from "../src/services/onboardingMattermost.js";
 import { unsubscribeHeaders, UNSUB_STREAMS } from "../Utils/unsubscribe.js";
 import {
   sendViaSmtp,
@@ -39,16 +38,6 @@ const STEP_LABEL = {
   cover_letter: "Cover letter ready",
   linkedin: "LinkedIn optimisation done",
 };
-
-// Mattermost mirror of one step, as the UI shows it. "skipped" covers both
-// "no webhook saved" and "email never went out", which is why the UI only
-// renders the chip on a sent row.
-function mattermostOutcome(step) {
-  if (!step) return { state: "skipped", at: null, error: "" };
-  if (step.mattermostAt) return { state: "sent", at: step.mattermostAt, error: "" };
-  if (step.mattermostError) return { state: "failed", at: null, error: step.mattermostError };
-  return { state: "skipped", at: null, error: "" };
-}
 
 // Mirrors onboardingMailWorker's ENABLED gate so the UI can explain a silent
 // worker instead of leaving the operator guessing.
@@ -140,7 +129,6 @@ export async function OnboardingMailStatus(req, res) {
         attempts: s?.attempts || 0,
         error: s?.error || "",
         messageId: s?.messageId || "",
-        mattermost: mattermostOutcome(s),
         // What the operator should read on the row.
         state: sent
           ? "sent"
@@ -169,7 +157,6 @@ export async function OnboardingMailStatus(req, res) {
         attempts: s.attempts || 0,
         error: s.error || "",
         messageId: s.messageId || "",
-        mattermost: mattermostOutcome(s),
         // Never "pending": the worker drops an unsent out-of-plan step from the
         // sequence, so one that is still here and unsent is not going anywhere.
         state: s.sentAt ? "sent" : "not-scheduled",
@@ -296,13 +283,6 @@ export async function SendOnboardingMailStep(req, res) {
     }
 
     const now = new Date();
-    // Same mirror the automatic sender does, after the email is accepted. A
-    // hand-sent "your cover letter is ready" reaches the client's channel too.
-    const mirror = await mirrorOnboardingStep({ clientEmail: email, clientName, key });
-    const mirrorFields = {
-      mattermostAt: mirror.ok ? now : null,
-      mattermostError: mirror.error || "",
-    };
     if (state) {
       const step = state.steps.find((s) => s.key === key);
       if (step) {
@@ -311,7 +291,7 @@ export async function SendOnboardingMailStep(req, res) {
         step.subject = rendered.subject;
         step.error = "";
         step.attempts = (step.attempts || 0) + 1;
-        recordMirrorOnStep(step, mirror);
+        step.trigger = "manual";
       } else {
         // Step missing from the doc (plan changed, or a skipped client). Add it
         // as already-sent so the automatic sender treats it as done.
@@ -323,7 +303,7 @@ export async function SendOnboardingMailStep(req, res) {
           attempts: 1,
           error: "",
           messageId: result.messageId || "",
-          ...mirrorFields,
+          trigger: "manual",
         });
       }
       // A manual send on a skipped client must NOT flip the doc to "scheduled"
@@ -352,7 +332,7 @@ export async function SendOnboardingMailStep(req, res) {
           attempts: 1,
           error: "",
           messageId: result.messageId || "",
-          ...mirrorFields,
+          trigger: "manual",
         }],
       }).catch((e) => console.error("[onboarding-mail] manual create failed:", e?.message || e));
     }
@@ -365,11 +345,6 @@ export async function SendOnboardingMailStep(req, res) {
       subject: rendered.subject,
       messageId: result.messageId || "",
       sentAt: now.toISOString(),
-      mattermost: mirror.ok
-        ? { state: "sent" }
-        : mirror.error
-          ? { state: "failed", error: mirror.error }
-          : { state: "skipped", reason: mirror.skipped || "no_webhook" },
     });
   } catch (err) {
     console.error("[onboarding-mail/send-step] failed:", err);

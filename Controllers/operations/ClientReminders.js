@@ -21,12 +21,9 @@ import {
 } from "../../Utils/reminderItems.js";
 import { ClientPaymentLookup, resolvePaymentEmail } from "../../Schema_Models/ClientPaymentLookup.js";
 import { isSmtpConfigured } from "../../Utils/smtpSender.js";
-import {
-  normalizeWebhookUrl,
-  isValidWebhookUrl,
-  sendToMattermost
-} from "../../Utils/mattermostSender.js";
-import { renderReminderEmail, renderReminderMattermost } from "../../Utils/reminderTemplates.js";
+import { renderReminderEmail } from "../../Utils/reminderTemplates.js";
+import { ReminderDelivery } from "../../Schema_Models/ReminderDelivery.js";
+import { parseDeliveryQuery, DELIVERY_STATUSES, EFFECTIVE_STATUS } from "../../Utils/reminderDeliveryQuery.js";
 import {
   getClientActivityStats,
   getClientLifetimeStats,
@@ -161,12 +158,11 @@ async function readOrCreateConfig(clientEmail, updatedBy = "") {
         clientEmail,
         clientName: "",
         // Every client receives inbox milestone alerts; creating a config row
-        // to set a webhook or a schedule must not silence them. Only an
-        // explicit opt-out does that.
+        // to set a schedule must not silence them. Only an explicit opt-out
+        // does that.
         inboxAlertsEnabled: true,
         inboxAlertsOptOut: false,
         paymentEmailOverride: "",
-        mattermostWebhookUrl: "",
         items: mergeWithDefaults(null).items,
         history: [],
         updatedBy: String(updatedBy || ""),
@@ -245,23 +241,7 @@ export const updateClientReminderConfig = async (req, res) => {
   if (!clientEmail) return undefined;
 
   try {
-    const { mattermostWebhookUrl, items, updatedBy, clientName, inboxAlertsEnabled } = req.body || {};
-
-    // ABSENT MEANS "LEAVE IT ALONE", and that distinction matters: a caller
-    // that saves only one field (the inbox-alerts switch) must not blank the
-    // webhook simply by not mentioning it. Storing normalizeWebhookUrl(undefined)
-    // unconditionally erased a working credential on every partial save.
-    const webhookProvided = mattermostWebhookUrl !== undefined;
-    const webhook = webhookProvided ? normalizeWebhookUrl(mattermostWebhookUrl) : "";
-    // An empty webhook is a legitimate state (email-only client). A non-empty
-    // one that is not https is rejected loudly rather than silently stored and
-    // then failing on every tick for weeks.
-    if (webhook && !isValidWebhookUrl(webhook)) {
-      return res.status(400).json({
-        success: false,
-        message: "mattermostWebhookUrl must be a valid https URL"
-      });
-    }
+    const { items, updatedBy, clientName, inboxAlertsEnabled } = req.body || {};
 
     const existing = await ClientReminderConfig.findOne({ clientEmail }).lean();
     const sanitized = sanitizeItemsInput(items, existing?.items || []);
@@ -272,7 +252,6 @@ export const updateClientReminderConfig = async (req, res) => {
       updatedBy: String(updatedBy || "").slice(0, 120),
       updatedAt: now
     };
-    if (webhookProvided) set.mattermostWebhookUrl = webhook;
     if (clientName !== undefined) set.clientName = String(clientName || "").slice(0, 200);
     // The toggle is now an opt-OUT switch: alerts are on for everyone, and
     // turning this off is what records the client as opted out. Both fields
@@ -378,17 +357,11 @@ export const sendClientReminderNow = async (req, res) => {
     const updatedBy = String(req.body?.updatedBy || "").slice(0, 120);
     const { merged } = await readOrCreateConfig(clientEmail, updatedBy);
 
-    // A channel override is only ever a narrowing of what the operator sees on
-    // screen ("send just the Mattermost copy"). Absent means "use the item's
-    // saved channels".
+    // A channel override narrows what the operator sees on screen. Absent
+    // means "use the item's saved channels". Email is the only channel.
     const rawChannels = req.body?.channels;
     const channelsOverride =
-      rawChannels && typeof rawChannels === "object"
-        ? {
-            mattermost: rawChannels.mattermost === true,
-            email: rawChannels.email === true
-          }
-        : null;
+      rawChannels && typeof rawChannels === "object" ? { email: rawChannels.email === true } : null;
 
     const result = await worker.deliverReminder({
       config: merged,
@@ -402,54 +375,6 @@ export const sendClientReminderNow = async (req, res) => {
     return res.status(200).json({ success: true, ...result });
   } catch (err) {
     return fail(res, err, "sendClientReminderNow", "Failed to send the reminder");
-  }
-};
-
-/* ------------------------------------------------------------------ */
-/* POST /operations/reminders/test-mattermost                          */
-/* ------------------------------------------------------------------ */
-
-export const testClientReminderMattermost = async (req, res) => {
-  const clientEmail = readClientEmail(req, res);
-  if (!clientEmail) return undefined;
-
-  try {
-    let webhook = normalizeWebhookUrl(req.body?.webhookUrl);
-    if (!webhook) {
-      // Falling back to the saved URL lets an operator re-test an existing
-      // integration without pasting the secret back into the form.
-      const { merged } = await readConfig(clientEmail);
-      webhook = normalizeWebhookUrl(merged.mattermostWebhookUrl);
-    }
-
-    if (!isValidWebhookUrl(webhook)) {
-      return res.status(400).json({
-        success: false,
-        ok: false,
-        error: "No valid https Mattermost webhook URL to test"
-      });
-    }
-
-    const result = await sendToMattermost({
-      webhookUrl: webhook,
-      text: [
-        "#### FlashFire reminder channel test",
-        "",
-        `Connected for **${clientEmail}**. Scheduled reports will land here.`,
-        "",
-        `_Sent ${getCurrentISTTime()} IST_`
-      ].join("\n"),
-      username: "FlashFire",
-      iconEmoji: "fire"
-    });
-
-    return res.status(200).json({
-      success: true,
-      ok: result.ok === true,
-      ...(result.ok ? {} : { error: result.error || "delivery failed" })
-    });
-  } catch (err) {
-    return fail(res, err, "testClientReminderMattermost", "Failed to test the Mattermost webhook");
   }
 };
 
@@ -509,9 +434,7 @@ export const previewClientReminder = async (req, res) => {
     };
 
     const email = renderReminderEmail(payload);
-    const mm = renderReminderMattermost(payload);
-
-    if (!email && !mm) {
+    if (!email) {
       return res.status(400).json({ success: false, message: "No template is registered for that item" });
     }
 
@@ -520,7 +443,6 @@ export const previewClientReminder = async (req, res) => {
       subject: email?.subject || "",
       html: email?.html || "",
       text: email?.text || "",
-      mattermostText: mm?.text || "",
       isEmpty: stats.isEmpty === true,
       window: { from, to, label }
     });
@@ -552,12 +474,82 @@ export const getClientReminderHistory = async (req, res) => {
   }
 };
 
+/* ------------------------------------------------------------------ */
+/* POST /operations/reminders/deliveries                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One client's reminder history, newest first and paginated, from the
+ * ReminderDelivery log, plus when each enabled item is next scheduled.
+ *
+ * Body: { clientEmail, status?, itemKey?, from?, to?, page?, pageSize? }
+ *   status  all | sent | failed | skipped ("delivered" is read as "sent")
+ *   from/to IST calendar days, "YYYY-MM-DD", both inclusive
+ *
+ * Always answers the same shape:
+ *   { success, rows, page, pageSize, total, totalPages,
+ *     counts: { sent, failed, skipped },  same filters, any status
+ *     scheduled: [{ itemKey, at, dueNow, activityGated, autoOnThreshold }] }
+ */
+export const listReminderDeliveries = async (req, res) => {
+  const q = parseDeliveryQuery(req.body || {}, isReminderItemKey);
+  if (!q.ok) return res.status(400).json({ success: false, message: q.message });
+
+  try {
+    const [rows, total, grouped, config, worker] = await Promise.all([
+      ReminderDelivery.find(q.filter)
+        .sort({ at: -1, _id: -1 })
+        .skip((q.page - 1) * q.pageSize)
+        .limit(q.pageSize)
+        .lean(),
+      ReminderDelivery.countDocuments(q.filter),
+      ReminderDelivery.aggregate([{ $match: q.countsFilter }, { $group: { _id: EFFECTIVE_STATUS, n: { $sum: 1 } } }]),
+      ClientReminderConfig.findOne({ clientEmail: q.filter.clientEmail }).select("clientEmail items").lean(),
+      loadWorker()
+    ]);
+
+    const counts = Object.fromEntries(DELIVERY_STATUSES.map((s) => [s, 0]));
+    for (const g of grouped) if (g._id in counts) counts[g._id] = g.n;
+
+    // No config row means the worker has not picked this client up yet, so
+    // nothing is scheduled. Never show the catalogue defaults as a promise.
+    const now = new Date();
+    const scheduled = [];
+    if (config && worker?.nextScheduledSend) {
+      for (const item of mergeWithDefaults(config).items) {
+        const meta = reminderItemMeta(item.key);
+        const next = worker.nextScheduledSend(item, meta, now);
+        if (next) {
+          scheduled.push({
+            ...next,
+            activityGated: meta.activityGated === true,
+            autoOnThreshold: item.autoOnThreshold === true
+          });
+        }
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      rows: rows.map(({ _id, ...row }) => ({ id: String(_id), ...row })),
+      page: q.page,
+      pageSize: q.pageSize,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / q.pageSize)),
+      counts,
+      scheduled
+    });
+  } catch (err) {
+    return fail(res, err, "listReminderDeliveries", "Failed to load reminder history");
+  }
+};
+
 export default {
   getClientReminderConfig,
+  listReminderDeliveries,
   updateClientReminderConfig,
   setClientReminderPaymentEmail,
   sendClientReminderNow,
-  testClientReminderMattermost,
   previewClientReminder,
   getClientReminderHistory
 };

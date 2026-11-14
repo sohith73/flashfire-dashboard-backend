@@ -475,7 +475,7 @@ app.use((err, req, res, next) => {
       // Client Reminders tab has configured per client - daily/weekly/monthly
       // activity reports, interview pipeline, plan usage, milestones and the
       // internal no-activity alert. Goes to the client's payment email over
-      // SMTP and/or a per-client Mattermost webhook.
+      // SMTP, to active, unpaused clients only.
       //
       // Two things worth knowing before you touch this line:
       //   - Gated on CLIENT_REMINDERS_ENABLED ('1' forces on, '0' forces off,

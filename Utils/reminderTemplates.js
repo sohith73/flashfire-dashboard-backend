@@ -1,4 +1,4 @@
-// Client reminder templates - email + Mattermost renderings for every
+// Client reminder templates - the email rendering for every
 // catalogue item in Utils/reminderItems.js.
 //
 // WHAT WE DELIBERATELY DO NOT SEND, and why. This is policy, not styling -
@@ -26,8 +26,8 @@
 //
 // Rendering constraints: inline CSS only, table layout only, no images, no
 // web fonts - the only things Gmail, Outlook and Apple Mail all honour. The
-// wordmark is styled text. Every interpolated value goes through escapeHtml
-// (email) or mmEscape (Mattermost); company and role names are scraped text
+// wordmark is styled text. Every interpolated value goes through escapeHtml;
+// company and role names are scraped text
 // and get no more trust than any other user input.
 
 import { reminderItemMeta } from "./reminderItems.js";
@@ -62,9 +62,6 @@ const DASHBOARD_URL = "https://portal.flashfirejobs.com";
 // pipeline cannot produce a scroll of doom.
 const MAX_DIGEST_ROWS = 12;
 
-// Hard ceiling for a Mattermost message; the server rejects ~16k but long
-// posts collapse badly on mobile, so we stay far under.
-const MM_MAX_CHARS = 4000;
 
 /* ------------------------------------------------------------------ *
  * escaping + small utilities
@@ -77,17 +74,6 @@ function escapeHtml(v) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
-}
-
-/**
- * Escape Mattermost markdown. Brackets and parens are included on purpose: a
- * scraped job title of `Engineer](https://phish.example/login` would otherwise
- * close a link we opened around it and render as a working link somewhere
- * else. Angle brackets stop autolinking and HTML-ish injection in clients
- * that render a preview.
- */
-function mmEscape(v) {
-  return String(v ?? "").replace(/([\\`*_{}[\]()<>#+\-.!|~])/g, "\\$1");
 }
 
 function num(v) {
@@ -418,7 +404,7 @@ function weekBuckets(byDay) {
 
 
 function buildInactivityAlert({ client, stats, windowText, extra }) {
-  // Internal only - the catalogue defaults this item to Mattermost, and the
+  // Internal only - this goes to the team inbox, never the client, and the
   // copy assumes an operations reader. It must never soften into client mail.
   const days = num(extra?.days);
 
@@ -493,70 +479,4 @@ export function renderReminderEmail({ kind, client = {}, stats, lifetime, period
     html: shell({ ...built, unsubUrl }),
     text: unsubUrl ? `${built.text.trimEnd()}\n\nUnsubscribe: ${unsubUrl}\n` : built.text
   };
-}
-
-/* ------------------------------------------------------------------ *
- * public: mattermost
- * ------------------------------------------------------------------ */
-
-/** "| Metric | Value |" table from [{label, value}] rows, falsy rows skipped. */
-function mmTable(rows) {
-  const body = (rows || [])
-    .filter(Boolean)
-    .map((r) => `| ${mmEscape(r.label)} | ${mmEscape(String(r.value))} |`)
-    .join("\n");
-  return `| Metric | Value |\n|:--|--:|\n${body}`;
-}
-
-const MM_BUILDERS = {
-  daily_summary({ stats, windowText }) {
-    return [
-      `#### Daily update - ${windowText}`,
-      "",
-      mmTable([{ label: "New roles added", value: stats.addedCount }])
-    ].join("\n");
-  },
-
-
-
-
-
-
-  inactivity_alert({ client, stats, extra }) {
-    const days = num(extra?.days);
-    return [
-      `#### Internal: no activity for ${days} ${days === 1 ? "day" : "days"}`,
-      "",
-      mmTable([
-        { label: "Client", value: client.email },
-        { label: "Days idle", value: days },
-        { label: "Added in window", value: stats.addedCount },
-        { label: "Applied in window", value: stats.appliedCount }
-      ])
-    ].join("\n");
-  }
-};
-
-/**
- * Render one reminder as a Mattermost markdown message.
- * Same input contract as renderReminderEmail; null for an unknown kind.
- * @returns {{text:string}|null}
- */
-export function renderReminderMattermost({ kind, client = {}, stats, lifetime, period = {}, extra = {} } = {}) {
-  const key = String(kind || "");
-  const build = MM_BUILDERS[key];
-  if (!build) return null;
-
-  let text = build({
-    client: { name: String(client.name || ""), email: String(client.email || "") },
-    stats: normStats(stats),
-    lifetime: normLifetime(lifetime),
-    windowText: windowLabel(key, period),
-    extra: extra || {}
-  });
-
-  if (text.length > MM_MAX_CHARS) {
-    text = text.slice(0, MM_MAX_CHARS - 22).trimEnd() + "\n\n_(truncated)_";
-  }
-  return { text };
 }

@@ -44,41 +44,6 @@ export function onboardingSubject(key) {
   return STEPS[key]?.subject || "An update from FlashFire";
 }
 
-/** Escape Mattermost markdown so a client name cannot break the layout. */
-function mmEscape(v) {
-  return String(v ?? "").replace(/([\\`*_{}[\]()<>#+\-.!|~])/g, "\\$1");
-}
-
-/**
- * Render one onboarding step as a Mattermost markdown message. Mirrors the
- * email that just went out into the client's own channel, so a client who
- * lives in Mattermost rather than their inbox still hears "your résumé is
- * ready" the moment it is.
- *
- * Terse on purpose: the email is the record, this is the nudge.
- *
- * @param {Object} a
- * @param {string} a.key   - base_resume | cover_letter | linkedin
- * @param {string} [a.clientName]
- * @param {string} [a.clientEmail]  fallback for the first name only
- * @param {string} [a.dashboardUrl]
- * @returns {{text:string}|null} null for an unknown step key
- */
-export function renderOnboardingMattermost({ key, clientName, clientEmail, dashboardUrl } = {}) {
-  const step = STEPS[key];
-  if (!step) return null;
-  const name = firstName(clientName, clientEmail);
-  const lines = [
-    `#### ${mmEscape(step.heading)}, ${mmEscape(name)}`,
-    "",
-    mmEscape(step.body),
-    "",
-    "We have also emailed you about this."
-  ];
-  if (dashboardUrl) lines.push("", `[Open your dashboard](${dashboardUrl})`);
-  return { text: lines.join("\n") };
-}
-
 function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
