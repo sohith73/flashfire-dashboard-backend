@@ -8,6 +8,8 @@ import { judgeJobs } from "../Utils/apiJudge.js";
 import { checkCap, checkPlanCap, enforcePlanCapPostInsert } from "../Utils/dailyCapGuard.js";
 import { ukSponsorGate } from "../Utils/ukVisaSponsor.js";
 import { usSponsorGate } from "../Utils/usVisaSponsor.js";
+import { auSponsorGate } from "../Utils/auVisaSponsor.js";
+import { euSponsorGate } from "../Utils/euVisaSponsor.js";
 import { companyAllowlistGate } from "../Utils/companyAllowlist.js";
 import { jobLinkKey } from "../Utils/jobLinkKey.js";
 import { classifyApplyUrl } from "../Utils/applyUrlPolicy.js";
@@ -203,8 +205,8 @@ export async function importJobs({
   // ---- UK visa sponsors only -------------------------------------------
   // Filtered BEFORE judging, so the judge never spends tokens on a job the
   // push would refuse anyway. Same rule /addjob applies (Utils/ukVisaSponsor.js).
-  // A client is UK or US, never both, so at most one of these gates applies
-  // and both report into counts.notSponsor. The US one checks in memory.
+  // A client has one country, so at most one of these gates applies and all
+  // report into counts.notSponsor. The US and Australian ones check in memory.
   let sponsorKind = "UK visa";
   try {
     let gate = await ukSponsorGate({ email: clientEmail, profile });
@@ -215,13 +217,27 @@ export async function importJobs({
         gate = { check: async (company, description) => us.check(company, description) };
       }
     }
+    if (!gate) {
+      const au = await auSponsorGate({ email: clientEmail, profile });
+      if (au) {
+        sponsorKind = "Australian visa";
+        gate = { check: async (company, description) => au.check(company, description) };
+      }
+    }
+    if (!gate) {
+      const eu = await euSponsorGate({ email: clientEmail, profile });
+      if (eu) {
+        sponsorKind = "European visa";
+        gate = { check: async (company, description, location) => eu.check(company, description, location) };
+      }
+    }
     if (gate) {
       const kept = [];
       // Ten at a time: a page of results can name 250 employers and each
       // uncached lookup is a query; this keeps the pool free for the app.
       for (let i = 0; i < fresh.length; i += 10) {
         const slice = fresh.slice(i, i + 10);
-        const verdicts = await Promise.all(slice.map(({ job }) => gate.check(job.company, job.description)));
+        const verdicts = await Promise.all(slice.map(({ job }) => gate.check(job.company, job.description, job.location)));
         slice.forEach((entry, k) => { if (!verdicts[k]) kept.push(entry); });
       }
       counts.notSponsor = fresh.length - kept.length;

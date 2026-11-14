@@ -169,6 +169,8 @@ import { startAutoOptimizationWorker } from "./src/services/autoOptimizationWork
 import { geoStats } from "./Utils/ipGeo.js";
 import { refreshOverrides } from "./Utils/ipGeoOverrides.js";
 import { loadUsSponsors } from "./Utils/usVisaSponsor.js";
+import { loadAuSponsors } from "./Utils/auVisaSponsor.js";
+import { loadEuSponsors } from "./Utils/euVisaSponsor.js";
 
 dotenv.config();
 
@@ -561,6 +563,18 @@ app.use((err, req, res, next) => {
       loadUsSponsors();
     } catch (err) {
       console.error("❌ US H-1B sponsor data not loaded:", err.message);
+    }
+    // Australian sponsors (Utils/auVisaSponsor.js), same contract as the US list.
+    try {
+      loadAuSponsors();
+    } catch (err) {
+      console.error("❌ Australian sponsor data not loaded:", err.message);
+    }
+    // European sponsors (Utils/euVisaSponsor.js): IND register + Irish permits.
+    try {
+      loadEuSponsors();
+    } catch (err) {
+      console.error("❌ European sponsor data not loaded:", err.message);
     }
 
     app.listen(PORT, () => {

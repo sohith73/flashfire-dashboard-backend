@@ -667,6 +667,33 @@ export const profileSchema = new mongoose.Schema({
     updatedAt: { type: Date, required: false, default: null },
     updatedBy: { type: String, required: false, default: "" },
   },
+  // "Australia visa sponsors only" (Utils/auVisaSponsor.js). Only offered to
+  // Australian clients; when on, operator pushes from employers that are not
+  // on a Home Affairs sponsor list, or whose posting needs full Australian
+  // working rights, are refused with 403 NOT_AU_VISA_SPONSOR. Data is in memory.
+  auSponsorOnly: {
+    type: Boolean,
+    required: false,
+    default: false,
+  },
+  auSponsorOnlyMeta: {
+    updatedAt: { type: Date, required: false, default: null },
+    updatedBy: { type: String, required: false, default: "" },
+  },
+  // "Europe visa sponsors only" (Utils/euVisaSponsor.js). Only offered to
+  // Europe clients; when on, a job in the Netherlands must be from an IND
+  // recognised sponsor and one in Ireland from an employer issued employment
+  // permits, and no posting may require an existing EU right to work. Refused
+  // with 403 NOT_EU_VISA_SPONSOR. Data is in memory.
+  euSponsorOnly: {
+    type: Boolean,
+    required: false,
+    default: false,
+  },
+  euSponsorOnlyMeta: {
+    updatedAt: { type: Date, required: false, default: null },
+    updatedBy: { type: String, required: false, default: "" },
+  },
   // Operator's per-client OpenAI API key. Used by the JR-direct extension's
   // SW to call api.openai.com directly for the auto-judge step. Stored as
   // plain text per ops decision — extension fetches it on /extension/clientLogin

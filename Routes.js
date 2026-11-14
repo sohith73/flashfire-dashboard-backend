@@ -137,6 +137,8 @@ import UpdateTargetJobs from "./Controllers/UpdateTargetJobs.js";
 import UpdateScrapeSources from "./Controllers/UpdateScrapeSources.js";
 import { GetUkSponsorOnly, UpdateUkSponsorOnly, LookupUkSponsor } from "./Controllers/UkVisaSponsors.js";
 import { GetUsSponsorOnly, UpdateUsSponsorOnly, LookupUsSponsor } from "./Controllers/UsVisaSponsors.js";
+import { GetAuSponsorOnly, UpdateAuSponsorOnly, LookupAuSponsor } from "./Controllers/AuVisaSponsors.js";
+import { GetEuSponsorOnly, UpdateEuSponsorOnly, LookupEuSponsor } from "./Controllers/EuVisaSponsors.js";
 import UpdateOpenaiKey from "./Controllers/UpdateOpenaiKey.js";
 import { GetGlobalOpenaiKey, SetGlobalOpenaiKey } from "./Controllers/GlobalOpenaiKey.js";
 import PushHistory from "./Controllers/PushHistory.js";
@@ -558,6 +560,16 @@ app.get("/us-sponsor-only", GetUsSponsorOnly);
 app.post("/update-us-sponsor-only", UpdateUsSponsorOnly);
 app.get("/us-visa-sponsors/lookup", LookupUsSponsor);
 app.post("/us-visa-sponsors/lookup", LookupUsSponsor);
+// "Australia visa sponsors only" (Controllers/AuVisaSponsors.js). Sponsor data is in memory.
+app.get("/au-sponsor-only", GetAuSponsorOnly);
+app.post("/update-au-sponsor-only", UpdateAuSponsorOnly);
+app.get("/au-visa-sponsors/lookup", LookupAuSponsor);
+app.post("/au-visa-sponsors/lookup", LookupAuSponsor);
+// "Europe visa sponsors only" (Controllers/EuVisaSponsors.js). Sponsor data is in memory.
+app.get("/eu-sponsor-only", GetEuSponsorOnly);
+app.post("/update-eu-sponsor-only", UpdateEuSponsorOnly);
+app.get("/eu-visa-sponsors/lookup", LookupEuSponsor);
+app.post("/eu-visa-sponsors/lookup", LookupEuSponsor);
 app.post("/update-openai-key", UpdateOpenaiKey);
 app.get("/admin/global-openai-key", GetGlobalOpenaiKey);
 app.post("/admin/global-openai-key", SetGlobalOpenaiKey);
