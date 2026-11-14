@@ -9,6 +9,8 @@ import { jobLinkKey, inspectJobLink, SHARED_FORM_COMPANY_LIMIT } from '../Utils/
 import { classifyApplyUrl } from '../Utils/applyUrlPolicy.js';
 import { ukSponsorPushBlock } from '../Utils/ukVisaSponsor.js';
 import { usSponsorPushBlock } from '../Utils/usVisaSponsor.js';
+import { auSponsorPushBlock } from '../Utils/auVisaSponsor.js';
+import { euSponsorPushBlock } from '../Utils/euVisaSponsor.js';
 import { companyAllowlistBlock } from '../Utils/companyAllowlist.js';
 import { initialAutoOptimization } from '../Utils/autoOptimizationState.js';
 
@@ -379,6 +381,81 @@ export default async function AddJob(req, res) {
                     success: false,
                     error: usBlock.error,
                     message: usBlock.message,
+                });
+            }
+        }
+
+        // "Australia visa sponsors only" (Utils/auVisaSponsor.js). Same contract
+        // as the UK and US rules above; the lookup is in memory.
+        if (isOpsRole && clientForExclusions) {
+            let auBlock;
+            try {
+                auBlock = await auSponsorPushBlock({
+                    email: clientForExclusions,
+                    companyName: jobDetails?.companyName,
+                    jobDescription: jobDetails?.jobDescription,
+                });
+            } catch (e) {
+                console.error('auSponsorPushBlock failed:', e.message);
+                return res.status(503).json({
+                    success: false,
+                    error: e.code === 'AU_SPONSOR_DATA_NOT_LOADED' ? 'AU_SPONSOR_DATA_NOT_LOADED' : 'SPONSOR_CHECK_FAILED',
+                    message: e.code === 'AU_SPONSOR_DATA_NOT_LOADED'
+                        ? e.message
+                        : 'Could not check Australian visa sponsors (DB unavailable). Push refused, try again shortly.',
+                });
+            }
+            if (auBlock) {
+                console.log(JSON.stringify({
+                    event: 'au.sponsor.block',
+                    client: clientForExclusions,
+                    company: jobDetails?.companyName || '',
+                    reason: auBlock.sponsor?.reason || null,
+                    quote: auBlock.posting?.quote || null,
+                    ts: new Date().toISOString(),
+                }));
+                return res.status(auBlock.status).json({
+                    success: false,
+                    error: auBlock.error,
+                    message: auBlock.message,
+                });
+            }
+        }
+
+        // "Europe visa sponsors only" (Utils/euVisaSponsor.js). The job's location
+        // decides which list applies (NL: IND register, IE: permit holders).
+        if (isOpsRole && clientForExclusions) {
+            let euBlock;
+            try {
+                euBlock = await euSponsorPushBlock({
+                    email: clientForExclusions,
+                    companyName: jobDetails?.companyName,
+                    jobDescription: jobDetails?.jobDescription,
+                    jobLocation: jobDetails?.jobLocation,
+                });
+            } catch (e) {
+                console.error('euSponsorPushBlock failed:', e.message);
+                return res.status(503).json({
+                    success: false,
+                    error: e.code === 'EU_SPONSOR_DATA_NOT_LOADED' ? 'EU_SPONSOR_DATA_NOT_LOADED' : 'SPONSOR_CHECK_FAILED',
+                    message: e.code === 'EU_SPONSOR_DATA_NOT_LOADED'
+                        ? e.message
+                        : 'Could not check European visa sponsors (DB unavailable). Push refused, try again shortly.',
+                });
+            }
+            if (euBlock) {
+                console.log(JSON.stringify({
+                    event: 'eu.sponsor.block',
+                    client: clientForExclusions,
+                    company: jobDetails?.companyName || '',
+                    reason: euBlock.sponsor?.reason || null,
+                    quote: euBlock.posting?.quote || null,
+                    ts: new Date().toISOString(),
+                }));
+                return res.status(euBlock.status).json({
+                    success: false,
+                    error: euBlock.error,
+                    message: euBlock.message,
                 });
             }
         }

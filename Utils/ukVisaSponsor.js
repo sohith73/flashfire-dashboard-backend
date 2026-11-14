@@ -233,11 +233,11 @@ export function deriveClientCountry(trackingDoc) {
 
 export async function resolveClientCountry(email, { collection } = {}) {
   const e = String(email || "").trim().toLowerCase();
-  if (!e.includes("@")) return { email: e, isUk: false, isUs: false, country: null, source: null };
+  if (!e.includes("@")) return { email: e, isUk: false, isUs: false, isAu: false, isEu: false, country: null, source: null };
   const col = collection || mongoose.connection.collection(TRACKING_COLLECTION);
   const doc = await col.findOne({ email: e }, { projection: { clientCountry: 1, amountPaid: 1 } });
   const { country, source } = deriveClientCountry(doc);
-  return { email: e, isUk: country === UK_COUNTRY, isUs: country === "USA", country, source };
+  return { email: e, isUk: country === UK_COUNTRY, isUs: country === "USA", isAu: country === "Australia", isEu: country === "Europe", country, source };
 }
 
 // ---- the push gate ----------------------------------------------------------
