@@ -19,11 +19,9 @@ const StepSchema = new mongoose.Schema(
     attempts: { type: Number, default: 0 },
     error: { type: String, default: "" },
     messageId: { type: String, default: "" }, // SMTP receipt
-    // Mattermost mirror of this step, posted to the client's channel right
-    // after the email is accepted. Its own stamp, independent of sentAt: a
-    // missing webhook or a 5xx must never make the email look unsent.
-    mattermostAt: { type: Date, default: null },
-    mattermostError: { type: String, default: "" }
+    // "manual" when an operator sent it from Client Onboarding; empty for the
+    // automatic sequence. Shown in clients-tracking > Notifications.
+    trigger: { type: String, default: "" }
   },
   { _id: false }
 );

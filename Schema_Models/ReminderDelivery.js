@@ -20,7 +20,8 @@ const reminderDeliverySchema = new mongoose.Schema(
     periodKey: { type: String, default: "" },
     // cron | auto-threshold | manual (send-now)
     trigger: { type: String, default: "cron" },
-    // sent | partial | failed | skipped
+    // sent | failed | skipped (email is the only channel; "partial" only
+    // appears on rows written while Mattermost was a second channel)
     status: { type: String, required: true },
     // Machine reason: "ok", "nothing_added", "email: <smtp error>", ...
     reason: { type: String, default: "" },
@@ -29,11 +30,6 @@ const reminderDeliverySchema = new mongoose.Schema(
       attempted: { type: Boolean, default: false },
       ok: { type: Boolean, default: false },
       to: { type: String, default: "" },
-      error: { type: String, default: "" }
-    },
-    mattermost: {
-      attempted: { type: Boolean, default: false },
-      ok: { type: Boolean, default: false },
       error: { type: String, default: "" }
     },
     stats: {

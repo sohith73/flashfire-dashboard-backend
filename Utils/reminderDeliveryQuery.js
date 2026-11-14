@@ -2,9 +2,31 @@
 // reminder history. Pure, so the filter and paging rules are unit-tested
 // without a database.
 
-export const DELIVERY_STATUSES = ["sent", "partial", "failed", "skipped"];
-// "delivered" = reached the client on at least one channel (sent or partial).
+export const DELIVERY_STATUSES = ["sent", "failed", "skipped"];
+// "delivered" is the old name for "sent", still accepted from older clients.
 export const STATUS_FILTERS = ["all", "delivered", ...DELIVERY_STATUSES];
+
+// Email is the only channel. Rows written while Mattermost was a second channel
+// can say "partial"; what counts now is whether their email went out.
+const LEGACY_SENT = { status: "partial", "email.ok": true };
+const LEGACY_FAILED = { status: "partial", "email.ok": { $ne: true } };
+
+/** Mongo filter clause for one status, legacy "partial" rows folded in. */
+export function statusClause(status) {
+  if (status === "sent" || status === "delivered") return { $or: [{ status: "sent" }, LEGACY_SENT] };
+  if (status === "failed") return { $or: [{ status: "failed" }, LEGACY_FAILED] };
+  if (status === "skipped") return { status: "skipped" };
+  return {};
+}
+
+/** $group key giving each row its email-only status, for the per-status counts. */
+export const EFFECTIVE_STATUS = {
+  $cond: [
+    { $eq: ["$status", "partial"] },
+    { $cond: [{ $eq: ["$email.ok", true] }, "sent", "failed"] },
+    "$status"
+  ]
+};
 export const DEFAULT_PAGE_SIZE = 25;
 export const MAX_PAGE_SIZE = 100;
 
@@ -69,9 +91,7 @@ export function parseDeliveryQuery(body = {}, isItemKey = () => true) {
   if (!STATUS_FILTERS.includes(status)) {
     return { ok: false, message: `status must be one of: ${STATUS_FILTERS.join(", ")}` };
   }
-  const filter = { ...base };
-  if (status === "delivered") filter.status = { $in: ["sent", "partial"] };
-  else if (status !== "all") filter.status = status;
+  const filter = { ...base, ...statusClause(status) };
 
   const page = positiveInt(body.page, 1);
   const pageSize = Math.min(MAX_PAGE_SIZE, positiveInt(body.pageSize, DEFAULT_PAGE_SIZE));

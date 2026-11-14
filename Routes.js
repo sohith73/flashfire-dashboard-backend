@@ -93,7 +93,6 @@ import {
   updateClientReminderConfig,
   setClientReminderPaymentEmail,
   sendClientReminderNow,
-  testClientReminderMattermost,
   previewClientReminder,
   getClientReminderHistory,
   listReminderDeliveries
@@ -219,8 +218,7 @@ app.get("/autopilot/runs", listAutopilotRuns);
 // queue + cancel are called by the Client Tracking portal, so they are NOT
 // ops-key gated. Vite inlines env vars at build time, so requiring the key
 // here would publish OPS_SECRET_KEY inside the browser bundle - and that same
-// key guards /operations/reminders/*, which can email clients and post to
-// their Mattermost channels. Handing that key to every visitor to protect a
+// key guards /operations/reminders/*, which can email clients. Handing that key to every visitor to protect a
 // scrape button is a bad trade.
 // The exposure left is bounded: an unknown client is refused by the autopilot,
 // the partial unique index allows one live request per client, and the 30-job
@@ -723,8 +721,8 @@ app.post('/operations/auto-optimize-saved', queueAutoOptimizeSavedJobs);
 // Client Reminders — operator-configured recurring reports for one client.
 //
 // Operations picks which of the Utils/reminderItems.js catalogue items a client
-// receives, on what IST schedule, and over which channels: the client's payment
-// email (existing SMTP) and/or a client-specific Mattermost incoming webhook.
+// receives and on what IST schedule, delivered to the client's payment email
+// over the existing SMTP account. Email is the only channel.
 // src/services/clientReminderWorker.js does the actual delivery every five
 // minutes; these routes only read and write the configuration, plus a preview
 // and a manual "send now" that both run through that same worker code so what
@@ -735,7 +733,7 @@ app.post('/operations/auto-optimize-saved', queueAutoOptimizeSavedJobs);
 // digest.
 //
 // Every route is gated by requireOpsKey (header `x-ops-key`), because they can
-// email a paying client and post into their Mattermost channel.
+// email a paying client.
 // Unsubscribe. NO AUTH on purpose: the link has to work from an email client
 // with no session, and the HMAC in it is the authorisation. GET serves a page
 // for a human; POST is the one-click action Gmail and Yahoo perform on the
@@ -790,7 +788,6 @@ app.post('/operations/reminders/get', requireOpsKey, getClientReminderConfig);
 app.put('/operations/reminders', requireOpsKey, updateClientReminderConfig);
 app.post('/operations/reminders/payment-email', requireOpsKey, setClientReminderPaymentEmail);
 app.post('/operations/reminders/send-now', requireOpsKey, sendClientReminderNow);
-app.post('/operations/reminders/test-mattermost', requireOpsKey, testClientReminderMattermost);
 app.post('/operations/reminders/preview', requireOpsKey, previewClientReminder);
 app.post('/operations/reminders/history', requireOpsKey, getClientReminderHistory);
 app.post('/operations/reminders/deliveries', requireOpsKey, listReminderDeliveries);

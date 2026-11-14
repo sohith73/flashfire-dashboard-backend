@@ -56,11 +56,6 @@ for (const c of configs) {
               to: String(h.email?.to || ""),
               error: String(h.email?.error || "")
             },
-            mattermost: {
-              attempted: h.mattermost?.attempted === true,
-              ok: h.mattermost?.ok === true,
-              error: String(h.mattermost?.error || "")
-            },
             stats: { added: Number(h.stats?.added) || 0, applied: Number(h.stats?.applied) || 0 },
             at
           }

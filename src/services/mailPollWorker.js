@@ -59,7 +59,7 @@ import { applyLearnedExclusions, proposeAndStoreExclusion } from "./mailRegexLea
 import { notifyUsefulMailLine, isGmailAuthError, errorText } from "../../Utils/discordMailNotify.js";
 import {
   deriveEligibility,
-  notifyClientForDigestAllChannels,
+  notifyClientForDigest,
   retryPendingClientNotifications
 } from "./clientMailNotifier.js";
 
@@ -694,19 +694,15 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
         if (ok) posted++;
       }
 
-      // Client milestone alert (interview / assignment / offer) over the payment
-      // email AND the client's Mattermost channel, both gated on the per-client
-      // opt-in in the Client Reminders tab. Independent of Discord and
-      // fail-soft: a send failure is recorded on the digest and retried on a
-      // later tick, never blocking the poll. Each channel is at-most-once on
-      // its own stamp, so a retry cannot double-deliver either half.
+      // Client milestone alert (interview / assignment / offer) to the payment
+      // email, unless the client opted out in the Client Reminders tab.
+      // Independent of Discord and fail-soft: a send failure is recorded on the
+      // digest and retried on a later tick, never blocking the poll. At most
+      // once per digest (clientNotifiedAt), so a retry cannot double-deliver.
       try {
-        const outcome = await notifyClientForDigestAllChannels({ digestDoc, client, mailbox });
-        if (outcome.email === "sent" || outcome.mattermost === "sent") {
-          console.log(
-            `[client-notify] ${mailbox}: alerted client — ${digestDoc.clientNotifyCategory} (${messageId}) ` +
-              `email=${outcome.email} mattermost=${outcome.mattermost}`
-          );
+        const outcome = await notifyClientForDigest({ digestDoc, client, mailbox });
+        if (outcome === "sent") {
+          console.log(`[client-notify] ${mailbox}: alerted client - ${digestDoc.clientNotifyCategory} (${messageId})`);
         }
       } catch (e) {
         console.warn(`[client-notify] ${mailbox}: unexpected error for ${messageId}: ${e.message}`);

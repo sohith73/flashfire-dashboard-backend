@@ -87,11 +87,9 @@ test("an empty address is never treated as a client", async () => {
   assert.equal((await readInboxAlertConfig("")).enabled, false);
 });
 
-test("the webhook still comes back alongside the decision", async () => {
-  row = { inboxAlertsOptOut: false, mattermostWebhookUrl: "  https://mm.example.com/hooks/abc12345  " };
-  const cfg = await readInboxAlertConfig("client@example.com");
-  assert.equal(cfg.enabled, true);
-  assert.equal(cfg.webhookUrl, "https://mm.example.com/hooks/abc12345", "trimmed, ready for the poster");
+test("the decision is the only thing that comes back", async () => {
+  row = { inboxAlertsOptOut: false };
+  assert.deepEqual(await readInboxAlertConfig("client@example.com"), { enabled: true });
 });
 
 test("no client is excluded by the rollout allowlist any more", () => {

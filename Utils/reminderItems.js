@@ -48,7 +48,7 @@ export const REMINDER_ITEMS = [
     scheduleFields: ["sendAtIST", "autoOnThreshold"],
     defaults: {
       enabled: true,
-      channels: { mattermost: true, email: true },
+      channels: { email: true },
       sendAtIST: "21:30",
       autoOnThreshold: false,
       autoThresholdCount: 5,
@@ -73,7 +73,7 @@ export const REMINDER_ITEMS = [
     scheduleFields: ["inactivityDays", "sendAtIST"],
     defaults: {
       enabled: false,
-      channels: { mattermost: true, email: false },
+      channels: { email: true },
       inactivityDays: 3,
       sendAtIST: "11:00"
     }
@@ -113,10 +113,7 @@ export function defaultItemConfig(key) {
   return {
     key: meta.key,
     enabled: d.enabled === true,
-    channels: {
-      mattermost: d.channels?.mattermost === true,
-      email: d.channels?.email === true
-    },
+    channels: { email: d.channels?.email === true },
     sendAtIST: d.sendAtIST || "09:00",
     // Threshold auto-send. Only the daily summary declares these today, but
     // every row carries them so the worker and the UI never branch on undefined.

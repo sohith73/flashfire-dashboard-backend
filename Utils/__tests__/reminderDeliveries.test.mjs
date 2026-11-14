@@ -17,10 +17,22 @@ test("defaults: one client, every status, page 1 of 25", () => {
   assert.equal(q.pageSize, 25);
 });
 
-test("delivered means sent or partial, and counts ignore the status filter", () => {
-  const q = parseDeliveryQuery({ clientEmail: C, status: "delivered", itemKey: "daily_summary" }, isItem);
-  assert.deepEqual(q.filter, { clientEmail: C, itemKey: "daily_summary", status: { $in: ["sent", "partial"] } });
+test("sent folds in legacy partial rows whose email went out; counts ignore the status filter", () => {
+  const q = parseDeliveryQuery({ clientEmail: C, status: "sent", itemKey: "daily_summary" }, isItem);
+  assert.deepEqual(q.filter, {
+    clientEmail: C,
+    itemKey: "daily_summary",
+    $or: [{ status: "sent" }, { status: "partial", "email.ok": true }]
+  });
   assert.deepEqual(q.countsFilter, { clientEmail: C, itemKey: "daily_summary" });
+  // "delivered" is the old name and still means the same thing.
+  assert.deepEqual(parseDeliveryQuery({ clientEmail: C, status: "delivered" }, isItem).filter.$or, q.filter.$or);
+});
+
+test("failed folds in legacy partial rows whose email did not go out; partial is not a filter any more", () => {
+  const q = parseDeliveryQuery({ clientEmail: C, status: "failed" }, isItem);
+  assert.deepEqual(q.filter.$or, [{ status: "failed" }, { status: "partial", "email.ok": { $ne: true } }]);
+  assert.equal(parseDeliveryQuery({ clientEmail: C, status: "partial" }, isItem).ok, false);
 });
 
 test("dates are whole IST days, both ends inclusive", () => {
@@ -78,7 +90,7 @@ test("past the time with today still open, it is due on the next tick", () => {
 test("a switched-off item, or one with no channel, has nothing scheduled", () => {
   const now = ist("2026-11-13T11:00:00");
   assert.equal(nextScheduledSend({ ...defaultItemConfig("daily_summary"), enabled: false }, daily, now), null);
-  const noChannel = { ...defaultItemConfig("daily_summary"), channels: { email: false, mattermost: false } };
+  const noChannel = { ...defaultItemConfig("daily_summary"), channels: { email: false } };
   assert.equal(nextScheduledSend(noChannel, daily, now), null);
 });
 
@@ -124,4 +136,39 @@ test("nothing to create means no write, and a lookup failure never throws", asyn
     await ensureActiveClientConfigs({ listActive: async () => { throw new Error("db down"); }, model }),
     0
   );
+});
+
+test("the tick can hand in the active list it already read, so it is fetched once", async () => {
+  const model = fakeModel([]);
+  let listed = 0;
+  const created = await ensureActiveClientConfigs({
+    listActive: async () => { listed += 1; return []; },
+    active: [{ email: "fresh@x.com", name: "Fresh" }],
+    model
+  });
+  assert.equal(created, 1);
+  assert.equal(listed, 0);
+  assert.equal(model.calls.bulk[0].updateOne.filter.clientEmail, "fresh@x.com");
+});
+
+// ---- email is the only channel ------------------------------------------------
+
+const { mergeWithDefaults, sanitizeItemsInput } = await import("../../Schema_Models/ClientReminderConfig.js");
+
+test("a stored Mattermost-only row now delivers by email, so nobody silently stops hearing from us", () => {
+  const merged = mergeWithDefaults({
+    clientEmail: C,
+    items: [{ key: "daily_summary", enabled: true, channels: { mattermost: true, email: false } }]
+  });
+  const daily = merged.items.find((i) => i.key === "daily_summary");
+  assert.deepEqual(daily.channels, { email: true });
+  assert.equal("mattermostWebhookUrl" in merged, false);
+});
+
+test("an operator switching email off is honoured, and Mattermost never comes back", () => {
+  const existing = [{ key: "daily_summary", enabled: true, channels: { mattermost: true, email: true } }];
+  const [daily] = sanitizeItemsInput([{ key: "daily_summary", channels: { email: false } }], existing);
+  assert.deepEqual(daily.channels, { email: false });
+  const [kept] = sanitizeItemsInput([{ key: "daily_summary", enabled: true }], existing);
+  assert.deepEqual(kept.channels, { email: true }, "an omitted channel keeps what is stored");
 });

@@ -1,10 +1,11 @@
 // clientReminderWorker - delivers the operator-configured "Client Reminders"
-// to a client's payment email and/or their Mattermost channel.
+// to a client's payment email. Email is the only channel; Mattermost was
+// removed on 2026-11-14.
 //
 // One ClientReminderConfig document per client (Schema_Models/ClientReminderConfig.js),
 // one row per catalogue item (Utils/reminderItems.js). Every five minutes this
-// worker walks the configs that have at least one enabled item with at least
-// one enabled channel, asks the pure scheduling functions below whether each
+// worker walks the configs of active, unpaused clients that have at least one
+// enabled item, asks the pure scheduling functions below whether each
 // row is due, and hands the due ones to deliverReminder().
 //
 // THE PRODUCT RULE that shapes everything here: an activity-gated report with
@@ -64,9 +65,8 @@ import {
   daysSinceLastActivity,
   nthRoleAddedTodayIST
 } from "../../Utils/clientActivityStats.js";
-import { renderReminderEmail, renderReminderMattermost } from "../../Utils/reminderTemplates.js";
+import { renderReminderEmail } from "../../Utils/reminderTemplates.js";
 import { sendViaSmtp, isSmtpConfigured } from "../../Utils/smtpSender.js";
-import { sendToMattermost, isValidWebhookUrl, normalizeWebhookUrl } from "../../Utils/mattermostSender.js";
 import { resolvePaymentEmail, getActiveUnpausedClients } from "../../Schema_Models/ClientPaymentLookup.js";
 import { ReminderDelivery } from "../../Schema_Models/ReminderDelivery.js";
 import { unsubscribeHeaders, UNSUB_STREAMS } from "../../Utils/unsubscribe.js";
@@ -212,8 +212,7 @@ export function periodKeyFor(itemKey, now = new Date()) {
 
 /**
  * The reporting window an item covers, as UTC instants bounding IST calendar
- * days, plus a human label that goes verbatim into the email and the
- * Mattermost post.
+ * days, plus a human label that goes verbatim into the email.
  *
  * The label matters more than it looks: "your daily summary" is ambiguous the
  * moment a send slips past midnight, so every reminder states the exact dates
@@ -411,7 +410,7 @@ export function isThresholdAutoDue({ item, meta, addedCount, nthAt, now = new Da
 }
 
 function hasEnabledChannel(channels) {
-  return channels?.mattermost === true || channels?.email === true;
+  return channels?.email === true;
 }
 
 /**
@@ -490,7 +489,6 @@ function blankResult(itemKey, extraFields = {}) {
     reason: "",
     itemKey,
     email: { attempted: false, ok: false, to: "", error: "" },
-    mattermost: { attempted: false, ok: false, error: "" },
     stats: { added: 0, applied: 0 },
     periodKey: "",
     subject: "",
@@ -577,11 +575,6 @@ async function persistOutcome({ clientEmail, clientName = "", itemKey, periodKey
       to: result.email.to,
       error: trim300(result.email.error)
     },
-    mattermost: {
-      attempted: result.mattermost.attempted,
-      ok: result.mattermost.ok,
-      error: trim300(result.mattermost.error)
-    },
     stats: { added: result.stats.added, applied: result.stats.applied },
     trigger: result.trigger || "cron"
   };
@@ -598,7 +591,7 @@ async function persistOutcome({ clientEmail, clientName = "", itemKey, periodKey
     updatedAt: getCurrentISTTime()
   };
   if (writePeriodKey && periodKey) set["items.$[it].lastPeriodKey"] = periodKey;
-  if (result.status === "sent" || result.status === "partial") set["items.$[it].lastSentAt"] = historyRow.at;
+  if (result.status === "sent") set["items.$[it].lastSentAt"] = historyRow.at;
 
   try {
     // The item row may not exist yet on a document saved before this item
@@ -659,9 +652,9 @@ async function persistOutcome({ clientEmail, clientName = "", itemKey, periodKey
  * @param {string} a.itemKey
  * @param {string} [a.trigger]          'cron' | 'manual' | anything the caller wants in the audit row
  * @param {boolean} [a.force]           bypass the empty-skip decision only
- * @param {object|null} [a.channelsOverride]  {mattermost, email} for a one-off test send
+ * @param {object|null} [a.channelsOverride]  {email} for a one-off test send
  * @param {Date} [a.now]
- * @returns {Promise<{status:string, reason:string, email:object, mattermost:object, stats:object, periodKey:string, subject:string}>}
+ * @returns {Promise<{status:string, reason:string, email:object, stats:object, periodKey:string, subject:string}>}
  *          Never throws.
  */
 export async function deliverReminder({
@@ -692,8 +685,8 @@ export async function deliverReminder({
 
   // A channel override applies to THIS delivery only; it is never written back.
   const channels = channelsOverride
-    ? { mattermost: channelsOverride.mattermost === true, email: channelsOverride.email === true }
-    : { mattermost: item.channels?.mattermost === true, email: item.channels?.email === true };
+    ? { email: channelsOverride.email === true }
+    : { email: item.channels?.email === true };
   const effectiveItem = { ...item, channels };
 
   const window = reportWindowFor(key, now);
@@ -775,7 +768,7 @@ export async function deliverReminder({
 
     if (!dest.to) {
       // Not forceable and not a failure of ours: there is simply no address on
-      // file. Reported, logged, and the Mattermost half still goes out.
+      // file. Reported and logged as a skip.
       out.email = {
         attempted: false,
         ok: false,
@@ -821,54 +814,15 @@ export async function deliverReminder({
     }
   }
 
-  // ── Mattermost ──
-  if (channels.mattermost) {
-    const webhook = normalizeWebhookUrl(merged.mattermostWebhookUrl);
-    if (!isValidWebhookUrl(webhook)) {
-      out.mattermost = { attempted: false, ok: false, error: "no_webhook_url" };
-    } else {
-      const rendered = renderReminderMattermost({ kind: key, client, stats, lifetime, period, extra });
-      if (!rendered?.text) {
-        out.mattermost = { attempted: false, ok: false, error: "template_unavailable" };
-      } else {
-        const res = await sendToMattermost({ webhookUrl: webhook, text: rendered.text, username: "FlashFire" });
-        out.mattermost = {
-          attempted: true,
-          ok: res?.ok === true,
-          error: res?.ok === true ? "" : trim300(res?.error || "post_failed")
-        };
-      }
-    }
-  }
-
-  const attempted = [out.email.attempted, out.mattermost.attempted].filter(Boolean).length;
-  const succeeded = [out.email.attempted && out.email.ok, out.mattermost.attempted && out.mattermost.ok].filter(
-    Boolean
-  ).length;
-
-  // The reason must name why a channel that WAS tried failed. Reading
-  // out.email.error unconditionally would report "no_payment_email" for a run
-  // whose only real problem was a 404 from the webhook, which sends an
-  // operator chasing the wrong thing.
-  const attemptedErrors = [
-    out.email.attempted && !out.email.ok ? `email: ${out.email.error}` : "",
-    out.mattermost.attempted && !out.mattermost.ok ? `mattermost: ${out.mattermost.error}` : ""
-  ].filter(Boolean);
-  const unusableErrors = [
-    !out.email.attempted && out.email.error ? `email: ${out.email.error}` : "",
-    !out.mattermost.attempted && out.mattermost.error ? `mattermost: ${out.mattermost.error}` : ""
-  ].filter(Boolean);
-
-  if (attempted === 0) {
-    // Every enabled channel was unusable (no address, no webhook, no SMTP).
+  // One channel, so the outcome is the email's outcome. An address we could
+  // not use (none on file, SMTP not configured, no template) is a skip with
+  // that reason; a send the provider refused is a failure.
+  if (!out.email.attempted) {
     out.status = "skipped";
-    out.reason = unusableErrors.join("; ") || "no_destination";
-  } else if (succeeded === 0) {
+    out.reason = out.email.error ? `email: ${out.email.error}` : "no_destination";
+  } else if (!out.email.ok) {
     out.status = "failed";
-    out.reason = attemptedErrors.join("; ") || "delivery_failed";
-  } else if (succeeded < attempted) {
-    out.status = "partial";
-    out.reason = attemptedErrors.join("; ") || "partial_delivery";
+    out.reason = `email: ${out.email.error || "send_failed"}`;
   } else {
     out.status = "sent";
     if (!forcedThrough) out.reason = "ok";
@@ -886,12 +840,8 @@ export async function deliverReminder({
     sentAt: now
   });
 
-  if (out.status === "sent" || out.status === "partial") {
-    console.log(
-      `${LOG} ${out.status} '${key}' for ${clientEmail} (${periodKey || "event"}) ` +
-        `email=${out.email.attempted ? (out.email.ok ? "ok" : "fail") : "-"} ` +
-        `mm=${out.mattermost.attempted ? (out.mattermost.ok ? "ok" : "fail") : "-"}`
-    );
+  if (out.status === "sent") {
+    console.log(`${LOG} sent '${key}' for ${clientEmail} (${periodKey || "event"}) to ${out.email.to}`);
   } else if (out.status === "failed") {
     console.warn(`${LOG} failed '${key}' for ${clientEmail}: ${out.reason}`);
   }
@@ -917,7 +867,7 @@ export async function deliverReminder({
  */
 /**
  * Give every active, unpaused client a reminder config with the catalogue
- * defaults (daily summary on, 21:30 IST, email + Mattermost), so the daily
+ * defaults (daily summary on, 21:30 IST, by email), so the daily
  * summary reaches every active client and not only the ones an operator
  * happened to open in Operations > Reminders. Until 2026-11-13 only 9 of 79
  * active clients had a config, and the tick below never sees a client
@@ -932,10 +882,11 @@ export async function deliverReminder({
  */
 export async function ensureActiveClientConfigs({
   listActive = getActiveUnpausedClients,
-  model = ClientReminderConfig
+  model = ClientReminderConfig,
+  active: given = null
 } = {}) {
   try {
-    const active = (await listActive()).filter((c) => EMAIL_RE.test(c.email));
+    const active = (given || (await listActive())).filter((c) => EMAIL_RE.test(c.email));
     if (active.length === 0) return 0;
 
     const existing = await model
@@ -979,18 +930,29 @@ export async function ensureActiveClientConfigs({
 export async function runReminderTick({ now = new Date() } = {}) {
   const summary = { evaluated: 0, sent: 0, skipped: 0, failed: 0 };
 
+  // Reminders go to active, unpaused clients only. Pausing a client or
+  // marking them inactive in clients-tracking stops their mail on the next
+  // tick, and marking them active (unpaused) starts it, with no operator
+  // visiting Operations > Reminders.
+  let active = [];
+  try {
+    active = (await getActiveUnpausedClients()).filter((c) => EMAIL_RE.test(c.email));
+  } catch (err) {
+    console.error(`${LOG} active client lookup failed:`, err?.message || err);
+    return summary;
+  }
+  if (active.length === 0) return summary;
+
   // Before the query, so a client who just became active is in this pass.
-  await ensureActiveClientConfigs();
+  await ensureActiveClientConfigs({ active });
 
   let configs = [];
   try {
+    // Channel checks happen in memory after mergeWithDefaults, which also
+    // reads legacy Mattermost-only rows as email-on.
     configs = await ClientReminderConfig.find({
-      items: {
-        $elemMatch: {
-          enabled: true,
-          $or: [{ "channels.mattermost": true }, { "channels.email": true }]
-        }
-      }
+      clientEmail: { $in: active.map((c) => c.email) },
+      items: { $elemMatch: { enabled: true } }
     })
       .lean();
   } catch (err) {
@@ -1040,7 +1002,7 @@ export async function runReminderTick({ now = new Date() } = {}) {
 
         deliveries += 1;
         const res = await deliverReminder({ config: raw, itemKey: meta.key, trigger, now });
-        if (res.status === "sent" || res.status === "partial") summary.sent += 1;
+        if (res.status === "sent") summary.sent += 1;
         else if (res.status === "failed") summary.failed += 1;
         else summary.skipped += 1;
       }

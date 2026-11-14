@@ -1,7 +1,7 @@
 import { unsubscribeUrl, UNSUB_STREAMS } from "./unsubscribe.js";
 // Branded HTML email templates for client milestone alerts.
 //
-// Design (2026-08-24 redesign, modeled on Mattermost's notification mail):
+// Design (2026-08-24 redesign, modeled on a chat app's notification mail):
 // one centered white card on a light-gray page, logo + wordmark on top, a big
 // centered headline, one quiet sub-line, a single CTA button, then a bordered
 // inner card with the source mail's facts. No gradients on surfaces, no
@@ -77,11 +77,8 @@ function formatReceived(date) {
   const d = date instanceof Date ? date : date ? new Date(date) : null;
   if (!d || Number.isNaN(d.getTime())) return "";
   try {
-    // IST, not ET. Every other timestamp this product shows a client is IST -
-    // the dashboard, the scheduled reports, and this alert's own Mattermost
-    // message, which already said IST. Stamping the email in Eastern time meant
-    // the same mail was announced at two different times depending on which
-    // channel the client happened to read first.
+    // IST, not ET. Every other timestamp this product shows a client is IST,
+    // the dashboard and the scheduled reports included.
     return (
       d.toLocaleString("en-IN", {
         timeZone: "Asia/Kolkata",
@@ -217,52 +214,4 @@ export function renderClientMilestoneEmail({ client = {}, digest = {}, dashboard
   const text = textLines.join("\n");
 
   return { subject, html, text, category: digest.category };
-}
-
-/**
- * The same milestone, rendered for the client's Mattermost channel.
- *
- * Deliberately shorter than the email. A channel post is glanceable: what
- * happened, from whom, when, and one link to the dashboard. Everything the
- * classifier inferred stays out - we state the fact of the mail, not our
- * confidence about it.
- *
- * The subject and sender are scraped from the client's real inbox, so both go
- * through mmEscape. A recruiter signature containing markdown, or a subject
- * crafted to close a link we opened, must not be able to forge anything in a
- * channel our name is on.
- *
- * @param {object} a
- * @param {object} a.digest  the MailDigest document
- * @param {string} [a.dashboardUrl]
- * @returns {{text: string}|null} null when the category is not notifiable
- */
-export function renderClientMilestoneMattermost({ digest = {}, dashboardUrl } = {}) {
-  const category = String(digest.clientNotifyCategory || digest.category || "").toLowerCase();
-  const meta = CATEGORY[category];
-  if (!meta) return null;
-
-  const mmEscape = (v) => String(v ?? "").replace(/([\\`*_{}[\]()<>#+\-.!|~])/g, "\\$1");
-
-  const received = digest.date
-    ? new Date(digest.date).toLocaleString("en-IN", {
-        timeZone: "Asia/Kolkata",
-        day: "numeric",
-        month: "short",
-        hour: "numeric",
-        minute: "2-digit",
-        hour12: true
-      })
-    : "";
-
-  const lines = [
-    `#### ${meta.label}: ${mmEscape(digest.subject || "(no subject)")}`,
-    "",
-    meta.blurb
-  ];
-  if (digest.from) lines.push("", `**From:** ${mmEscape(digest.from)}`);
-  if (received) lines.push(`**Received:** ${received} IST`);
-  if (dashboardUrl) lines.push("", `[Open your dashboard](${dashboardUrl})`);
-
-  return { text: lines.join("\n") };
 }

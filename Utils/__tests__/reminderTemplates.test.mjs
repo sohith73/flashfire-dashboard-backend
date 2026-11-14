@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const { renderReminderEmail, renderReminderMattermost } = await import("../reminderTemplates.js");
+const { renderReminderEmail } = await import("../reminderTemplates.js");
 
 const CLIENT = { name: "Rijul Jain", email: "rijuljain17@gmail.com" };
 
@@ -69,17 +69,6 @@ const render = (kind, over = {}) =>
     ...over
   });
 
-const renderMm = (kind, over = {}) =>
-  renderReminderMattermost({
-    kind,
-    client: CLIENT,
-    stats: STATS,
-    lifetime: LIFETIME,
-    period: { label: "18 Aug - 24 Aug 2026" },
-    extra: { threshold: 400, days: 4 },
-    ...over
-  });
-
 test("reminderTemplates", async (t) => {
   await t.test("every kind renders subject, html and text; unknown kind is null", () => {
     for (const kind of KINDS) {
@@ -88,11 +77,8 @@ test("reminderTemplates", async (t) => {
       assert.ok(out.subject.length > 0, `${kind} has a subject`);
       assert.ok(out.html.includes("<!DOCTYPE html>"), `${kind} html is a document`);
       assert.ok(out.text.trim().length > 0, `${kind} has a text part`);
-      const mm = renderMm(kind);
-      assert.ok(mm && mm.text.length > 0, `${kind} has a Mattermost message`);
     }
     assert.equal(renderReminderEmail({ kind: "not_a_kind" }), null);
-    assert.equal(renderReminderMattermost({ kind: "not_a_kind" }), null);
   });
 
   await t.test("POLICY: no job links anywhere in client email - one dashboard link only", () => {
@@ -123,8 +109,6 @@ test("reminderTemplates", async (t) => {
     // dedicated case below for why the applications row was removed.
     assert.ok(out.html.includes("New roles added"), "labelled");
     assert.ok(out.html.includes(">5<") || out.html.includes("5"), "added count present");
-    const mm = renderMm("daily_summary");
-    assert.ok(!mm.text.includes("Stripe"), "Mattermost daily is numbers only too");
   });
 
   await t.test("no hype: no emoji, no exclamation marks, no em dashes in client output", () => {
@@ -134,8 +118,7 @@ test("reminderTemplates", async (t) => {
     const visible = (html) => html.replace(/<[^>]*>/g, " ").replace(/&[a-z#0-9]+;/gi, " ");
     for (const kind of KINDS) {
       const out = render(kind);
-      const mm = renderMm(kind);
-      for (const [what, text] of [["subject", out.subject], ["html", visible(out.html)], ["text", out.text], ["mattermost", mm.text]]) {
+      for (const [what, text] of [["subject", out.subject], ["html", visible(out.html)], ["text", out.text]]) {
         assert.ok(!text.includes(EM_DASH), `${kind} ${what}: em dash`);
         assert.ok(!text.includes("!"), `${kind} ${what}: exclamation mark`);
         assert.ok(!/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(text), `${kind} ${what}: emoji`);
@@ -162,25 +145,12 @@ test("reminderTemplates", async (t) => {
     }
   });
 
-  await t.test("mattermost messages stay under the size ceiling with a huge pipeline", () => {
-    const many = {
-      ...STATS,
-      interviewJobs: Array.from({ length: 300 }, (_, i) => job(`A very long senior staff principal role title number ${i}`, `Company ${i}`)),
-      byDay: Array.from({ length: 31 }, (_, i) => ({ date: `2026-07-${String(i + 1).padStart(2, "0")}`, added: 5, applied: 9 }))
-    };
-    for (const kind of KINDS) {
-      const mm = renderMm(kind, { stats: many });
-      assert.ok(mm.text.length <= 4000, `${kind}: ${mm.text.length} chars`);
-    }
-  });
-
   await t.test("removed report types render nothing at all", () => {
     // Retired from the catalogue over several rounds. An unknown kind must
     // return null rather than a half-built mail, so a stale config row
     // referencing one cannot resurrect it.
     for (const gone of ["monthly_report", "plan_usage", "weekly_report", "interview_digest", "milestone"]) {
       assert.equal(renderReminderEmail({ kind: gone }), null, `${gone} email`);
-      assert.equal(renderReminderMattermost({ kind: gone }), null, `${gone} mattermost`);
     }
   });
 
@@ -199,7 +169,5 @@ test("reminderTemplates", async (t) => {
     assert.ok(!out.html.includes("Moved to interview"), "no interview row");
     assert.ok(!out.html.includes("Offers"), "no offers row");
     assert.match(out.subject, /11 new roles added/, out.subject);
-    const mm = renderMm("daily_summary", { stats: { ...STATS, addedCount: 11, appliedCount: 0 } });
-    assert.ok(!mm.text.includes("Applications submitted"), "mattermost too");
   });
 });

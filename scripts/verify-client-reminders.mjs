@@ -13,13 +13,12 @@
 //
 //   ... -- --client=x@y.com --item=weekly_report   pick the catalogue item (default daily_summary)
 //   ... -- --client=x@y.com --all                  verdict table for every catalogue item
-//   ... -- --client=x@y.com --render               also dump the rendered email + Mattermost post to ./tmp-reminder-preview/
+//   ... -- --client=x@y.com --render               also dump the rendered email to ./tmp-reminder-preview/
 //   ... -- --client=x@y.com --now=2026-04-24T18:00:00+05:30
 //                                                  evaluate as if it were this instant (window/due/period maths only)
-//   ... -- --client=x@y.com --mattermost           REALLY post to the client's stored webhook
 //   ... -- --client=x@y.com --email                REALLY send via SMTP to the resolved payment email
 //   ... -- --client=x@y.com --email --force        push a send through even when the period was empty
-//   ... -- --client=x@y.com --mattermost --yes     skip the 5-second confirmation pause
+//   ... -- --client=x@y.com --email --yes          skip the 5-second confirmation pause
 //
 // Every layer this touches is the production one: Utils/clientActivityStats.js
 // for the numbers, src/services/clientReminderWorker.js for the window, the
@@ -27,8 +26,8 @@
 // Utils/reminderTemplates.js for the copy. Nothing is re-implemented here, so
 // a green run means the cron would behave the same way.
 //
-// Why the send flags go through deliverReminder() rather than calling
-// sendViaSmtp/sendToMattermost directly: that function is the single delivery
+// Why the send flag goes through deliverReminder() rather than calling
+// sendViaSmtp directly: that function is the single delivery
 // implementation shared with the cron and the operator's "Send now" button. A
 // script with its own send path would prove a code path nobody else runs.
 //
@@ -67,8 +66,7 @@ import {
   isReminderWorkerEnabled,
   reminderWorkerEnabledReason
 } from "../src/services/clientReminderWorker.js";
-import { renderReminderEmail, renderReminderMattermost } from "../Utils/reminderTemplates.js";
-import { normalizeWebhookUrl, isValidWebhookUrl } from "../Utils/mattermostSender.js";
+import { renderReminderEmail } from "../Utils/reminderTemplates.js";
 import { isSmtpConfigured, smtpFromEmail } from "../Utils/smtpSender.js";
 
 dotenv.config();
@@ -96,14 +94,13 @@ const OPT = {
   now: valueOf("--now"),
   all: has("--all"),
   render: has("--render"),
-  mattermost: has("--mattermost"),
   email: has("--email"),
   force: has("--force"),
   yes: has("--yes"),
   help: has("--help") || has("-h")
 };
 
-const SENDING = OPT.mattermost || OPT.email;
+const SENDING = OPT.email;
 
 // Reasons decideDelivery() can return that --force is allowed to override.
 // Mirrors FORCEABLE_REASONS in the worker; kept here only so the read-only
@@ -157,24 +154,6 @@ const IST_STAMP = new Intl.DateTimeFormat("en-GB", {
 const istStamp = (d) => (d instanceof Date && !Number.isNaN(d.getTime()) ? `${IST_STAMP.format(d)} IST` : "-");
 
 const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-
-/**
- * Host + a short masked tail of the secret path segment. A Mattermost incoming
- * webhook URL IS the credential: anyone holding it can post into the channel,
- * so it must never reach a terminal, a CI log or a pasted bug report intact.
- */
-function maskWebhook(url) {
-  const raw = String(url || "").trim();
-  if (!raw) return "(none)";
-  try {
-    const u = new URL(raw);
-    const tail = u.pathname.replace(/\/+$/, "").split("/").pop() || "";
-    const shown = tail.length > 4 ? tail.slice(-4) : "";
-    return `${u.protocol}//${u.host}/…${shown ? `••••${shown}` : "••••"}`;
-  } catch {
-    return "(unparseable URL)";
-  }
-}
 
 /** Cluster host only. The URI carries the database password. */
 function maskMongoUri(uri) {
@@ -234,14 +213,12 @@ verify-client-reminders — end-to-end proof for the Client Reminders chain.
   --now=<iso>           Evaluate as if it were this instant. Affects the window,
                         the due check and the period key only; the idle-days
                         lookup always measures from the real clock.
-  --render              Also write the rendered email HTML and the Mattermost
-                        markdown to ./tmp-reminder-preview/ and print the paths.
+  --render              Also write the rendered email HTML and text to
+                        ./tmp-reminder-preview/ and print the paths.
 
-  --mattermost          REALLY post to the client's stored webhook.
-                        Refuses when no webhook is stored.
   --email               REALLY send via SMTP to the resolved payment email.
                         Refuses when SMTP is unconfigured or no address resolves.
-  --force               Bypass the empty-period skip for the send flags only.
+  --force               Bypass the empty-period skip for --email only.
                         Also stops the send from consuming the period key.
   --yes                 Skip the five-second confirmation pause.
   --help, -h            This text.
@@ -267,7 +244,7 @@ async function listConfigs() {
   const rows = [["client", "enabled items", "last item", "last status", "last sent"]];
   for (const raw of docs.sort((a, b) => String(a.clientEmail).localeCompare(String(b.clientEmail)))) {
     const merged = mergeWithDefaults(raw);
-    const enabled = merged.items.filter((i) => i.enabled && (i.channels.mattermost || i.channels.email));
+    const enabled = merged.items.filter((i) => i.enabled && i.channels.email);
     // The most recent delivery across all items is what an operator scans for,
     // so surface that rather than one arbitrary item's bookkeeping.
     const latest = merged.items
@@ -320,10 +297,7 @@ function printConfigTable(config) {
   for (const meta of REMINDER_ITEMS) {
     const item = config.items.find((i) => i.key === meta.key);
     if (!item) continue;
-    const channels =
-      [item.channels.email ? "email" : "", item.channels.mattermost ? "mattermost" : ""]
-        .filter(Boolean)
-        .join("+") || "(none)";
+    const channels = item.channels.email ? "email" : "(none)";
     let schedule;
     if (meta.cadence === "daily" && meta.key === "inactivity_alert") {
       schedule = `daily ${item.sendAtIST} after ${item.inactivityDays}d idle`;
@@ -382,7 +356,6 @@ async function evaluateItem({ config, itemKey, now, verbose }) {
   const client = { name: config.clientName || "", email: config.clientEmail };
   const period = { label: window.label, from: window.from, to: window.to };
   const rendered = renderReminderEmail({ kind: itemKey, client, stats, lifetime, period, extra });
-  const mmRendered = renderReminderMattermost({ kind: itemKey, client, stats, lifetime, period, extra });
 
   if (verbose) {
     info(`item:        ${meta.key} — ${meta.label}`);
@@ -428,15 +401,13 @@ async function evaluateItem({ config, itemKey, now, verbose }) {
     }
   }
 
-  return { meta, item, window, stats, lifetime, daysIdle, decision, extra, due, periodKey, rendered, mmRendered, client, period };
+  return { meta, item, window, stats, lifetime, daysIdle, decision, extra, due, periodKey, rendered, client, period };
 }
 
-function printVerdict(ev, { destination, webhook }) {
+function printVerdict(ev, { destination }) {
   const { meta, item, decision, due, periodKey, rendered } = ev;
 
-  const enabledChannels =
-    [item.channels.email ? "email" : "", item.channels.mattermost ? "mattermost" : ""].filter(Boolean).join("+") ||
-    "(none)";
+  const enabledChannels = item.channels.email ? "email" : "(none)";
 
   info(`enabled:     ${item.enabled ? "yes" : "no"}   channels: ${enabledChannels}`);
   info(`due now:     ${due ? "YES" : "no"}${due ? "" : `   (${dueExplanation(ev)})`}`);
@@ -454,9 +425,6 @@ function printVerdict(ev, { destination, webhook }) {
     if (!destination.to) info("email dest:  (none) — no paymentEmail on the tracking doc and no override");
     else info(`email dest:  ${destination.to}   (source: ${destination.source})`);
     if (!isSmtpConfigured()) info("email would be skipped: SMTP is not configured in this environment");
-  }
-  if (item.channels.mattermost) {
-    info(`mattermost:  ${webhook ? maskWebhook(webhook) : "(none stored) — this channel cannot deliver"}`);
   }
 
   info(`subject:     ${rendered ? `"${rendered.subject}"` : "(template returned null)"}`);
@@ -505,11 +473,6 @@ function writePreviews(clientEmail, itemKey, ev) {
     fs.writeFileSync(textPath, `Subject: ${ev.rendered.subject}\n\n${ev.rendered.text}`, "utf8");
     written.push(textPath);
   }
-  if (ev.mmRendered?.text) {
-    const mdPath = path.join(PREVIEW_DIR, `${slug}.mattermost.md`);
-    fs.writeFileSync(mdPath, ev.mmRendered.text, "utf8");
-    written.push(mdPath);
-  }
   return written;
 }
 
@@ -517,19 +480,11 @@ function writePreviews(clientEmail, itemKey, ev) {
 // Outbound
 // ---------------------------------------------------------------------------
 
-async function doSend({ config, itemKey, destination, webhook, now }) {
+async function doSend({ config, itemKey, destination, now }) {
   const item = config.items.find((i) => i.key === itemKey);
 
   // Refuse before the banner, not after: an operator should never see a
   // countdown for a send that was never going to happen.
-  if (OPT.mattermost && !isValidWebhookUrl(webhook)) {
-    bad(
-      webhook
-        ? `--mattermost refused: the stored webhook is not a valid https URL (${maskWebhook(webhook)})`
-        : "--mattermost refused: no Mattermost webhook is stored for this client"
-    );
-    return null;
-  }
   if (OPT.email && !isSmtpConfigured()) {
     bad("--email refused: SMTP is not configured in this environment (SMTP_USER / SMTP_PASS unset)");
     return null;
@@ -543,7 +498,6 @@ async function doSend({ config, itemKey, destination, webhook, now }) {
   lines.push(`client:   ${config.clientEmail}`);
   lines.push(`item:     ${itemKey}`);
   if (OPT.email) lines.push(`EMAIL ->  ${destination.to}   (via SMTP as ${smtpFromEmail() || "(unknown sender)"})`);
-  if (OPT.mattermost) lines.push(`POST  ->  ${maskWebhook(webhook)}`);
   lines.push(
     OPT.force
       ? "force:    ON — empty-period skip bypassed, period key NOT consumed"
@@ -551,14 +505,14 @@ async function doSend({ config, itemKey, destination, webhook, now }) {
   );
   await confirmBanner(lines);
 
-  // channelsOverride keeps the send to exactly the flags given, regardless of
+  // channelsOverride keeps the send to exactly the flag given, regardless of
   // what the saved config has switched on, and is never written back.
   const result = await deliverReminder({
     config,
     itemKey,
     trigger: "verify-script",
     force: OPT.force,
-    channelsOverride: { mattermost: OPT.mattermost, email: OPT.email },
+    channelsOverride: { email: OPT.email },
     now
   });
 
@@ -570,11 +524,6 @@ async function doSend({ config, itemKey, destination, webhook, now }) {
     const e = result.email;
     const line = `email:       attempted=${e.attempted} ok=${e.ok} to=${e.to || "-"}${e.error ? ` error=${e.error}` : ""}`;
     e.ok ? good(line) : bad(line);
-  }
-  if (OPT.mattermost) {
-    const m = result.mattermost;
-    const line = `mattermost:  attempted=${m.attempted} ok=${m.ok}${m.error ? ` error=${m.error}` : ""}`;
-    m.ok ? good(line) : bad(line);
   }
   if (result.status === "skipped") {
     warn(`nothing was sent — ${result.reason}${FORCEABLE.has(result.reason) ? " (re-run with --force to override)" : ""}`);
@@ -670,11 +619,6 @@ async function main() {
   if (saved) good("reminder config: saved document found");
   else info("reminder config: none saved — showing catalogue defaults (this is what the tab would open with)");
 
-  const webhook = normalizeWebhookUrl(config.mattermostWebhookUrl);
-  if (!webhook) info("mattermost webhook: (none stored)");
-  else if (isValidWebhookUrl(webhook)) good(`mattermost webhook: ${maskWebhook(webhook)}`);
-  else bad(`mattermost webhook stored but unusable (must be https): ${maskWebhook(webhook)}`);
-
   // ── 3. Config ──
   section(3, "Reminder config");
   printConfigTable(config);
@@ -718,14 +662,14 @@ async function main() {
   const ev = await evaluateItem({ config, itemKey, now: NOW, verbose: true });
 
   section(5, "Verdict");
-  printVerdict(ev, { destination, webhook });
+  printVerdict(ev, { destination });
 
   let n = 6;
   if (OPT.render) {
     section(n++, "Rendered previews");
     try {
       const files = writePreviews(config.clientEmail, itemKey, ev);
-      if (!files.length) warn("nothing to render — both templates returned null for this item");
+      if (!files.length) warn("nothing to render — the template returned null for this item");
       for (const f of files) good(f);
     } catch (err) {
       bad(`could not write previews: ${err?.message || err}`);
@@ -734,10 +678,10 @@ async function main() {
 
   if (SENDING) {
     section(n++, "Outbound send");
-    await doSend({ config, itemKey, destination, webhook, now: NOW });
+    await doSend({ config, itemKey, destination, now: NOW });
   } else {
     section(n++, "Read-only");
-    info("no --email / --mattermost flag given: nothing was sent and nothing was written to Mongo");
+    info("no --email flag given: nothing was sent and nothing was written to Mongo");
   }
 
   return problems.length ? 1 : 0;
