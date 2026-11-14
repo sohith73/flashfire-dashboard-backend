@@ -172,6 +172,19 @@ let sponsorThrows = null;
 mock.module("../../Utils/usVisaSponsor.js", {
   namedExports: { usSponsorGate: async () => null },
 });
+// "Australia visa sponsors only": null = off; otherwise the employers it accepts.
+// "Europe visa sponsors only": off (no Europe client in these tests).
+mock.module("../../Utils/euVisaSponsor.js", {
+  namedExports: { euSponsorGate: async () => null },
+});
+let auSponsorSet = null;
+mock.module("../../Utils/auVisaSponsor.js", {
+  namedExports: {
+    auSponsorGate: async () => (auSponsorSet
+      ? { check: (company) => (auSponsorSet.has(company) ? null : { error: "NOT_AU_VISA_SPONSOR" }) }
+      : null),
+  },
+});
 
 mock.module("../../Utils/ukVisaSponsor.js", {
   namedExports: {
@@ -231,7 +244,7 @@ function reset() {
   profileDoc = { email: CLIENT, aiThreshold: 50, aiSummary: "RN, 5 years" };
   existingLinks = []; existingOwner = CLIENT; created = []; createThrowsFor = new Set();
   pages = []; termPages = {}; fetchCalls = []; judgeResult = null; judgeCalls = [];
-  sponsorSet = null; sponsorThrows = null;
+  sponsorSet = null; sponsorThrows = null; auSponsorSet = null;
   includedCompanies = [];
 }
 
@@ -660,6 +673,27 @@ test("sponsor-only client with no sponsors in the batch: nothing judged, nothing
   assert.equal(r.body.outcome, "no-sponsors");
   assert.equal(judgeCalls.length, 0);
   assert.equal(created.length, 0);
+});
+
+test("Australian sponsor-only client: non-sponsors are dropped, and the message names Australia", async () => {
+  reset();
+  auSponsorSet = new Set(["Atlassian"]);
+  pages = [{ ok: true, results: [
+    adzJob(1, { company: "Atlassian" }),
+    adzJob(2, { company: "Tiny Agency" }),
+  ] }];
+  judgeResult = judgeAll(["1"]);
+  const r = await run();
+  assert.equal(r.code, 200);
+  assert.deepEqual(judgeCalls[0].jobs.map((j) => j.jobId), ["adz-1"]);
+  assert.equal(r.body.notSponsor, 1);
+
+  reset();
+  auSponsorSet = new Set();
+  pages = [{ ok: true, results: [adzJob(1, { company: "Tiny Agency" })] }];
+  const none = await run();
+  assert.equal(none.body.outcome, "no-sponsors");
+  assert.match(none.body.message, /Australian visa sponsors/);
 });
 
 // ── only these companies ─────────────────────────────────────────────

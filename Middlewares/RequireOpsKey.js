@@ -41,7 +41,8 @@ export default function requireOpsKey(req, res, next) {
 
   if (typeof presented !== "string" || !presented || !timingSafeEquals(presented, expected)) {
     console.warn(`[requireOpsKey] rejected ${req?.method || "?"} ${req?.originalUrl || req?.url || "?"}`);
-    return res.status(401).json({ success: false, message: "unauthorized" });
+    // `success` for the older callers, `ok`/`error` for the { ok, error, message } routes.
+    return res.status(401).json({ success: false, ok: false, error: "unauthorized", message: "unauthorized" });
   }
 
   return next();

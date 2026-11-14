@@ -13,6 +13,8 @@ import { checkCap, detectOvershoot, checkPlanCap, enforcePlanCapPostInsert } fro
 import { jobLinkKey, inspectJobLink, SHARED_FORM_COMPANY_LIMIT } from "../Utils/jobLinkKey.js";
 import { ukSponsorPushBlock } from "../Utils/ukVisaSponsor.js";
 import { usSponsorPushBlock } from "../Utils/usVisaSponsor.js";
+import { auSponsorPushBlock } from "../Utils/auVisaSponsor.js";
+import { euSponsorPushBlock } from "../Utils/euVisaSponsor.js";
 import { companyAllowlistBlock } from "../Utils/companyAllowlist.js";
 import { initialAutoOptimization } from "../Utils/autoOptimizationState.js";
 
@@ -383,6 +385,58 @@ export async function saveToDashboard(req, res) {
                         status: "failed",
                         error: usBlock.error,
                         reason: usBlock.message,
+                    });
+                    continue;
+                }
+
+                // "Australia visa sponsors only" (Utils/auVisaSponsor.js). Fails closed per client.
+                let auBlock;
+                try {
+                    auBlock = await auSponsorPushBlock({ email: userEmail, companyName: company, jobDescription: description });
+                } catch (e) {
+                    console.error("auSponsorPushBlock failed (saveToDashboard):", e.message);
+                    summary.failedWithError++;
+                    summary.details.push({
+                        user: userEmail,
+                        status: "failed",
+                        error: e.code === "AU_SPONSOR_DATA_NOT_LOADED" ? "AU_SPONSOR_DATA_NOT_LOADED" : "SPONSOR_CHECK_FAILED",
+                        reason: "Could not check Australian visa sponsors. Try again shortly.",
+                    });
+                    continue;
+                }
+                if (auBlock) {
+                    summary.failedWithError++;
+                    summary.details.push({
+                        user: userEmail,
+                        status: "failed",
+                        error: auBlock.error,
+                        reason: auBlock.message,
+                    });
+                    continue;
+                }
+
+                // "Europe visa sponsors only" (Utils/euVisaSponsor.js). Fails closed per client.
+                let euBlock;
+                try {
+                    euBlock = await euSponsorPushBlock({ email: userEmail, companyName: company, jobDescription: description, jobLocation: locationStr });
+                } catch (e) {
+                    console.error("euSponsorPushBlock failed (saveToDashboard):", e.message);
+                    summary.failedWithError++;
+                    summary.details.push({
+                        user: userEmail,
+                        status: "failed",
+                        error: e.code === "EU_SPONSOR_DATA_NOT_LOADED" ? "EU_SPONSOR_DATA_NOT_LOADED" : "SPONSOR_CHECK_FAILED",
+                        reason: "Could not check European visa sponsors. Try again shortly.",
+                    });
+                    continue;
+                }
+                if (euBlock) {
+                    summary.failedWithError++;
+                    summary.details.push({
+                        user: userEmail,
+                        status: "failed",
+                        error: euBlock.error,
+                        reason: euBlock.message,
                     });
                     continue;
                 }

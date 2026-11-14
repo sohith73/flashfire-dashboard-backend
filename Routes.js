@@ -112,7 +112,9 @@ import ClientLogin from "./Controllers/Extensions/clientLogin.js";
 import { getSpeedyApplyProfile, saveSpeedyApplyProfile } from "./Controllers/Extensions/speedyApplyProfile.js";
 import { speedyApplyLogin, getSpeedyApplyAccessCode, rotateSpeedyApplyAccessCode } from "./Controllers/Extensions/speedyApplyAccess.js";
 import { listSpeedyApplyOptimizedResumes, getSpeedyApplyOptimizedResumePdf } from "./Controllers/Extensions/speedyApplyResumes.js";
-import { listSpeedyApplyCoverLetters, getSpeedyApplyCoverLetterFile } from "./Controllers/Extensions/speedyApplyCoverLetters.js";
+import { listSpeedyApplyCoverLetters, getSpeedyApplyCoverLetterFile, getSpeedyApplyJobCoverLetter } from "./Controllers/Extensions/speedyApplyCoverLetters.js";
+import { getBaseCoverLetter, putBaseCoverLetter } from "./Controllers/operations/BaseCoverLetter.js";
+import { generateSpeedyApplyCoverLetter } from "./Controllers/Extensions/speedyApplyCoverLetterWriter.js";
 import SpeedyApplyAuth from "./Middlewares/SpeedyApplyAuth.js";
 import { onboardingTick } from "./src/services/onboardingMailWorker.js";
 import { OnboardingMailStatus, SendOnboardingMailStep } from "./Controllers/OnboardingMailStatus.js";
@@ -136,6 +138,8 @@ import UpdateTargetJobs from "./Controllers/UpdateTargetJobs.js";
 import UpdateScrapeSources from "./Controllers/UpdateScrapeSources.js";
 import { GetUkSponsorOnly, UpdateUkSponsorOnly, LookupUkSponsor } from "./Controllers/UkVisaSponsors.js";
 import { GetUsSponsorOnly, UpdateUsSponsorOnly, LookupUsSponsor } from "./Controllers/UsVisaSponsors.js";
+import { GetAuSponsorOnly, UpdateAuSponsorOnly, LookupAuSponsor } from "./Controllers/AuVisaSponsors.js";
+import { GetEuSponsorOnly, UpdateEuSponsorOnly, LookupEuSponsor } from "./Controllers/EuVisaSponsors.js";
 import UpdateOpenaiKey from "./Controllers/UpdateOpenaiKey.js";
 import { GetGlobalOpenaiKey, SetGlobalOpenaiKey } from "./Controllers/GlobalOpenaiKey.js";
 import PushHistory from "./Controllers/PushHistory.js";
@@ -557,6 +561,16 @@ app.get("/us-sponsor-only", GetUsSponsorOnly);
 app.post("/update-us-sponsor-only", UpdateUsSponsorOnly);
 app.get("/us-visa-sponsors/lookup", LookupUsSponsor);
 app.post("/us-visa-sponsors/lookup", LookupUsSponsor);
+// "Australia visa sponsors only" (Controllers/AuVisaSponsors.js). Sponsor data is in memory.
+app.get("/au-sponsor-only", GetAuSponsorOnly);
+app.post("/update-au-sponsor-only", UpdateAuSponsorOnly);
+app.get("/au-visa-sponsors/lookup", LookupAuSponsor);
+app.post("/au-visa-sponsors/lookup", LookupAuSponsor);
+// "Europe visa sponsors only" (Controllers/EuVisaSponsors.js). Sponsor data is in memory.
+app.get("/eu-sponsor-only", GetEuSponsorOnly);
+app.post("/update-eu-sponsor-only", UpdateEuSponsorOnly);
+app.get("/eu-visa-sponsors/lookup", LookupEuSponsor);
+app.post("/eu-visa-sponsors/lookup", LookupEuSponsor);
 app.post("/update-openai-key", UpdateOpenaiKey);
 app.get("/admin/global-openai-key", GetGlobalOpenaiKey);
 app.post("/admin/global-openai-key", SetGlobalOpenaiKey);
@@ -780,6 +794,11 @@ app.post('/operations/reminders/test-mattermost', requireOpsKey, testClientRemin
 app.post('/operations/reminders/preview', requireOpsKey, previewClientReminder);
 app.post('/operations/reminders/history', requireOpsKey, getClientReminderHistory);
 app.post('/operations/reminders/deliveries', requireOpsKey, listReminderDeliveries);
+// Base cover letter (Operations tab): ops key + an operator who manages the
+// client (or an admin). Saving queues the client's job cards for a tailored
+// letter (Executive only, same worker as auto-optimization).
+app.get('/operations/base-cover-letter', requireOpsKey, getBaseCoverLetter);
+app.put('/operations/base-cover-letter', requireOpsKey, putBaseCoverLetter);
 
 //extensions
 app.post('/extension/login', ExtensionLogin);
@@ -813,7 +832,11 @@ app.get('/extension/speedyapply/optimized-resumes/:jobId/pdf', SpeedyApplyAuth, 
 // SpeedyApply cover letters: the client's uploaded cover letter files, sent as
 // stored (not rebuilt by the PDF server).
 app.get('/extension/speedyapply/cover-letters', SpeedyApplyAuth, listSpeedyApplyCoverLetters);
+app.get('/extension/speedyapply/cover-letters/job/:jobId', SpeedyApplyAuth, getSpeedyApplyJobCoverLetter);
 app.get('/extension/speedyapply/cover-letters/:id/file', SpeedyApplyAuth, getSpeedyApplyCoverLetterFile);
+// SpeedyApply cover letter writer (Executive plan): gpt-4o-mini writes a one-page
+// letter for the job on the page and returns it as text; the extension builds the PDF.
+app.post('/extension/speedyapply/cover-letters/generate', SpeedyApplyAuth, generateSpeedyApplyCoverLetter);
 // Shared learning: label aliases merged across all clients (daily, src/services/speedyApplyLearningWorker.js).
 // app.get('/extension/speedyapply/shared-learning', SpeedyApplyAuth, getSpeedyApplySharedLearning);
 // Onboarding email sequence — manual trigger (runs backfill → detect → send-due).

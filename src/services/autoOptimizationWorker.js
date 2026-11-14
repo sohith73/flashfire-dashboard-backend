@@ -4,6 +4,14 @@ import { uploadJSONToR2 } from '../../Utils/r2Storage.js';
 import { sanitizeSectionTitles } from '../../Utils/sectionTitles.js';
 import { DiscordConnect } from '../../Utils/DiscordConnect.js';
 import { buildResumeOptimizationInstructionPrompt } from '../../Utils/resumeOptimizationPrompt.js';
+import { claimNextWork } from '../../Utils/coverLetterQueue.js';
+import {
+  claimNextCoverLetterJob,
+  enqueueCoverLetterIfEligible,
+  markCoverLetterFailed,
+  processCoverLetterJob,
+  recoverStaleCoverLetterJobs
+} from '../../Utils/coverLetterAutoWriter.js';
 
 // ─── Configuration ───────────────────────────────────────────────────
 const RESUME_API_URL = process.env.RESUME_API_URL || 'http://localhost:5000';
@@ -14,6 +22,8 @@ const REQUEST_TIMEOUT_MS = parseInt(process.env.AUTO_OPT_REQUEST_TIMEOUT_MS) || 
 const WORKER_ENABLED = process.env.AUTO_OPT_ENABLED !== 'false';
 const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 const DISCORD_ERROR_URL = process.env.DISCORD_OPTIMIZATION_ERROR_URL;
+// Cover letter jobs are one gpt-4o-mini call each, so a shorter gap is enough.
+const COVER_LETTER_DELAY_MS = parseInt(process.env.AUTO_OPT_CL_DELAY_MS) || 2000;
 
 let isProcessing = false;
 let workerRunning = false;
@@ -316,6 +326,11 @@ async function recoverStaleJobs() {
   if (result.modifiedCount > 0) {
     console.log(`[AutoOptWorker] Recovered ${result.modifiedCount} stale processing job(s)`);
   }
+  try {
+    await recoverStaleCoverLetterJobs();
+  } catch (err) {
+    console.error('[AutoOptWorker] Cover letter stale recovery failed:', err?.message || err);
+  }
 }
 
 // ─── Claim Next Pending Job (Atomic) ─────────────────────────────────
@@ -544,6 +559,28 @@ async function processJob(job) {
 
   const durationSec = ((Date.now() - startMs) / 1000).toFixed(1);
   console.log(`${tag} Completed in ${durationSec}s. R2 key: ${r2Result.key}`);
+
+  // Executive clients with a base letter get this card's cover letter queued.
+  // Never throws: the resume above is saved whatever happens here.
+  await enqueueCoverLetterIfEligible(job, { reason: 'auto-optimized resume saved' });
+}
+
+// ─── Process a Single Cover Letter Job ──────────────────────────────
+// Errors only ever write coverLetterOptimization, never autoOptimization.
+async function runCoverLetterJob(job) {
+  try {
+    await processCoverLetterJob(job);
+  } catch (err) {
+    const attempts = job.coverLetterOptimization?.attempts || 1;
+    console.error(
+      `[AutoOptWorker] [${job.userID}] [${job._id}] Cover letter attempt ${attempts} failed: ${err?.message || err}`
+    );
+    try {
+      await markCoverLetterFailed(job._id, err?.message || String(err), attempts);
+    } catch (markErr) {
+      console.error(`[AutoOptWorker] Could not record the cover letter failure for ${job._id}:`, markErr?.message || markErr);
+    }
+  }
 }
 
 // ─── Polling Loop ────────────────────────────────────────────────────
@@ -551,7 +588,19 @@ async function pollLoop() {
   if (!workerRunning) return;
 
   try {
-    const job = await claimNextJob();
+    // Resume jobs first; a cover letter job only when no resume job is claimable.
+    const work = await claimNextWork({
+      claimResume: claimNextJob,
+      claimCoverLetter: claimNextCoverLetterJob
+    });
+    if (work?.kind === 'cover-letter') {
+      isProcessing = true;
+      await runCoverLetterJob(work.job);
+      isProcessing = false;
+      pollTimer = setTimeout(pollLoop, COVER_LETTER_DELAY_MS);
+      return;
+    }
+    const job = work?.job || null;
     if (job) {
       isProcessing = true;
       try {
