@@ -21,6 +21,7 @@ import {
 } from "../../Utils/reminderItems.js";
 import { ClientPaymentLookup, resolvePaymentEmail } from "../../Schema_Models/ClientPaymentLookup.js";
 import { isSmtpConfigured } from "../../Utils/smtpSender.js";
+import { CLIENT_MAIL_HOLD_REASON } from "../../Utils/clientMailDays.js";
 import { renderReminderEmail } from "../../Utils/reminderTemplates.js";
 import { ReminderDelivery } from "../../Schema_Models/ReminderDelivery.js";
 import { parseDeliveryQuery, DELIVERY_STATUSES, EFFECTIVE_STATUS } from "../../Utils/reminderDeliveryQuery.js";
@@ -371,6 +372,16 @@ export const sendClientReminderNow = async (req, res) => {
       channelsOverride,
       now: new Date()
     });
+
+    // Sunday: client mail is held (Utils/clientMailDays.js). Say so plainly
+    // instead of reporting a successful "skipped".
+    if (result?.reason === CLIENT_MAIL_HOLD_REASON) {
+      return res.status(409).json({
+        success: false,
+        code: CLIENT_MAIL_HOLD_REASON,
+        message: "No client emails go out on Sundays (IST). This one sends on Monday."
+      });
+    }
 
     return res.status(200).json({ success: true, ...result });
   } catch (err) {

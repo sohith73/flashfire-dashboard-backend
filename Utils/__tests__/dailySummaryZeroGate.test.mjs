@@ -56,10 +56,19 @@ test("a broken stats read cannot turn into a zero-count mail", () => {
   }
 });
 
-test("one role added is enough to send", () => {
-  const d = decide(stats(1, 0));
-  assert.equal(d.shouldSend, true);
-  assert.equal(d.reason, "ok");
+test("below 5 added or below 5 applied is a skip; 5 and 5 sends", () => {
+  for (const [a, p] of [[1, 0], [4, 20], [20, 4], [4, 4]]) {
+    const d = decide(stats(a, p));
+    assert.equal(d.shouldSend, false, `${a} added / ${p} applied`);
+    assert.equal(d.reason, "below_minimum");
+    assert.deepEqual(d.extra, { added: a, applied: p, minAdded: 5, minApplied: 5 });
+  }
+  assert.equal(decide(stats(5, 5)).shouldSend, true);
+  assert.equal(decide(stats(30, 12)).reason, "ok");
+});
+
+test("below_minimum can never be forced through", () => {
+  assert.equal(FORCEABLE_REASONS.has("below_minimum"), false);
 });
 
 test("nothing_added can never be forced through", () => {
