@@ -70,6 +70,7 @@ import { sendViaSmtp, isSmtpConfigured } from "../../Utils/smtpSender.js";
 import { resolvePaymentEmail, getActiveUnpausedClients } from "../../Schema_Models/ClientPaymentLookup.js";
 import { ReminderDelivery } from "../../Schema_Models/ReminderDelivery.js";
 import { unsubscribeHeaders, UNSUB_STREAMS } from "../../Utils/unsubscribe.js";
+import { isClientMailOffDay, CLIENT_MAIL_HOLD_REASON } from "../../Utils/clientMailDays.js";
 
 const LOG = "[client-reminders]";
 
@@ -355,9 +356,20 @@ export function nextScheduledSend(item, meta, now = new Date()) {
 
   const atOn = (day) =>
     new Date(Date.parse(`${istDayKey(day)}T00:00:00Z`) - IST_OFFSET_MS + (sendAt.hour * 60 + sendAt.minute) * 60000);
+  // Client items skip the no-mail day (Sunday) and go at the same time on the
+  // next day that allows mail. Internal items still send that day.
+  const heldOn = (day) => !meta.internal && isClientMailOffDay(day);
+  const firstAllowedFrom = (day) => {
+    let d = day;
+    for (let i = 0; i < 7 && heldOn(d); i++) d = new Date(d.getTime() + DAY_MS);
+    return d;
+  };
 
   const todayDone = periodKeyFor(meta.key, now) === String(item.lastPeriodKey || "");
-  if (todayDone) return { itemKey: meta.key, at: atOn(new Date(now.getTime() + DAY_MS)), dueNow: false };
+  const heldToday = heldOn(now);
+  if (todayDone || heldToday) {
+    return { itemKey: meta.key, at: atOn(firstAllowedFrom(new Date(now.getTime() + DAY_MS))), dueNow: false };
+  }
   if (istMinuteOfDay(now) < sendAt.hour * 60 + sendAt.minute) {
     return { itemKey: meta.key, at: atOn(now), dueNow: false };
   }
@@ -683,6 +695,15 @@ export async function deliverReminder({
 
   const item = merged.items.find((i) => i.key === key) || defaultItemConfig(key);
 
+  // No client mail on Sundays (Utils/clientMailDays.js). The tick never gets
+  // here for a client item on that day; this catches an operator's send-now.
+  // Nothing is recorded and no period is used, so Monday sends as normal.
+  if (!meta.internal && isClientMailOffDay(now)) {
+    out.status = "skipped";
+    out.reason = CLIENT_MAIL_HOLD_REASON;
+    return out;
+  }
+
   // A channel override applies to THIS delivery only; it is never written back.
   const channels = channelsOverride
     ? { email: channelsOverride.email === true }
@@ -977,6 +998,8 @@ export async function runReminderTick({ now = new Date() } = {}) {
         const item = merged.items.find((i) => i.key === meta.key);
         if (!item || item.enabled !== true) continue;
         if (!hasEnabledChannel(item.channels)) continue;
+        // Sunday: client items wait for Monday; the team's own alert still runs.
+        if (!meta.internal && isClientMailOffDay(now)) continue;
 
         summary.evaluated += 1;
 

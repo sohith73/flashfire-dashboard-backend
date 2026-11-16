@@ -9,7 +9,7 @@
 // either pruned by the plan gate or not yet due, so sendDue() returns before it
 // can render or deliver anything.
 
-import { test, before, beforeEach, after } from "node:test";
+import { test, before, beforeEach, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import mongoose from "mongoose";
 
@@ -57,7 +57,13 @@ function step(key, { sentAt = null, dueInMs = HOUR } = {}) {
   return { key, subject: "", sendAt: new Date(Date.now() + dueInMs), sentAt, attempts: 0, error: "", messageId: "" };
 }
 
+// sendDue() holds everything on Sundays (IST), so the clock is pinned to a
+// Monday; otherwise this file would fail one day a week.
+const MONDAY_NOON_IST = new Date("2026-11-16T12:00:00+05:30");
+const SUNDAY_NOON_IST = new Date("2026-11-15T12:00:00+05:30");
+
 before(() => {
+  mock.timers.enable({ apis: ["Date"], now: MONDAY_NOON_IST });
   orig.find = OnboardingMailState.find;
   orig.findOne = ClientPaymentLookup.findOne;
   OnboardingMailState.find = () => thenable(() => docs);
@@ -68,6 +74,7 @@ before(() => {
 });
 
 after(() => {
+  mock.timers.reset();
   OnboardingMailState.find = orig.find;
   ClientPaymentLookup.findOne = orig.findOne;
 });
@@ -182,5 +189,21 @@ test("the base résumé step is never gated and costs no plan lookup", async () 
     assert.equal(lookups, 0, "gating base_resume would add a query per client per tick for no reason");
   } finally {
     ClientPaymentLookup.findOne = prevFindOne;
+  }
+});
+
+// ── Sundays ───────────────────────────────────────────────────────────────
+
+test("on a Sunday (IST) nothing is sent and the overdue step keeps its place", async () => {
+  mock.timers.setTime(SUNDAY_NOON_IST.getTime());
+  try {
+    const doc = makeDoc("sun@example.com", "professional", [step("base_resume", { dueInMs: -HOUR })]);
+    docs = [doc];
+    const out = await sendDue();
+    assert.deepEqual(out, { sent: 0, skipped: "sunday_hold" });
+    assert.equal(doc.steps[0].attempts, 0, "no attempt is burned");
+    assert.equal(doc.saved, 0);
+  } finally {
+    mock.timers.setTime(MONDAY_NOON_IST.getTime());
   }
 });
