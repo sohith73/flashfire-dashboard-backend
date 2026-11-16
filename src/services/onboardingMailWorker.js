@@ -34,6 +34,7 @@ import { JobModel } from "../../Schema_Models/JobModel.js";
 import { ClientPaymentLookup } from "../../Schema_Models/ClientPaymentLookup.js";
 import { OnboardingMailState, ONBOARDING_BACKFILL_MARKER } from "../../Schema_Models/OnboardingMailState.js";
 import { sendViaSmtp, isSmtpConfigured, isMailCategoryPaused, MAIL_CATEGORY } from "../../Utils/smtpSender.js";
+import { isClientMailOffDay, CLIENT_MAIL_HOLD_REASON } from "../../Utils/clientMailDays.js";
 import { renderOnboardingEmail } from "../../Utils/onboardingMailTemplates.js";
 import { unsubscribeHeaders, UNSUB_STREAMS } from "../../Utils/unsubscribe.js";
 
@@ -210,6 +211,10 @@ export async function sendDue() {
   // 'onboarding' there stops us here WITHOUT burning attempt counters.
   if (isMailCategoryPaused(MAIL_CATEGORY.ONBOARDING)) return { sent: 0, skipped: "emails_paused" };
   if (!isSmtpConfigured()) return { sent: 0, skipped: "smtp_not_configured" };
+  // No client mail on Sundays (Utils/clientMailDays.js). Steps keep their
+  // place and attempts; the first due one goes out from Monday 00:00 IST and
+  // the spacing check below still holds the rest apart.
+  if (isClientMailOffDay()) return { sent: 0, skipped: CLIENT_MAIL_HOLD_REASON };
 
   const docs = await OnboardingMailState.find({ status: "scheduled" }).catch(() => []);
   let sent = 0;

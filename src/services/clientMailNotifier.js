@@ -21,6 +21,7 @@
 import { MailDigest } from "../../Schema_Models/MailDigest.js";
 import { sendEmail, isSendgridConfigured } from "../../Utils/sendgridClient.js";
 import { sendViaSmtp, isSmtpConfigured, isMailCategoryPaused, MAIL_CATEGORY } from "../../Utils/smtpSender.js";
+import { isClientMailOffDay } from "../../Utils/clientMailDays.js";
 import {
   renderClientMilestoneEmail,
   NOTIFIABLE_CATEGORIES
@@ -142,7 +143,7 @@ export async function readInboxAlertConfig(clientEmail) {
  * Send the milestone alert for one already-persisted, eligible digest.
  * Records the outcome on the digest. Never throws.
  *
- * @returns {"sent"|"skipped"|"failed"|"disabled"|"already"}
+ * @returns {"sent"|"skipped"|"failed"|"disabled"|"already"|"held"}
  */
 export async function notifyClientForDigest({ digestDoc, client, mailbox }) {
   if (!ENABLED) return "disabled";
@@ -214,6 +215,12 @@ export async function notifyClientForDigest({ digestDoc, client, mailbox }) {
     return "skipped";
   }
 
+  // No client mail on Sundays (Utils/clientMailDays.js). Held, not skipped:
+  // no attempt is burned and no skip reason is stored, so the retry sweep
+  // sends it from Monday 00:00 IST. A Sunday alert is under 24h old by then,
+  // well inside MAX_ALERT_AGE_HOURS.
+  if (isClientMailOffDay()) return "held";
+
   const { subject, html, text } = renderClientMilestoneEmail({
     client,
     digest: digestDoc,
@@ -284,6 +291,8 @@ export async function notifyClientForDigest({ digestDoc, client, mailbox }) {
  */
 export async function retryPendingClientNotifications({ gmailEmail, client, limit = 25 }) {
   if (!ENABLED || !isChannelConfigured()) return 0;
+  // Sunday: everything would come back "held", so skip the query entirely.
+  if (isClientMailOffDay()) return 0;
 
   const pending = await MailDigest.find({
     gmailEmail,
