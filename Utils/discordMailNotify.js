@@ -419,8 +419,12 @@ export async function notifyMailDigest({ client = {}, mailbox, digest = {}, file
  *
  * @param {Object} a - { scannedClients, connectedMailboxes, notConnected,
  *                        totalMails, usefulMails, windowHours, dateLabel }
+ * @param {Object} [opts]
+ * @param {Array}  [opts.extraEmbeds] - more cards on the same message (the
+ *                        client email breakdown), so "one message each
+ *                        follows" stays true
  */
-export async function notifyDailySummaryHeader(a = {}) {
+export async function notifyDailySummaryHeader(a = {}, { extraEmbeds = [] } = {}) {
   const useful = Number(a.usefulMails || 0);
   const embed = {
     title: "📊 Daily Mail Summary",
@@ -441,7 +445,9 @@ export async function notifyDailySummaryHeader(a = {}) {
   } else {
     embed.fields.push({ name: "Result", value: `${useful} useful mail(s) — one message each follows. ⬇️`, inline: false });
   }
-  return postToWebhook(MAIL_WEBHOOK, { embeds: [embed], allowed_mentions: { parse: [] } });
+  // Discord takes up to 10 embeds per message.
+  const embeds = [embed, ...extraEmbeds.filter(Boolean)].slice(0, 10);
+  return postToWebhook(MAIL_WEBHOOK, { embeds, allowed_mentions: { parse: [] } });
 }
 
 const USEFUL_META = {

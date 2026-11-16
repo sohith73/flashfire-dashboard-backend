@@ -27,6 +27,7 @@ import {
   notifyDailySummaryHeader,
   notifyUsefulMailLine
 } from "../../Utils/discordMailNotify.js";
+import { collectClientMailRows, summarizeClientMail, buildClientMailEmbed } from "./clientMailSummary.js";
 
 // ─── Fixed tuning (hard-coded; no env knobs) ─────────────────────────
 const SUMMARY_WINDOW_HOURS = 24; // daily summary looks back this far
@@ -82,7 +83,8 @@ export async function sendDailySummary() {
     return { skipped: "no_webhook" };
   }
 
-  const since = new Date(Date.now() - SUMMARY_WINDOW_HOURS * 3600 * 1000);
+  const until = new Date();
+  const since = new Date(until.getTime() - SUMMARY_WINDOW_HOURS * 3600 * 1000);
   const [clients, index] = await Promise.all([getActiveUnpausedClients(), buildMailboxIndex()]);
 
   let connectedCount = 0;
@@ -104,11 +106,18 @@ export async function sendDailySummary() {
     $or: [{ opsNotifyEligible: true }, { opsNotifyEligible: { $exists: false }, clientNotifyEligible: true }]
   };
 
-  const [totalMails, usefulInWindow, usefulDocs] = await Promise.all([
+  const [totalMails, usefulAll, usefulDocs] = await Promise.all([
     MailDigest.countDocuments({ date: { $gte: since } }).catch(() => 0),
-    // Headline count = every verified milestone in the window, posted or not.
-    // usefulDocs below is only the unposted remainder; do not conflate them.
-    MailDigest.countDocuments(verifiedMilestone).catch(() => 0),
+    // Headline count = every verified milestone in the window, posted or not,
+    // with the client-alert fields so the client card can say what happened
+    // to each. usefulDocs below is only the unposted remainder; do not
+    // conflate them.
+    MailDigest.find(verifiedMilestone)
+      .select(
+        "gmailEmail ownerEmail clientNotifyEligible clientNotifiedAt clientNotifySkippedReason clientNotifyError"
+      )
+      .lean()
+      .catch(() => []),
     // discordPostedAt: null keeps this a catch-up, not a re-post: the poll
     // stamps every line it delivers, so only the handful it failed to deliver
     // (webhook 5xx, a crash between post and stamp) are left for 5 AM.
@@ -128,7 +137,20 @@ export async function sendDailySummary() {
   const clientNameFor = (d) =>
     nameByAddr.get(lc(d.gmailEmail)) || nameByAddr.get(lc(d.ownerEmail)) || lc(d.gmailEmail) || "A client";
 
-  // Header first.
+  const usefulInWindow = usefulAll.length;
+
+  // Client email breakdown for the same window. A read failure still posts
+  // the header, with an error card in place of the numbers.
+  let clientMail = null;
+  let clientMailError = "";
+  try {
+    clientMail = summarizeClientMail(await collectClientMailRows({ since, until, usefulDocs: usefulAll }));
+  } catch (e) {
+    clientMailError = e?.message || String(e);
+    console.error(`[mail-monitor] client email breakdown failed: ${clientMailError}`);
+  }
+
+  // Header first, with the client card on the same message.
   await notifyDailySummaryHeader({
     scannedClients: clients.length,
     connectedMailboxes: connectedCount,
@@ -137,7 +159,7 @@ export async function sendDailySummary() {
     usefulMails: usefulInWindow,
     windowHours: SUMMARY_WINDOW_HOURS,
     dateLabel: new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" })
-  });
+  }, { extraEmbeds: [buildClientMailEmbed(clientMail, { error: clientMailError })] });
 
   // Then one message per useful mail.
   let posted = 0;
@@ -173,7 +195,16 @@ export async function sendDailySummary() {
 
   console.log(
     `[mail-monitor] daily summary — clients=${clients.length} connected=${connectedCount} ` +
-      `notConnected=${notConnected} mails=${totalMails} useful=${usefulInWindow} catchUpPosted=${posted}`
+      `notConnected=${notConnected} mails=${totalMails} useful=${usefulInWindow} catchUpPosted=${posted} ` +
+      `clientsEmailed=${clientMail ? clientMail.clientsEmailed : "error"}`
   );
-  return { clients: clients.length, connectedCount, notConnected, totalMails, useful: usefulInWindow, posted };
+  return {
+    clients: clients.length,
+    connectedCount,
+    notConnected,
+    totalMails,
+    useful: usefulInWindow,
+    posted,
+    clientMail: clientMail || { error: clientMailError }
+  };
 }

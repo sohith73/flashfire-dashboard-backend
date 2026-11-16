@@ -102,6 +102,9 @@ test("5 AM catch-up posts only the verified milestone and counts only verified o
 
   // One header + exactly one catch-up line.
   assert.equal(hits.length, 2, JSON.stringify(hits.map((h) => h.embeds?.[0]?.title)));
+  // The client email card rides on the header message. Its sources are not
+  // stubbed here, so it shows the error card; the header still goes out.
+  assert.equal(hits[0].embeds[1]?.title, "📨 Client Emails Sent");
   const line = hits[1].embeds[0];
   assert.match(line.title, /Interview/);
   assert.match(line.description, /Interview invitation - Acme/);
