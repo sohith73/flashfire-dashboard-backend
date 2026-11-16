@@ -40,11 +40,16 @@ export const REMINDER_ITEMS = [
     key: "daily_summary",
     label: "Daily activity summary",
     description:
-      "Jobs added and applications submitted for the client today, with the companies and roles.",
+      "Jobs added and applications submitted for the client today, with the companies and roles. Sent only on days with at least 5 added and 5 applied, never on Sundays.",
     cadence: "daily",
     activityGated: true,
     // Zero roles added = no mail, ever. Not even a forced send-now.
     gateOn: "added",
+    // And a light day stays silent too (bsc, 2026-11-16): fewer than 5 roles
+    // added OR fewer than 5 applied means no mail. Shown as "below 5" in the
+    // clients-tracking Notifications tab. Not forceable either.
+    minAdded: 5,
+    minApplied: 5,
     scheduleFields: ["sendAtIST", "autoOnThreshold"],
     defaults: {
       enabled: true,

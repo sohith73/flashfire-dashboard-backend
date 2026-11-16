@@ -99,7 +99,7 @@ export const FORCEABLE_REASONS = new Set([
   "client_is_active",
 ]);
 
-// 'nothing_added' is deliberately NOT in that set. A daily summary whose only
+// 'nothing_added' and 'below_minimum' are deliberately NOT in that set. A daily summary whose only
 // number is zero is not a template an operator needs to prove on a quiet day -
 // it is the exact mail the client should never receive ("Daily update: 0 new
 // roles added"), so there is no button that sends it. Preview renders it
@@ -482,7 +482,15 @@ export function decideDelivery({ meta, item, stats, lifetime, inactivityDays, da
     // Utils/reminderItems.js for why "any" is not good enough for an item
     // whose subject line carries a single figure.
     if (meta.gateOn === "added") {
-      if ((Number(st.addedCount) || 0) <= 0) return { shouldSend: false, reason: "nothing_added" };
+      const added = Number(st.addedCount) || 0;
+      const applied = Number(st.appliedCount) || 0;
+      if (added <= 0) return { shouldSend: false, reason: "nothing_added" };
+      // A light day stays silent: both figures must reach the item's minimum.
+      const minAdded = Number(meta.minAdded) || 0;
+      const minApplied = Number(meta.minApplied) || 0;
+      if (added < minAdded || applied < minApplied) {
+        return { shouldSend: false, reason: "below_minimum", extra: { added, applied, minAdded, minApplied } };
+      }
     } else if (st.isEmpty === true) {
       return { shouldSend: false, reason: "no_activity" };
     }
