@@ -21,6 +21,12 @@ const scrapeCostDailySchema = new mongoose.Schema(
         stage1OutputTokens: { type: Number, default: 0 },
         stage1Batches: { type: Number, default: 0 },
         stage1Measured: { type: Boolean, default: false },
+        // Stage 1 batches judged by Claude (not billed by OpenAI) — tracked
+        // separately; notional = what the same tokens would cost at gpt-4o-mini rates.
+        stage1ClaudeBatches: { type: Number, default: 0 },
+        stage1ClaudeInputTokens: { type: Number, default: 0 },
+        stage1ClaudeOutputTokens: { type: Number, default: 0 },
+        stage1ClaudeNotionalUsd: { type: Number, default: 0 },
 
         // Stage 2 — second judge.
         stage2Usd: { type: Number, default: 0 },
