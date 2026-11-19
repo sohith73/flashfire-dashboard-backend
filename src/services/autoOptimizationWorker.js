@@ -451,6 +451,9 @@ async function processJob(job) {
     leadership: checkboxStates.showLeadership ? resumePayload.leadership : [],
     publications: resumePayload.publications || []
   };
+  delete filteredResume.certifications;
+  delete filteredResume.therapeuticAreas;
+  delete filteredResume.customSections;
 
   // Step 3: Call optimize-with-gemini (resume_id triggers Discord/token tracking when configured)
   const optimizeBody = {
@@ -478,6 +481,14 @@ async function processJob(job) {
     const err = new Error('Optimization returned empty/invalid data');
     err._stage = 'Gemini Optimization Response Validation';
     throw err;
+  }
+
+  // Operator-entered facts are never rewritten by the AI (the resume builder
+  // does the same in Optimizer.tsx). The model returns only what it echoes, so
+  // a response without "certifications" would save an optimized resume that
+  // has none, even though the base resume does.
+  for (const field of ['certifications', 'therapeuticAreas', 'customSections']) {
+    if (resumePayload[field] !== undefined) optimizedData[field] = resumePayload[field];
   }
 
   // Guard: if Gemini dropped work experience entries, restore the missing originals.
@@ -528,7 +539,12 @@ async function processJob(job) {
   ];
 
   // Baseline must match the exact JSON sent to optimize-with-gemini
+  // The restored operator fields are unchanged by definition, so they belong in
+  // the baseline too or the diff reports them as added.
   const baselineForDiff = { ...filteredResume };
+  for (const field of ['certifications', 'therapeuticAreas', 'customSections']) {
+    if (resumePayload[field] !== undefined) baselineForDiff[field] = resumePayload[field];
+  }
   const changesMade = buildOptimizationChangesMade(baselineForDiff, optimizedData);
 
   await JobModel.findByIdAndUpdate(job._id, {
