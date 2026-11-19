@@ -44,8 +44,8 @@ test("a standard resume is built the way the job card's Download builds it", () 
     medical: false,
     scale: 0.9,
   });
-  assert.deepEqual(p.checkboxStates, { showSummary: true, showProjects: true, showLeadership: true, showPublications: false, showCertifications: false });
-  assert.deepEqual(p.sectionOrder, ["personalInfo", "summary", "workExperience"]);
+  assert.deepEqual(p.checkboxStates, { showSummary: true, showProjects: true, showLeadership: true, showPublications: false, showCertifications: true });
+  assert.deepEqual(p.sectionOrder, ["personalInfo", "summary", "workExperience", "certifications"]);
   assert.equal(p.scale, 0.9);
   assert.equal(p.overrideAutoScale, true);
   assert.equal("therapeuticAreas" in p, false);
@@ -54,8 +54,19 @@ test("a standard resume is built the way the job card's Download builds it", () 
 
 test("a standard resume with publications on gets a publications slot", () => {
   const p = buildPdfPayload({ optimizedResume: { showPublications: true, sectionOrder: ["personalInfo", "summary"] }, resumeData: resume, medical: false, scale: 1 });
-  assert.deepEqual(p.sectionOrder, ["personalInfo", "summary", "publications"]);
+  assert.deepEqual(p.sectionOrder, ["personalInfo", "summary", "publications", "certifications"]);
   assert.equal(p.checkboxStates.showPublications, true);
+});
+
+test("a standard resume without certification content leaves the section off", () => {
+  const p = buildPdfPayload({
+    optimizedResume: { sectionOrder: ["personalInfo", "summary", "certifications"] },
+    resumeData: { ...resume, certifications: [{ title: "", issuer: " " }] },
+    medical: false,
+    scale: 1,
+  });
+  assert.equal(p.checkboxStates.showCertifications, false);
+  assert.equal(p.sectionOrder.includes("certifications"), false);
 });
 
 test("a medical resume shows sections that have content and keeps therapeutic areas", () => {

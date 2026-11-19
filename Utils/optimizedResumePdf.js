@@ -74,10 +74,12 @@ export function buildPdfPayload({ optimizedResume, resumeData, medical, scale })
     }
   } else {
     // ResumePreview on a job card: publications follow their flag, and
-    // certifications are off.
+    // certifications show whenever the resume has any.
     if (showPublications && !order.includes("publications")) order.push("publications");
     if (!showPublications) order = order.filter((id) => id !== "publications");
-    order = order.filter((id) => id !== "certifications");
+    showCertifications = (d.certifications || []).some((c) => hasText(c?.title) || hasText(c?.issuer));
+    if (showCertifications && !order.includes("certifications")) order.push("certifications");
+    if (!showCertifications) order = order.filter((id) => id !== "certifications");
   }
 
   const payload = {
