@@ -22,6 +22,72 @@ function triggerResumeAttachRebuild(email, reason) {
     });
 }
 
+/**
+ * The one place a resume gets attached to a client. The admin button
+ * (POST /admin/assign-resume-to-user) and the auto-link on resume creation
+ * (Controllers/Admin/AutoLinkResume.js) both call this, so they cannot drift.
+ *
+ * Returns { outcome, user, previousResumeId, resumeIndexSynced }, where outcome
+ * is "assigned" | "user_not_found" | "already_assigned".
+ *
+ * `onlyIfUnassigned` is the auto-link guard: the claim on the client is one
+ * conditional update, so two resumes created at once for the same client cannot
+ * both win, and a client who already has a resume is left alone. The manual
+ * path leaves it off and keeps its replace-on-purpose behaviour.
+ */
+export async function assignResumeToUser(userEmail, resumeId, { onlyIfUnassigned = false } = {}) {
+    const user = await UserModel.findOne({ email: userEmail });
+    if (!user) return { outcome: "user_not_found" };
+
+    const existingResumeId = user.assignedResumeId;
+
+    const syncResumeIndex = async () => {
+        const resumeApiUrl = process.env.RESUME_API_URL || "http://localhost:5000";
+        try {
+            const updateRes = await fetch(`${resumeApiUrl}/api/update-resume-user-email`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ resumeId, userEmail }),
+                signal: AbortSignal.timeout(8000),
+            });
+            if (!updateRes.ok) {
+                console.error("Failed to update ResumeIndex userEmail");
+                return false;
+            }
+            return true;
+        } catch (err) {
+            console.error("Error updating ResumeIndex:", err);
+            return false;
+        }
+    };
+
+    let updatedUser;
+    let resumeIndexSynced;
+    if (onlyIfUnassigned) {
+        updatedUser = await UserModel.findOneAndUpdate(
+            {
+                _id: user._id,
+                $or: [{ assignedResumeId: null }, { assignedResumeId: "" }, { assignedResumeId: { $exists: false } }],
+            },
+            { $set: { assignedResumeId: resumeId } },
+            { new: true, runValidators: false }
+        );
+        if (!updatedUser) return { outcome: "already_assigned", user };
+        resumeIndexSynced = await syncResumeIndex();
+    } else {
+        resumeIndexSynced = await syncResumeIndex();
+        updatedUser = await UserModel.findOneAndUpdate(
+            { email: userEmail },
+            { $set: { assignedResumeId: resumeId } },
+            { new: true, runValidators: false }
+        );
+        if (!updatedUser) return { outcome: "user_not_found" };
+    }
+
+    triggerResumeAttachRebuild(userEmail, "resume-assign");
+    return { outcome: "assigned", user: updatedUser, previousResumeId: existingResumeId, resumeIndexSynced };
+}
+
 export default async function AssignResumeToUser(req, res) {
     try {
         const { userEmail, resumeId } = req.body;
@@ -33,46 +99,15 @@ export default async function AssignResumeToUser(req, res) {
             });
         }
 
-        const user = await UserModel.findOne({ email: userEmail });
-        
-        if (!user) {
+        const result = await assignResumeToUser(userEmail, resumeId);
+        if (result.outcome === "user_not_found") {
             return res.status(404).json({ 
                 success: false, 
                 message: "User not found" 
             });
         }
 
-        const existingResumeId = user.assignedResumeId;
-        
-        const resumeApiUrl = process.env.RESUME_API_URL || "http://localhost:5000";
-        try {
-            const updateRes = await fetch(`${resumeApiUrl}/api/update-resume-user-email`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ resumeId, userEmail })
-            });
-            
-            if (!updateRes.ok) {
-                console.error("Failed to update ResumeIndex userEmail");
-            }
-        } catch (err) {
-            console.error("Error updating ResumeIndex:", err);
-            
-        }
-        const updatedUser = await UserModel.findOneAndUpdate(
-            { email: userEmail },
-            { $set: { assignedResumeId: resumeId } },
-            { new: true, runValidators: false }
-        );
-        
-        if (!updatedUser) {
-            return res.status(404).json({ 
-                success: false, 
-                message: "User not found after update" 
-            });
-        }
-
-        triggerResumeAttachRebuild(userEmail, "resume-assign");
+        const { user: updatedUser, previousResumeId: existingResumeId } = result;
         return res.status(200).json({
             success: true,
             message: existingResumeId 
@@ -94,4 +129,3 @@ export default async function AssignResumeToUser(req, res) {
         });
     }
 }
-
