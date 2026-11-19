@@ -160,7 +160,7 @@ export function mergeSessionRows(rows) {
         const m = r.modelStats || {};
         let cur = bySession.get(key);
         if (!cur) {
-            cur = { captures: 0, series: { openaiBatches: [], geminiBatches: [], inputTokens: [], outputTokens: [], cachedTokens: [] }, rows: 0 };
+            cur = { captures: 0, series: { openaiBatches: [], geminiBatches: [], inputTokens: [], outputTokens: [], cachedTokens: [], claudeBatches: [], claudeInputTokens: [], claudeOutputTokens: [] }, rows: 0 };
             bySession.set(key, cur);
         }
         cur.captures = Math.max(cur.captures, r.captures || 0); // fully overlapping
@@ -169,6 +169,9 @@ export function mergeSessionRows(rows) {
         cur.series.inputTokens.push(m.inputTokens || 0);
         cur.series.outputTokens.push(m.outputTokens || 0);
         cur.series.cachedTokens.push(m.cachedTokens || 0);
+        cur.series.claudeBatches.push(m.claudeBatches || 0);
+        cur.series.claudeInputTokens.push(m.claudeInputTokens || 0);
+        cur.series.claudeOutputTokens.push(m.claudeOutputTokens || 0);
         cur.rows += 1;
     }
     for (const s of bySession.values()) {
@@ -177,10 +180,14 @@ export function mergeSessionRows(rows) {
         s.inputTokens = sumWithResets(s.series.inputTokens);
         s.outputTokens = sumWithResets(s.series.outputTokens);
         s.cachedTokens = sumWithResets(s.series.cachedTokens);
+        s.claudeBatches = sumWithResets(s.series.claudeBatches);
+        s.claudeInputTokens = sumWithResets(s.series.claudeInputTokens);
+        s.claudeOutputTokens = sumWithResets(s.series.claudeOutputTokens);
     }
     const out = {
         captures: 0, openaiBatches: 0, geminiBatches: 0,
         inputTokens: 0, outputTokens: 0, cachedTokens: 0,
+        claudeBatches: 0, claudeInputTokens: 0, claudeOutputTokens: 0,
         sessions: bySession.size,
         // How many rows were folded away. Non-zero means evictions happened and
         // the OLD totals were inflated by exactly this much duplication.
@@ -193,6 +200,9 @@ export function mergeSessionRows(rows) {
         out.inputTokens += s.inputTokens;
         out.outputTokens += s.outputTokens;
         out.cachedTokens += s.cachedTokens;
+        out.claudeBatches += s.claudeBatches;
+        out.claudeInputTokens += s.claudeInputTokens;
+        out.claudeOutputTokens += s.claudeOutputTokens;
         out.duplicateRows += s.rows - 1;
     }
     return out;
@@ -235,22 +245,44 @@ async function getTodaySecondJudgeRuns() {
 // ─── Stage 1 cost: measured when possible ────────────────────────────
 // Returns { measured, batches, inputTokens, cachedTokens, outputTokens, usd, cacheSavedUsd }
 export function stage1Cost(ext, scrapedJobs) {
+    // Claude batches (judged through the local bridge) are NOT billed by OpenAI.
+    // They are reported on their own line, with what the same tokens would have
+    // cost at gpt-4o-mini rates shown as a notional figure only.
+    const claude = {
+        batches: ext.claudeBatches || 0,
+        inputTokens: ext.claudeInputTokens || 0,
+        outputTokens: ext.claudeOutputTokens || 0,
+        notionalUsd: 0,
+    };
+    if (claude.inputTokens > 0 || claude.outputTokens > 0) {
+        claude.notionalUsd = priceTokens({
+            model: STAGE1_MODEL,
+            inputTokens: claude.inputTokens,
+            cachedTokens: 0,
+            outputTokens: claude.outputTokens,
+        }).usd;
+    }
+    const hasClaude = claude.batches > 0 || claude.inputTokens > 0 || claude.outputTokens > 0;
+
     const hasRealTokens = (ext.inputTokens || 0) > 0 || (ext.outputTokens || 0) > 0;
-    if (hasRealTokens) {
+    if (hasRealTokens || hasClaude) {
+        // GPT pool: whatever was actually judged by OpenAI/Gemini (may be empty
+        // on a day where every batch went to Claude -> $0 billed, still measured).
         const p = priceTokens({
             model: STAGE1_MODEL,
-            inputTokens: ext.inputTokens,
-            cachedTokens: ext.cachedTokens,
-            outputTokens: ext.outputTokens,
+            inputTokens: ext.inputTokens || 0,
+            cachedTokens: ext.cachedTokens || 0,
+            outputTokens: ext.outputTokens || 0,
         });
         return {
             measured: true,
             batches: (ext.openaiBatches || 0) + (ext.geminiBatches || 0),
-            inputTokens: ext.inputTokens,
-            cachedTokens: ext.cachedTokens,
-            outputTokens: ext.outputTokens,
+            inputTokens: ext.inputTokens || 0,
+            cachedTokens: ext.cachedTokens || 0,
+            outputTokens: ext.outputTokens || 0,
             usd: p.usd,
             cacheSavedUsd: p.cacheSavedUsd,
+            claude,
         };
     }
     // Fallback — extension build too old to report usage.
@@ -267,6 +299,7 @@ export function stage1Cost(ext, scrapedJobs) {
         outputTokens,
         usd: p.usd,
         cacheSavedUsd: p.cacheSavedUsd,
+        claude,
     };
 }
 
@@ -391,16 +424,23 @@ async function fireDiscord(milestone, r, today) {
 
     const fields = [
         { name: "Today scraped", value: `**${r.scraped.toLocaleString()}** jobs`, inline: true },
-        { name: "Judge batches", value: `${s1.batches.toLocaleString()} × ${BATCH_SIZE} jobs`, inline: true },
-        { name: "Model", value: `\`${r.model}\``, inline: true },
+        { name: "Judge batches (ChatGPT)", value: `${s1.batches.toLocaleString()} × ${BATCH_SIZE} jobs`, inline: true },
+        { name: "Judge batches (Claude)", value: `${(s1.claude?.batches || 0).toLocaleString()} × ${BATCH_SIZE} jobs`, inline: true },
 
-        { name: `Input tokens (${tag})`, value: s1.inputTokens.toLocaleString(), inline: true },
-        { name: `Output tokens (${tag})`, value: s1.outputTokens.toLocaleString(), inline: true },
+        { name: `ChatGPT input tokens (${tag})`, value: s1.inputTokens.toLocaleString(), inline: true },
+        { name: `ChatGPT output tokens (${tag})`, value: s1.outputTokens.toLocaleString(), inline: true },
         { name: "Cached input (50% off)", value: `${s1.cachedTokens.toLocaleString()} (${cachePct}%)`, inline: true },
 
         {
-            name: `1️⃣ Stage 1 — extension scraper judge (${tag})`,
+            name: `1️⃣ Stage 1 — ChatGPT (${r.model}) extension judge (${tag}, billed by OpenAI)`,
             value: `${both(s1.usd)} · ${stage1Pct}% of scrape cost`,
+            inline: false,
+        },
+        {
+            name: "1️⃣ Stage 1 — Claude extension judge (NOT billed by OpenAI)",
+            value: (s1.claude && s1.claude.batches > 0)
+                ? `${s1.claude.batches.toLocaleString()} batches · ${s1.claude.inputTokens.toLocaleString()} in / ${s1.claude.outputTokens.toLocaleString()} out tokens · $0 OpenAI (would be ${both(s1.claude.notionalUsd)} at gpt-4o-mini rates — not counted in the total)`
+                : "none today",
             inline: false,
         },
         {
@@ -411,7 +451,7 @@ async function fireDiscord(milestone, r, today) {
             inline: false,
         },
         {
-            name: "💵 SCRAPE PIPELINE COST (stage 1 + stage 2)",
+            name: "💵 SCRAPE PIPELINE COST — ChatGPT only (stage 1 ChatGPT + stage 2)",
             value: `**${both(r.totalUsd)}**  ·  per job $${r.perJobUsd.toFixed(6)} · ₹${inr(r.perJobUsd).toFixed(4)}`,
             inline: false,
         },
@@ -496,6 +536,10 @@ export async function snapshotTodayScrapeCost() {
                     stage1OutputTokens: r.stage1.outputTokens,
                     stage1Batches: r.stage1.batches,
                     stage1Measured: r.stage1.measured,
+                    stage1ClaudeBatches: r.stage1.claude?.batches || 0,
+                    stage1ClaudeInputTokens: r.stage1.claude?.inputTokens || 0,
+                    stage1ClaudeOutputTokens: r.stage1.claude?.outputTokens || 0,
+                    stage1ClaudeNotionalUsd: r.stage1.claude?.notionalUsd || 0,
                     stage2Usd: r.stage2Usd,
                     totalUsd: r.totalUsd,
                     perJobUsd: r.perJobUsd,

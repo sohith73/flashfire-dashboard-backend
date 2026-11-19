@@ -71,6 +71,11 @@ const extensionSessionStatSchema = new mongoose.Schema({
         inputTokens:   { type: Number, default: 0 },
         outputTokens:  { type: Number, default: 0 },
         cachedTokens:  { type: Number, default: 0 }, // cached input (billed at 50%)
+        // Batches judged by Claude (via a local OpenAI-compatible bridge). Kept
+        // apart from the OpenAI fields above so they are never priced as gpt-4o-mini.
+        claudeBatches:      { type: Number, default: 0 },
+        claudeInputTokens:  { type: Number, default: 0 },
+        claudeOutputTokens: { type: Number, default: 0 },
     },
     startedAt:     { type: Date, default: null },
     endedAt:       { type: Date, default: () => new Date(), index: true },
