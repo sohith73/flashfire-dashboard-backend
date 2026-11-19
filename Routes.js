@@ -76,6 +76,7 @@ import GetBaseResumeData from "./Controllers/GetBaseResumeData.js";
 import { assignUserToOperations } from "./Controllers/Admin/AssignUserToOperatios.js";
 import { listOperations, removeManagedUser, removeOperationUser, listAllUsers, listAllOperations, updateOperation } from "./Controllers/Admin/ListOperations.js";
 import AssignResumeToUser from "./Controllers/Admin/AssignResumeToUser.js";
+import AutoLinkResume from "./Controllers/Admin/AutoLinkResume.js";
 import { OperationsLogin, OperationsRegister } from "./Controllers/operations/Login.js";
 import { requestDashboardOtp, verifyDashboardOtp, validateOtpTrust } from "./Controllers/operations/OtpController.js";
 import OperationsHandeling from "./Middlewares/OperationsHandeling.js";
@@ -684,6 +685,7 @@ import { resumeDownloaded } from "./Controllers/resumeController.js";
 
 app.post("/admin/assign-resume-to-user", AssignResumeToUser); // keep existing
 app.post("/admin/unassign-resume", UnassignResume); // add new
+app.post("/admin/resume/auto-link", AutoLinkResume); // resume-maker backend, shared-secret gated
 
 // operations routes
 // app.post("/operations/getAllJobs", GetAllJobsOPS)
