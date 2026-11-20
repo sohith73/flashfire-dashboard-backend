@@ -259,7 +259,7 @@ export async function notifyClientForDigest({ digestDoc, client, mailbox }) {
         $set: {
           clientNotifiedAt: new Date(),
           clientNotifyTo: to,
-          clientNotifyChannel: CHANNEL,
+          clientNotifyChannel: result.channel || CHANNEL,
           clientNotifyMessageId: result.messageId || "",
           clientNotifyError: "",
           clientNotifySkippedReason: ""
