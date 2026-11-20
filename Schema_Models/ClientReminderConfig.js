@@ -139,6 +139,15 @@ const clientReminderConfigSchema = new mongoose.Schema(
      */
     inboxAlertsOptOut: { type: Boolean, default: false },
 
+    /**
+     * Move a job card to Rejected when this client's inbox gets a verified
+     * rejection mail that singles out exactly that card
+     * (src/services/mailAutoReject.js). OFF by default: only an operator
+     * switches it on, from Operations > Notifications. Strict === true is the
+     * only "on".
+     */
+    mailAutoRejectEnabled: { type: Boolean, default: false },
+
     // Only consulted when dashboardtrackings has no paymentEmail for this
     // client. The tracking collection is owned by the applications-monitor
     // backend, so it stays the source of truth wherever it has an answer.
@@ -295,6 +304,7 @@ export function mergeWithDefaults(doc) {
     // opt-out reads as off.
     inboxAlertsEnabled: src.inboxAlertsOptOut !== true,
     inboxAlertsOptOut: src.inboxAlertsOptOut === true,
+    mailAutoRejectEnabled: src.mailAutoRejectEnabled === true,
     paymentEmailOverride: String(src.paymentEmailOverride || "").toLowerCase().trim(),
     items,
     history,

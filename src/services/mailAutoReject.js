@@ -19,10 +19,16 @@
 //     (autoReject* fields) with the previous card status for a manual revert.
 //   - FAIL-SOFT: nothing here throws. The poll must never break on this.
 //
-// Kill switch: MAIL_AUTO_REJECT=off (also 0, false, no, disabled). Default ON.
+// Two switches, both must be on:
+//   - Per client: ClientReminderConfig.mailAutoRejectEnabled === true. OFF by
+//     default. Operators switch it on per client in the dashboard's
+//     Operations > Notifications panel. A client that is off is skipped
+//     WITHOUT claiming the digest, so a later backfill can still apply it.
+//   - Global kill switch: MAIL_AUTO_REJECT=off (also 0, false, no, disabled).
 
 import { JobModel } from "../../Schema_Models/JobModel.js";
 import { MailDigest } from "../../Schema_Models/MailDigest.js";
+import { ClientReminderConfig } from "../../Schema_Models/ClientReminderConfig.js";
 import { matchRejectionToJob, MATCH_STATUS } from "../../Utils/rejectionJobMatcher.js";
 
 /** Actor suffix on the card, in the same "<status> by <who>" shape as manual moves. */
@@ -32,6 +38,27 @@ const TIMEZONE = "Asia/Kolkata";
 export function isAutoRejectEnabled(env = process.env) {
   const v = String(env.MAIL_AUTO_REJECT ?? "").trim().toLowerCase();
   return !["off", "0", "false", "no", "disabled"].includes(v);
+}
+
+/** Reason returned (and logged by nobody) when the client's toggle is off. */
+export const CLIENT_OFF_REASON = "auto-reject is off for this client";
+
+/**
+ * Per-client switch, set by operators in Operations > Notifications. Off unless
+ * the client's reminder config says exactly `mailAutoRejectEnabled: true`, so a missing doc,
+ * a missing field or a lookup error all mean "leave the cards alone". Never throws.
+ */
+export async function isClientAutoRejectOn(ownerEmail) {
+  const email = String(ownerEmail || "").toLowerCase().trim();
+  if (!email) return false;
+  try {
+    const doc = await ClientReminderConfig.findOne({ clientEmail: email, mailAutoRejectEnabled: true }).select("_id").lean();
+    return Boolean(doc);
+  } catch (err) {
+    // Fail closed and record nothing: the digest stays unclaimed for a backfill.
+    console.warn(`[mail-auto-reject] could not read the client toggle: ${err?.message || err}`);
+    return false;
+  }
 }
 
 /**
@@ -88,15 +115,20 @@ async function record(digestId, fields) {
  * @param {Object} [opts]
  * @param {boolean} [opts.dryRun]  match only; write nothing (no claim, no job update)
  * @param {Array}  [opts.jobs]     pre-loaded candidate jobs (backfill batches them per client)
+ * @param {boolean} [opts.clientOn] pre-read per-client toggle (backfill caches it per client)
  * @returns {Promise<{outcome:string, reason:string, match?:Object}>}
- *   outcome: applied | matched (dry run) | ambiguous | no_match | skipped | already_handled | error
+ *   outcome: applied | matched (dry run) | ambiguous | no_match | skipped | client_off | already_handled | error
  */
-export async function autoRejectForDigest(digest, { dryRun = false, jobs } = {}) {
+export async function autoRejectForDigest(digest, { dryRun = false, jobs, clientOn } = {}) {
   try {
     if (!isAutoRejectEnabled()) return { outcome: "skipped", reason: "MAIL_AUTO_REJECT is off" };
     const gate = autoRejectGate(digest);
     if (!gate.ok) return { outcome: "skipped", reason: gate.reason };
     if (digest.autoRejectStatus) return { outcome: "already_handled", reason: digest.autoRejectStatus };
+    // Not claimed and nothing recorded: turning the client on later and running
+    // the backfill can still apply this mail.
+    const on = clientOn ?? (await isClientAutoRejectOn(digest.ownerEmail));
+    if (!on) return { outcome: "client_off", reason: CLIENT_OFF_REASON };
 
     const candidateJobs = jobs ?? (await loadCandidateJobs(digest.ownerEmail));
     const match = matchRejectionToJob(mailFactsFromDigest(digest), candidateJobs);

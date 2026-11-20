@@ -242,7 +242,7 @@ export const updateClientReminderConfig = async (req, res) => {
   if (!clientEmail) return undefined;
 
   try {
-    const { items, updatedBy, clientName, inboxAlertsEnabled } = req.body || {};
+    const { items, updatedBy, clientName, inboxAlertsEnabled, mailAutoRejectEnabled } = req.body || {};
 
     const existing = await ClientReminderConfig.findOne({ clientEmail }).lean();
     const sanitized = sanitizeItemsInput(items, existing?.items || []);
@@ -261,6 +261,10 @@ export const updateClientReminderConfig = async (req, res) => {
     if (inboxAlertsEnabled !== undefined) {
       set.inboxAlertsEnabled = inboxAlertsEnabled === true;
       set.inboxAlertsOptOut = inboxAlertsEnabled !== true;
+    }
+    // Auto-reject from mail. Off by default; strict === true, same reason.
+    if (mailAutoRejectEnabled !== undefined) {
+      set.mailAutoRejectEnabled = mailAutoRejectEnabled === true;
     }
 
     const saved = await ClientReminderConfig.findOneAndUpdate(
