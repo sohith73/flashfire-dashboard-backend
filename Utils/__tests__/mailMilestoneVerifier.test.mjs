@@ -31,7 +31,7 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 process.env.MAIL_AI_API_URL = `http://127.0.0.1:${server.address().port}/v1/chat/completions`;
 process.env.OPENAI_API_KEY = "test-key";
 
-const { verifyMilestoneMail, milestoneGate } = await import("../../src/services/mailMilestoneVerifier.js");
+const { verifyMilestoneMail, verifyRejectionMail, milestoneGate } = await import("../../src/services/mailMilestoneVerifier.js");
 const { classifyMailByRules } = await import("../mailRulesClassifier.js");
 const { renderClientMilestoneEmail } = await import("../clientMailTemplates.js");
 
@@ -104,6 +104,30 @@ test("verifier: genuine=true is honored only with a milestone category", async (
   const v = await verifyMilestoneMail({ from: "a@b.co", subject: "x", bodyText: "y", rulesCategory: "offer" });
   assert.equal(v.ok, true);
   assert.equal(v.genuine, false, "genuine must be forced false when category is not a milestone");
+});
+
+test("rejection verifier: returns the employer and role as the mail words them", async () => {
+  stub.status = 200;
+  stub.body = openaiReply({
+    genuine: true, category: "rejection", confidence: "high", reason: "declined",
+    company: "  Sodalis,   Inc. ", jobTitle: "Sr. ML Engineer, Clinical Automation"
+  });
+  const v = await verifyRejectionMail({ from: "x@ashbyhq.com", subject: "Update", bodyText: "we will not move forward" });
+  assert.equal(v.ok, true);
+  assert.equal(v.genuine, true);
+  assert.equal(v.company, "Sodalis, Inc.", "whitespace collapsed");
+  assert.equal(v.jobTitle, "Sr. ML Engineer, Clinical Automation");
+  assert.match(stub.lastRequest.messages[0].content, /"company"/, "the rejection prompt asks for it");
+});
+
+test("rejection verifier: missing or non-string company/jobTitle become empty strings", async () => {
+  stub.body = openaiReply({ genuine: true, category: "rejection", confidence: "medium", reason: "r", company: 7 });
+  const v = await verifyRejectionMail({ from: "a@b.co", subject: "x", bodyText: "y" });
+  assert.equal(v.company, "");
+  assert.equal(v.jobTitle, "");
+  const f = await (async () => { stub.status = 500; stub.body = {}; const r = await verifyRejectionMail({ from: "a@b.co", subject: "x" }); stub.status = 200; return r; })();
+  assert.equal(f.ok, false);
+  assert.equal(f.company, "");
 });
 
 test("verifier: HTTP error → ok:false (fail-closed), never throws", async () => {
