@@ -691,7 +691,8 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
 
       // Genuine rejection that singles out one of the client's live cards: move
       // that card to Rejected. Still notifies nobody. Fail-soft and idempotent
-      // (see mailAutoReject.js); MAIL_AUTO_REJECT=off disables it.
+      // (see mailAutoReject.js). Only for clients an operator switched on
+      // (ClientReminderConfig.mailAutoRejectEnabled); MAIL_AUTO_REJECT=off disables it all.
       if (digestDoc.category === "rejection") {
         const rej = await autoRejectForDigest(digestDoc);
         if (rej.outcome === "applied") {

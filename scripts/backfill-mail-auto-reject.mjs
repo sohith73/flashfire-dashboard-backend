@@ -19,12 +19,15 @@
  * matcher instead extracts company and role from sender, subject and summary
  * with patterns, and cross-checks them against each job's own company name.
  *
+ * Only clients an operator switched on (ClientReminderConfig.mailAutoRejectEnabled) are
+ * touched; everyone else is counted as client_off and left unclaimed.
+ *
  * Reads MONGODB_URI from the environment. Prints no email addresses.
  */
 
 import mongoose from "mongoose";
 import { MailDigest } from "../Schema_Models/MailDigest.js";
-import { autoRejectForDigest, loadCandidateJobs, autoRejectGate } from "../src/services/mailAutoReject.js";
+import { autoRejectForDigest, loadCandidateJobs, autoRejectGate, isClientAutoRejectOn } from "../src/services/mailAutoReject.js";
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -67,7 +70,7 @@ let q = MailDigest.find(filter)
 if (limit) q = q.limit(limit);
 const digests = await q;
 
-const counts = { matched: 0, applied: 0, ambiguous: 0, no_match: 0, skipped: 0, already_handled: 0, error: 0 };
+const counts = { matched: 0, applied: 0, ambiguous: 0, no_match: 0, skipped: 0, client_off: 0, already_handled: 0, error: 0 };
 const seen = {};
 const samples = { matched: [], ambiguous: [], no_match: [] };
 const clientIds = new Map();
@@ -77,17 +80,24 @@ const cid = (e) => {
   return clientIds.get(e);
 };
 
-let jobsCache = { owner: null, jobs: [] };
+let jobsCache = { owner: null, on: false, jobs: [] };
 for (const d of digests) {
   if (!autoRejectGate(d).ok) {
     counts.skipped++;
     continue;
   }
+  if (jobsCache.owner !== d.ownerEmail) {
+    const on = await isClientAutoRejectOn(d.ownerEmail);
+    jobsCache = { owner: d.ownerEmail, on, jobs: on ? await loadCandidateJobs(d.ownerEmail) : [] };
+  }
+  if (!jobsCache.on) {
+    counts.client_off++;
+    continue;
+  }
   owners.add(d.ownerEmail);
-  if (jobsCache.owner !== d.ownerEmail) jobsCache = { owner: d.ownerEmail, jobs: await loadCandidateJobs(d.ownerEmail) };
   const jobs = jobsCache.jobs;
 
-  const r = await autoRejectForDigest(d, { dryRun: !APPLY, jobs });
+  const r = await autoRejectForDigest(d, { dryRun: !APPLY, jobs, clientOn: true });
   const key = r.outcome === "applied" ? "applied" : r.outcome;
   counts[key] = (counts[key] || 0) + 1;
 

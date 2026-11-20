@@ -10,7 +10,8 @@ import { fileURLToPath } from "node:url";
 
 const { JobModel } = await import("../../Schema_Models/JobModel.js");
 const { MailDigest } = await import("../../Schema_Models/MailDigest.js");
-const { autoRejectForDigest, autoRejectGate, isAutoRejectEnabled, AUTO_REJECT_STATUS } = await import(
+const { ClientReminderConfig } = await import("../../Schema_Models/ClientReminderConfig.js");
+const { autoRejectForDigest, autoRejectGate, isAutoRejectEnabled, isClientAutoRejectOn, AUTO_REJECT_STATUS } = await import(
   "../../src/services/mailAutoReject.js"
 );
 
@@ -39,13 +40,21 @@ const acmeJob = (o = {}) => ({
   currentStatus: "applied by Rajdeep", appliedDate: "5/10/2026, 10:00:00 am", updatedAt: "5/10/2026, 10:00:00 am", ...o
 });
 
-let digestWrites, jobWrites, claimResult, jobResult, saved;
+let digestWrites, jobWrites, claimResult, jobResult, saved, toggleQueries, clientToggle;
 beforeEach(() => {
   digestWrites = [];
   jobWrites = [];
   claimResult = { modifiedCount: 1 };
   jobResult = { modifiedCount: 1 };
-  saved = { find: JobModel.find, jobUpdate: JobModel.updateOne, digestUpdate: MailDigest.updateOne, env: process.env.MAIL_AUTO_REJECT };
+  saved = { find: JobModel.find, jobUpdate: JobModel.updateOne, digestUpdate: MailDigest.updateOne, clientFind: ClientReminderConfig.findOne, env: process.env.MAIL_AUTO_REJECT };
+  // Every existing test runs with the client switched ON; the toggle tests flip it.
+  toggleQueries = [];
+  clientToggle = () => ({ _id: "c1" });
+  ClientReminderConfig.findOne = (filter) => {
+    toggleQueries.push(filter);
+    const chain = { select: () => chain, lean: async () => clientToggle(filter) };
+    return chain;
+  };
   delete process.env.MAIL_AUTO_REJECT;
   JobModel.updateOne = async (filter, update) => { jobWrites.push({ filter, update }); return jobResult; };
   MailDigest.updateOne = async (filter, update) => {
@@ -57,6 +66,7 @@ afterEach(() => {
   JobModel.find = saved.find;
   JobModel.updateOne = saved.jobUpdate;
   MailDigest.updateOne = saved.digestUpdate;
+  ClientReminderConfig.findOne = saved.clientFind;
   if (saved.env === undefined) delete process.env.MAIL_AUTO_REJECT; else process.env.MAIL_AUTO_REJECT = saved.env;
 });
 
@@ -139,6 +149,49 @@ test("kill switch and gate short-circuit before any read or write", async () => 
   delete process.env.MAIL_AUTO_REJECT;
   assert.equal((await autoRejectForDigest(digest({ verifyConfidence: "low" }), { jobs: [acmeJob()] })).outcome, "skipped");
   assert.equal(jobWrites.length + digestWrites.length, 0);
+});
+
+test("client toggle: OFF by default, nothing is claimed or moved", async () => {
+  clientToggle = () => null; // no config with mailAutoRejectEnabled: true
+  const r = await autoRejectForDigest(digest(), { jobs: [acmeJob()] });
+  assert.equal(r.outcome, "client_off");
+  assert.equal(jobWrites.length + digestWrites.length, 0, "the digest stays unclaimed for a later backfill");
+  assert.deepEqual(toggleQueries[0], { clientEmail: "client@example.com", mailAutoRejectEnabled: true });
+});
+
+test("client toggle: owner email is matched lowercased; only === true counts", async () => {
+  await isClientAutoRejectOn("  Client@Example.COM ");
+  assert.deepEqual(toggleQueries.at(-1), { clientEmail: "client@example.com", mailAutoRejectEnabled: true });
+  assert.equal(await isClientAutoRejectOn(""), false);
+});
+
+test("client toggle: a lookup error fails closed and records nothing", async () => {
+  clientToggle = () => { throw new Error("mongo down"); };
+  const r = await autoRejectForDigest(digest(), { jobs: [acmeJob()] });
+  assert.equal(r.outcome, "client_off");
+  assert.equal(jobWrites.length + digestWrites.length, 0);
+});
+
+test("client toggle: a pre-read clientOn skips the lookup (backfill path)", async () => {
+  const off = await autoRejectForDigest(digest(), { jobs: [acmeJob()], clientOn: false });
+  assert.equal(off.outcome, "client_off");
+  const on = await autoRejectForDigest(digest(), { jobs: [acmeJob()], clientOn: true });
+  assert.equal(on.outcome, "applied");
+  assert.equal(toggleQueries.length, 0);
+});
+
+test("config: mailAutoRejectEnabled is off unless stored exactly true", async () => {
+  const { mergeWithDefaults } = await import("../../Schema_Models/ClientReminderConfig.js");
+  assert.equal(mergeWithDefaults(null).mailAutoRejectEnabled, false);
+  assert.equal(mergeWithDefaults({ mailAutoRejectEnabled: "true" }).mailAutoRejectEnabled, false);
+  assert.equal(mergeWithDefaults({ mailAutoRejectEnabled: true }).mailAutoRejectEnabled, true);
+  assert.equal(new ClientReminderConfig({ clientEmail: "a@b.com" }).mailAutoRejectEnabled, false);
+});
+
+test("operations PUT: writes mailAutoRejectEnabled only when sent, strictly as a boolean", () => {
+  const ctl = read("../../Controllers/operations/ClientReminders.js");
+  assert.match(ctl, /set\.mailAutoRejectEnabled = mailAutoRejectEnabled === true/);
+  assert.match(ctl, /if \(mailAutoRejectEnabled !== undefined\)/);
 });
 
 test("fail-soft: a database error is returned and recorded, never thrown", async () => {
