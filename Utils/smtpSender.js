@@ -17,6 +17,7 @@
 //   SMTP_FROM_NAME  = From display name (e.g. "FlashFire Team")
 
 import nodemailer from "nodemailer";
+import { isMailFallbackEnabled, isSmtpAuthError, sendViaSendgridFallback } from "./mailFallback.js";
 
 // ============================================================
 //  PER-CATEGORY PAUSE — which client-facing streams are stopped.
@@ -137,8 +138,20 @@ export async function sendViaSmtp({ to, subject, html, text, replyTo, attachment
     );
     return { ok: false, error: "emails_paused", paused: true, category };
   }
-  if (!isSmtpConfigured()) return { ok: false, error: "smtp_not_configured" };
   if (!to || !subject || (!html && !text)) return { ok: false, error: "missing_required_fields" };
+  if (!isSmtpConfigured()) {
+    // No Gmail credentials at all: SendGrid is the only road left.
+    if (!isMailFallbackEnabled()) return { ok: false, error: "smtp_not_configured" };
+    return withFallbackChannel(await sendViaSendgridFallback({ to, subject, html, text, replyTo, attachment, headers }), "smtp_not_configured");
+  }
+  // Gmail refused the login recently: skip straight to SendGrid instead of
+  // knocking on a door that is known to be locked.
+  if (smtpAuthDeadUntil > Date.now() && isMailFallbackEnabled()) {
+    return withFallbackChannel(
+      await sendViaSendgridFallback({ to, subject, html, text, replyTo, attachment, headers }),
+      lastSmtpAuthError
+    );
+  }
 
   const fromEmail = smtpFromEmail();
   // Default the display name so a bare SMTP_USER/SMTP_PASS setup still sends
@@ -164,10 +177,40 @@ export async function sendViaSmtp({ to, subject, html, text, replyTo, attachment
     ];
   }
 
+  let smtpError;
   try {
     const info = await getTransporter().sendMail(mail);
-    return { ok: true, messageId: info?.messageId || "", from };
+    return { ok: true, messageId: info?.messageId || "", from, channel: "smtp" };
   } catch (err) {
-    return { ok: false, error: String(err?.message || err).slice(0, 400) };
+    smtpError = String(err?.message || err).slice(0, 400);
   }
+
+  if (isSmtpAuthError(smtpError)) {
+    smtpAuthDeadUntil = Date.now() + SMTP_AUTH_COOLDOWN_MS;
+    lastSmtpAuthError = smtpError;
+  }
+  if (!isMailFallbackEnabled()) return { ok: false, error: smtpError };
+  console.warn(`[smtpSender] SMTP failed (${smtpError.slice(0, 120)}), sending "${String(subject).slice(0, 60)}" through SendGrid`);
+  return withFallbackChannel(
+    await sendViaSendgridFallback({ to, subject, html, text, replyTo, attachment, headers }),
+    smtpError
+  );
+}
+
+// After Gmail refuses the login, sends go straight to SendGrid for this long,
+// then SMTP is tried again so a fixed app password is picked up on its own.
+const SMTP_AUTH_COOLDOWN_MS = 15 * 60 * 1000;
+let smtpAuthDeadUntil = 0;
+let lastSmtpAuthError = "";
+
+/** Tag a SendGrid result, and keep the SMTP error when both roads failed. */
+function withFallbackChannel(result, smtpError) {
+  if (result.ok) return { ...result, channel: "sendgrid", smtpError };
+  return { ok: false, error: `smtp: ${String(smtpError || "").slice(0, 200)} | ${result.error}` };
+}
+
+// Test seam: forget a remembered Gmail login failure.
+export function __resetSmtpAuthState() {
+  smtpAuthDeadUntil = 0;
+  lastSmtpAuthError = "";
 }
