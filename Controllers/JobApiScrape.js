@@ -4,7 +4,7 @@ import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { JobModel } from "../Schema_Models/JobModel.js";
 import { UserModel } from "../Schema_Models/UserModel.js";
 import { fetchPage, mapJob, adzunaCredentials, searchLadder } from "../Utils/adzunaClient.js";
-import { judgeJobs } from "../Utils/apiJudge.js";
+import { judgeJobs, buildUserPrompt, API_JUDGE_PROMPT, JUDGE_BATCH_SIZE } from "../Utils/apiJudge.js";
 import { checkCap, checkPlanCap, enforcePlanCapPostInsert } from "../Utils/dailyCapGuard.js";
 import { ukSponsorGate } from "../Utils/ukVisaSponsor.js";
 import { usSponsorGate } from "../Utils/usVisaSponsor.js";
@@ -137,6 +137,11 @@ const MAX_DESCRIPTION_CHARS = 4000;
 export async function importJobs({
   clientEmail, profile, jobs, remaining, importSource,
   operatorName = "Job API", operatorEmail = "",
+  // External judging (optional). When set, no OpenAI call is made here: the
+  // operator's machine judges with its own model. Two calls per chunk:
+  //   { }                       -> returns the prompts to judge (needs-judgement)
+  //   { contents: [...], model } -> the raw model answers, one per batch, in order
+  external = null,
 }) {
   const counts = { alreadyHad: 0, blockedByPolicy: 0, notOnList: 0, notSponsor: 0,
                    judged: 0, picked: 0, pushed: 0 };
@@ -258,7 +263,18 @@ export async function importJobs({
   const threshold = Number(profile.aiThreshold) || 50;
   const toJudge = fresh.map(({ job }) => job);
   counts.judged = toJudge.length;
-  const judged = await judgeJobs({ profile, aiSummary: profile.aiSummary || "", jobs: toJudge, threshold });
+  if (external && !Array.isArray(external.contents)) {
+    const batches = [];
+    for (let i = 0; i < toJudge.length; i += JUDGE_BATCH_SIZE) {
+      batches.push({ user: buildUserPrompt({ profile, aiSummary: profile.aiSummary || "", jobs: toJudge.slice(i, i + JUDGE_BATCH_SIZE), threshold }) });
+    }
+    return { status: 200, body: { success: true, outcome: "needs-judgement", system: API_JUDGE_PROMPT, batches, ...counts } };
+  }
+  let nextBatch = 0;
+  const externalCall = async () => ({ ok: true, content: external.contents[nextBatch++] ?? "{}" });
+  const judged = external
+    ? await judgeJobs({ profile, aiSummary: profile.aiSummary || "", jobs: toJudge, threshold }, externalCall)
+    : await judgeJobs({ profile, aiSummary: profile.aiSummary || "", jobs: toJudge, threshold });
   if (!judged.ok) {
     return { status: 502, body: { success: false, outcome: "judge-failed", error: judged.error,
       message: judged.message, ...counts, judged: 0 } };
@@ -312,7 +328,7 @@ export async function importJobs({
           reason: String(d.reason || "").slice(0, 600),
           score: Number.isInteger(d.score) ? d.score : null,
           matchedRole: String(d.matchedRole || "").slice(0, 120),
-          model: process.env.OPENAI_JUDGE_MODEL || "gpt-4o-mini",
+          model: (external && String(external.model || "").slice(0, 60)) || process.env.OPENAI_JUDGE_MODEL || "gpt-4o-mini",
           judgedAt: new Date(),
         },
       });
@@ -579,6 +595,10 @@ export const ingestJobApiJobs = async (req, res) => {
     const r = await importJobs({
       clientEmail, profile, jobs, remaining, importSource,
       operatorName: req.body?.operatorName, operatorEmail: req.body?.operatorEmail,
+      external: req.body?.judge === "external"
+        ? { contents: Array.isArray(req.body?.judgeContents) ? req.body.judgeContents.map((c) => String(c ?? "")) : undefined,
+            model: req.body?.judgeModel }
+        : null,
     });
     return res.status(r.status).json({ ...r.body, ...base, remainingBefore: remaining, minutes: elapsed() });
   } catch (error) {
