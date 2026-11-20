@@ -71,6 +71,21 @@ const MailDigestSchema = new mongoose.Schema(
     verifyReason: { type: String, default: "" },
     verifyModel: { type: String, default: "" },
     verifyError: { type: String, default: "" },
+    // Rejection mails only: the employer and role as the mail words them, read by
+    // the same verifier call. Input to the auto-reject matcher; "" when absent.
+    verifyCompany: { type: String, default: "" },
+    verifyJobTitle: { type: String, default: "" },
+
+    // Auto-reject audit (src/services/mailAutoReject.js). A genuine rejection that
+    // singles out ONE of the client's live job cards moves that card to Rejected.
+    // autoRejectStatus is also the idempotency claim: "" means never looked at,
+    // anything else means this digest has been handled and is never applied again.
+    //   claimed -> (applied | ambiguous | no_match | skipped | error)
+    autoRejectStatus: { type: String, default: "" },
+    autoRejectJobId: { type: String, default: "" },
+    autoRejectPreviousStatus: { type: String, default: "" }, // what the card said before, for a manual revert
+    autoRejectReason: { type: String, default: "" },
+    autoRejectAt: { type: Date, default: null },
 
     // Ops (Discord) eligibility: rules-flagged milestone that either passed
     // verification OR could not be verified (AI down). Verified rejections are
@@ -102,6 +117,8 @@ const MailDigestSchema = new mongoose.Schema(
 MailDigestSchema.index({ gmailEmail: 1, messageId: 1 }, { unique: true });
 MailDigestSchema.index({ ownerEmail: 1, date: -1 });
 MailDigestSchema.index({ discordPostedAt: 1, createdAt: 1 });
+// Audit lookups: which digests moved a card, newest first.
+MailDigestSchema.index({ autoRejectStatus: 1, autoRejectAt: -1 }, { sparse: true });
 // Pending client alerts: eligible, not yet sent. Backs the retry sweep.
 MailDigestSchema.index({ gmailEmail: 1, clientNotifyEligible: 1, clientNotifiedAt: 1 });
 

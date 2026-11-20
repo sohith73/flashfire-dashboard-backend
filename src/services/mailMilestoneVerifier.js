@@ -76,14 +76,20 @@ Return ONLY a JSON object:
   "genuine": true | false,
   "category": "rejection" | "not-rejection",
   "confidence": "high" | "medium" | "low",
-  "reason": "one short sentence naming the decisive evidence"
+  "reason": "one short sentence naming the decisive evidence",
+  "company": "the employer the application was for, exactly as the email names it, or \"\"",
+  "jobTitle": "the role the application was for, exactly as the email names it, or \"\""
 }
 
-Rules: base the decision only on the email content given. When uncertain, return genuine=false. Output raw JSON only.`;
+Rules: base the decision only on the email content given. When uncertain, return genuine=false. For company and jobTitle copy the wording from the email and never guess: use "" when the email does not name them (a recruiting-platform name such as Greenhouse, Workday or Lever is not the employer). Output raw JSON only.`;
 
 function clamp(text, max) {
   const s = String(text || "").trim();
   return s.length <= max ? s : s.slice(0, max) + "\n…[truncated]";
+}
+
+function cleanField(v) {
+  return typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, 120) : "";
 }
 
 function fail(error) {
@@ -93,6 +99,8 @@ function fail(error) {
     category: "",
     confidence: "",
     reason: "",
+    company: "",
+    jobTitle: "",
     model: MODEL,
     error: String(error || "unknown").slice(0, 300)
   };
@@ -136,7 +144,9 @@ export async function verifyMilestoneMail({ from, subject, bodyText, snippet, ru
  * @param {string} mail.subject
  * @param {string} [mail.bodyText]
  * @param {string} [mail.snippet]
- * @returns {Promise<{ok:boolean, genuine:boolean, category:string, confidence:string, reason:string, model:string, error:string}>}
+ *          Also returns `company` and `jobTitle` as the mail words them ("" when absent),
+ *          which the auto-reject matcher uses to find the client's job card.
+ * @returns {Promise<{ok:boolean, genuine:boolean, category:string, confidence:string, reason:string, company:string, jobTitle:string, model:string, error:string}>}
  */
 export async function verifyRejectionMail({ from, subject, bodyText, snippet }) {
   return askVerifier({
@@ -222,6 +232,9 @@ async function askVerifier({
       category,
       confidence: CONFIDENCES.has(parsed?.confidence) ? parsed.confidence : "low",
       reason: typeof parsed?.reason === "string" ? parsed.reason.trim().slice(0, 300) : "",
+      // Only the rejection prompt asks for these; the milestone prompt leaves them "".
+      company: cleanField(parsed?.company),
+      jobTitle: cleanField(parsed?.jobTitle),
       model: data?.model || MODEL,
       error: ""
     };

@@ -54,6 +54,7 @@ import {
 import { summarizeMail } from "./mailAiSummarizer.js";
 import { classifyMailByRules } from "../../Utils/mailRulesClassifier.js";
 import { verifyMilestoneMail, milestoneGate, verifyRejectionMail } from "./mailMilestoneVerifier.js";
+import { autoRejectForDigest } from "./mailAutoReject.js";
 import { shouldSuppressSender, recordVerdict } from "./mailVerifierLearning.js";
 import { applyLearnedExclusions, proposeAndStoreExclusion } from "./mailRegexLearner.js";
 import { notifyUsefulMailLine, isGmailAuthError, errorText } from "../../Utils/discordMailNotify.js";
@@ -620,7 +621,10 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
           verifyConfidence: verdict.confidence,
           verifyReason: verdict.reason,
           verifyModel: verdict.model,
-          verifyError: verdict.error
+          verifyError: verdict.error,
+          // Employer + role as the mail words them; the auto-reject matcher reads these.
+          verifyCompany: verdict.company || "",
+          verifyJobTitle: verdict.jobTitle || ""
         };
         // Every flag stays false. A rejection reaches neither the client nor
         // the ops channel; it is recorded and nothing else.
@@ -683,6 +687,18 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
           continue;
         }
         throw e;
+      }
+
+      // Genuine rejection that singles out one of the client's live cards: move
+      // that card to Rejected. Still notifies nobody. Fail-soft and idempotent
+      // (see mailAutoReject.js); MAIL_AUTO_REJECT=off disables it.
+      if (digestDoc.category === "rejection") {
+        const rej = await autoRejectForDigest(digestDoc);
+        if (rej.outcome === "applied") {
+          console.log(`[mail-auto-reject] ${mailbox}: moved card ${rej.match?.jobId} to Rejected (${messageId}): ${rej.reason}`);
+        } else if (rej.outcome === "error") {
+          console.warn(`[mail-auto-reject] ${mailbox}: ${messageId}: ${rej.reason}`);
+        }
       }
 
       // Discord update ONLY for verified milestones (or unverifiable ones the
