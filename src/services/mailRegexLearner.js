@@ -68,6 +68,12 @@ export const GENUINE_FIXTURES = [
     body: "We are pleased to extend a formal offer for the Senior Engineer position. Compensation details are attached; let us know your decision."
   },
   {
+    // 2026-11-20: real iCIMS invite the regexes filed as a job-board alert.
+    subject: "Interview invitation - Showroom Project Coordinator, B&Q Blackburn",
+    from: "Jack Laycock <kingfisher2+email+1u66m-b131f7bf28@talent.icims.eu>",
+    body: "Hello, thanks for your application to B&Q for the position of Showroom Project Coordinator. I'd like to invite you to an interview, which will take up to an hour."
+  },
+  {
     subject: "Interview confirmed: Thursday 2 PM ET",
     from: "scheduling@calendly.com",
     body: "Your interview with Hooli has been scheduled. A calendar invitation has been sent to your email."
@@ -130,6 +136,39 @@ export function validatePatternSource(pattern) {
   return { ok: true, re };
 }
 
+// ── Senders a "from" exclusion may never cover ──
+// Hiring systems, scheduling tools, assessment providers and the generic
+// no-reply shapes all of them use send interviews, assessments and offers as
+// well as noise. A sender-wide exclusion on any of them silences real mail:
+// on 2026-11-21, 18 live rules (/noreply@.*/, /notifications@calendly\.com/,
+// /no-reply@ashbyhq\.com/, /myworkday\.com/ ...) had hidden 92 invite-looking
+// mails in two weeks. A "from" pattern that matches any of these is refused
+// when proposed AND ignored when loaded, so the existing bad rules stop
+// applying on deploy without anyone editing the database.
+export const PROTECTED_SENDERS = [
+  "noreply@example.com", "no-reply@example.com", "donotreply@example.com",
+  "do-not-reply@example.com", "do_not_reply@example.com", "notifications@example.com",
+  "recruiting@example.com", "careers@example.com", "talent@example.com", "jobs@example.com", "hr@example.com",
+  "notifications@calendly.com", "no-reply@calendly.com", "no-reply@ashbyhq.com",
+  "hr@myworkday.com", "acme@myworkday.com", "x@talent.icims.com", "x@talent.icims.eu",
+  "no-reply@greenhouse.io", "no-reply@us.greenhouse-mail.io", "no-reply@hire.lever.co",
+  "jobs@smartrecruiters.com", "system@successfactors.com", "noreply@successfactors.eu", "x@taleo.net",
+  "noreply@hirevue.com", "noreply@mail.hirevue-app.eu", "no-reply@codility.com", "noreply@hackerrank.com",
+  "noreply@codesignal.com", "noreply@testgorilla.com", "noreply@arcticshores.com", "noreply@cappassessments.com",
+  "do-not-reply@criteriacorp.com", "noreply@mail.amazon.jobs", "noreply@google.com", "x@jobvite.com",
+  "x@workablemail.com", "x@bamboohr.com", "x@teamtailor-mail.com", "x@recruitee.com", "x@pinpointhq.com",
+  "interviews@example.com", "interview@example.com", "scheduling@example.com", "talentacquisition@example.com",
+  "jobs+abc@adp.com", "noreply@adp.com", "no-reply@ats.rippling.com", "x@rippling.com", "x@paylocity.com",
+  "x@ultipro.com", "x@ukg.com", "x@oraclecloud.com", "x@applytojob.com", "x@breezy.hr", "x@dayforcehcm.com",
+  "x@avature.net", "x@eightfold.ai", "x@paradox.ai", "x@gem.com", "x@beamery.com", "x@personio.de",
+  "x@phenompeople.com", "x@modernhire.com", "x@sparkhire.com", "x@willo.video", "x@micro1.ai"
+];
+
+/** True when a "from" exclusion would cover a hiring system or a generic no-reply sender. */
+export function coversProtectedSender(re) {
+  return PROTECTED_SENDERS.some((addr) => re.test(addr) || re.test(`"Recruiting Team" <${addr}>`));
+}
+
 function fieldText(mail, targetField) {
   if (targetField === "subject") return String(mail.subject || "");
   if (targetField === "from") return String(mail.from || "");
@@ -157,6 +196,10 @@ export function acceptProposal({
   if (!TARGET_FIELDS.has(targetField)) return { ok: false, reason: `bad targetField: ${targetField}` };
   const v = validatePatternSource(pattern);
   if (!v.ok) return v;
+
+  if (targetField === "from" && coversProtectedSender(v.re)) {
+    return { ok: false, reason: "covers a hiring-system or generic no-reply sender" };
+  }
 
   // Must actually catch the mail that triggered the learning.
   if (!v.re.test(fieldText(offendingMail, targetField))) {
@@ -191,7 +234,10 @@ async function loadActiveRules() {
     const rules = [];
     for (const d of docs) {
       const v = validatePatternSource(d.pattern);
-      if (v.ok) rules.push({ id: String(d._id), re: v.re, targetField: d.targetField, category: d.category });
+      if (!v.ok) continue;
+      // Older rules were stored before the protected-sender check existed.
+      if (d.targetField === "from" && coversProtectedSender(v.re)) continue;
+      rules.push({ id: String(d._id), re: v.re, targetField: d.targetField, category: d.category });
     }
     cache = { rules, loadedAt: now };
     return rules;
@@ -239,6 +285,37 @@ export async function applyLearnedExclusions(classification, mail) {
   return classification;
 }
 
+/**
+ * Self-correction: a learned exclusion hid a mail that AI triage found and the
+ * verifier then confirmed genuine. The rule is wrong, so it is switched off for
+ * every mailbox at once and the evidence is kept on it. Only "ai" rules are
+ * retired automatically; a hand-written ("manual") rule is left to a human.
+ * Never throws.
+ *
+ * @returns {Promise<{retired:boolean, reason:string}>}
+ */
+export async function retireExclusionRule(ruleId, { subject = "", reason = "" } = {}) {
+  if (!ruleId) return { retired: false, reason: "no rule id" };
+  try {
+    const res = await MailClassifierRule.updateOne(
+      { _id: ruleId, status: "active", source: { $ne: "manual" } },
+      {
+        $set: {
+          status: "disabled",
+          disabledAt: new Date(),
+          disabledReason: clamp(`hid a mail the verifier confirmed genuine: ${reason}`, 300),
+          wrongExampleSubject: clamp(subject, 200)
+        }
+      }
+    );
+    if (res.modifiedCount) invalidateRuleCache();
+    return { retired: Boolean(res.modifiedCount), reason: res.modifiedCount ? "" : "already disabled, manual or missing" };
+  } catch (e) {
+    console.warn(`[mail-regex] could not retire rule ${ruleId}: ${e?.message || e}`);
+    return { retired: false, reason: e?.message || String(e) };
+  }
+}
+
 // ── Proposal pipeline (AI writes, gauntlet decides) ──────────────────
 
 const MILESTONE_BRIEF = `A mail was WRONGLY flagged as a career milestone (an interview invitation, an assessment, or a job offer); the human-facing alert was stopped by a second AI check, and now you must write ONE exclusion pattern so this kind of mail is filtered out at the regex stage in future.`;
@@ -257,7 +334,7 @@ Return ONLY a JSON object:
 Hard requirements for the pattern:
 - It must match THIS mail's chosen field.
 - It must NEVER match genuine recruiting mail from a real employer: interview invitations, assessment invitations, job offers, or genuine rejection letters. Target what makes this mail promotional/automated: a distinctive marketing phrase, a product/brand name, a bulk-sender address pattern. Do not target generic recruiting vocabulary like "interview", "offer", "schedule a call", "next step", "unfortunately" or "other candidates" on their own.
-- Prefer "from" when the sender address itself is the tell (e.g. a marketing subdomain); prefer "subject"/"body" for a distinctive phrase.
+- Prefer "subject"/"body" for a distinctive phrase. Use "from" only for a sender that never sends hiring mail (e.g. a marketing subdomain). Never target a generic no-reply address, or an applicant-tracking, scheduling or assessment system (Workday, iCIMS, Greenhouse, Lever, Ashby, Calendly, HireVue, Codility...): they send real interviews too, and such a pattern is refused.
 - 8 to 200 characters. No lookbehind, no backreferences, no nested quantifiers like (x+)+.
 - Escape regex metacharacters that should be literal.
 Output raw JSON only.`;

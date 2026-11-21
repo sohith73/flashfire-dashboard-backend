@@ -214,8 +214,13 @@ const SECURITY = [
 const NEWSLETTER_SENDERS = /(newsletter|digest|noreply|no-reply|updates?|notifications?|mailer|marketing)@/i;
 // Job boards and aggregators: their mail is alerts and digests, never a step
 // in an application the client made. Checked before the positive lists.
+//
+// talent.com is named in full. A bare "talent" also matched talent.icims.com
+// and talent.icims.eu, the iCIMS applicant-tracking system that hundreds of
+// employers (B&Q, Kingfisher, KPMG, First Citizens...) send real interview
+// invites through, so every one of those was filed as a job-board alert.
 const JOB_BOARD_SENDERS =
-  /@(?:[\w.-]+\.)?(?:linkedin|indeed|ziprecruiter|glassdoor|monster|dice|wellfound|angellist|naukri|hired|jobright|simplyhired|careerbuilder|lensa|talent|joblist|remotive|weworkremotely|himalayas|wfh)\.[a-z.]+/i;
+  /@(?:(?:[\w.-]+\.)?(?:linkedin|indeed|ziprecruiter|glassdoor|monster|dice|wellfound|angellist|naukri|hired|jobright|simplyhired|careerbuilder|lensa|joblist|remotive|weworkremotely|himalayas|wfh)\.[a-z.]+|(?:[\w.-]+\.)?talent\.com)\b/i;
 // Content platforms: community digests and newsletters. A Reddit jobs thread
 // mentioning "job offer" is not an offer. Checked before the positive lists.
 const CONTENT_PLATFORM_SENDERS = /@(?:[\w.-]+\.)?(?:reddit|redditmail|medium|substack|quora|beehiiv|mailchimp|convertkit)\.[a-z.]+/i;
@@ -320,6 +325,11 @@ export function classifyMailByRules({ subject = "", from = "", bodyText = "", sn
     actionRequired: isNotifiable ? ACTION[category] : "",
     urls
   };
+}
+
+/** The fixed next-step line for a notifiable category ("" for anything else). */
+export function actionForCategory(category) {
+  return ACTION[category] || "";
 }
 
 // Exported for the verification script.

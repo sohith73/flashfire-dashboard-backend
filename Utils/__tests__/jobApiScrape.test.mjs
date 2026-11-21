@@ -149,6 +149,11 @@ mock.module("../../Utils/adzunaClient.js", {
 mock.module("../../Utils/apiJudge.js", {
   namedExports: {
     judgeJobs: async (args) => { judgeCalls.push(args); return judgeResult; },
+    // The controller also imports these since local judging (130edd8); a mock
+    // without them fails the whole file at import.
+    buildUserPrompt: () => "",
+    API_JUDGE_PROMPT: "test-prompt",
+    JUDGE_BATCH_SIZE: 20,
   },
 });
 

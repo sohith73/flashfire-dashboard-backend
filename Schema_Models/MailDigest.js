@@ -76,6 +76,22 @@ const MailDigestSchema = new mongoose.Schema(
     verifyCompany: { type: String, default: "" },
     verifyJobTitle: { type: String, default: "" },
 
+    // AI triage (src/services/mailAiTriage.js): the second look every mail the
+    // regexes did not flag gets. rulesCategory keeps what the regexes said when
+    // triage overrode it; aiTriageFound=true means triage sent the mail down the
+    // milestone or rejection path (the verifier still decides).
+    rulesCategory: { type: String, default: "" },
+    aiTriageRan: { type: Boolean, default: false },
+    aiTriageCategory: { type: String, default: "" }, // interview|assessment|offer|rejection|none
+    aiTriageConfidence: { type: String, default: "" },
+    aiTriageReason: { type: String, default: "" },
+    aiTriageError: { type: String, default: "" },
+    aiTriageFound: { type: Boolean, default: false },
+    // A learned exclusion that hid a mail the verifier then confirmed genuine.
+    // That rule is switched off (MailClassifierRule.status = "disabled").
+    excludedByRule: { type: String, default: "" },
+    retiredRuleId: { type: String, default: "" },
+
     // Auto-reject audit (src/services/mailAutoReject.js). A genuine rejection that
     // singles out ONE of the client's live job cards moves that card to Rejected.
     // autoRejectStatus is also the idempotency claim: "" means never looked at,

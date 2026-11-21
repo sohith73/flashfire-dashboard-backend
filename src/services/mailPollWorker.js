@@ -52,11 +52,12 @@ import {
   isTextLike
 } from "../../Utils/gmailMessage.js";
 import { summarizeMail } from "./mailAiSummarizer.js";
-import { classifyMailByRules } from "../../Utils/mailRulesClassifier.js";
+import { classifyMailByRules, actionForCategory } from "../../Utils/mailRulesClassifier.js";
 import { verifyMilestoneMail, milestoneGate, verifyRejectionMail } from "./mailMilestoneVerifier.js";
 import { autoRejectForDigest } from "./mailAutoReject.js";
 import { shouldSuppressSender, recordVerdict } from "./mailVerifierLearning.js";
-import { applyLearnedExclusions, proposeAndStoreExclusion } from "./mailRegexLearner.js";
+import { applyLearnedExclusions, proposeAndStoreExclusion, retireExclusionRule } from "./mailRegexLearner.js";
+import { triageMail, triageFlags, RULE_FLAGGED_CATEGORIES } from "./mailAiTriage.js";
 import { notifyUsefulMailLine, isGmailAuthError, errorText } from "../../Utils/discordMailNotify.js";
 import {
   deriveEligibility,
@@ -65,7 +66,7 @@ import {
 } from "./clientMailNotifier.js";
 
 // ─── Fixed tuning (hard-coded on purpose; no env knobs) ──────────────
-const CLASSIFIER_MODE = "rules"; // zero-cost regex classifier, no OpenAI calls
+const CLASSIFIER_MODE = "rules"; // regex first pass; every mail it does not flag then gets an AI triage read (mailAiTriage.js)
 const CRON_EXPR = "0 * * * *"; // hourly, on the hour
 const CONCURRENCY = 2; // mailboxes polled in parallel
 const SCAN_ACTIVE_ONLY = true; // only active + unpaused clients' mailboxes
@@ -495,11 +496,52 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
       // Learned exclusions: AI-written, DB-stored patterns from past verified
       // false positives. A hit downgrades the category to "learned-excluded"
       // before any eligibility or AI-verification cost.
-      const ai = await applyLearnedExclusions(rawAi, {
+      const learned = await applyLearnedExclusions(rawAi, {
         from: msg.meta.from,
         subject: msg.meta.subject,
         bodyText: msg.bodyText
       });
+
+      // AI triage: EVERY mail the regexes (or a learned exclusion) left as
+      // something other than interview / assessment / offer / rejection gets a
+      // gpt-4o-mini read. When it finds one, the mail continues under that
+      // category, so the verifier below still decides before any client email.
+      // Fail-soft: a failed call leaves the rules result as it was.
+      let ai = learned;
+      let fromTriage = false;
+      let triageFields = {};
+      if (!RULE_FLAGGED_CATEGORIES.has(learned.category)) {
+        const t = await triageMail({
+          from: msg.meta.from,
+          subject: msg.meta.subject,
+          bodyText: msg.bodyText,
+          snippet: msg.snippet,
+          rulesCategory: learned.category
+        });
+        fromTriage = triageFlags(t);
+        triageFields = {
+          aiTriageRan: t.ok,
+          aiTriageCategory: t.category,
+          aiTriageConfidence: t.confidence,
+          aiTriageReason: t.reason,
+          aiTriageError: t.error,
+          aiTriageFound: fromTriage,
+          rulesCategory: learned.category,
+          excludedByRule: learned.excludedByRule || ""
+        };
+        if (fromTriage) {
+          ai = {
+            ...learned,
+            category: t.category,
+            priority: t.category === "rejection" ? "medium" : "high",
+            matched: true,
+            actionRequired: actionForCategory(t.category)
+          };
+          console.log(
+            `[mail-triage] ${mailbox}: regexes said ${learned.category}, AI found ${t.category} (${t.confidence}) (${messageId}): ${t.reason}`
+          );
+        }
+      }
 
       // Second-stage AI verification, ONLY for rules-flagged milestones.
       // deriveEligibility() is the cheap first gate; the verifier's job is to
@@ -519,7 +561,9 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
       // Learned suppression: a sender domain the AI has already rejected
       // repeatedly (and never once confirmed) skips the AI entirely — the
       // verdict is known, the check is free, and the alert stays silent.
-      const suppression = provisional.clientNotifyEligible
+      // Not for a triage find: the domain counters were built from regex false
+      // positives, and the AI has just read this mail and called it real.
+      const suppression = provisional.clientNotifyEligible && !fromTriage
         ? await shouldSuppressSender(senderEmail)
         : { suppress: false };
       if (provisional.clientNotifyEligible && suppression.suppress) {
@@ -542,19 +586,25 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
         });
         // Feed the loop: every real AI verdict updates the per-domain counters
         // and evidence list that drive suppression + future regex tightening.
-        await recordVerdict({ fromEmail: senderEmail, rulesCategory: ai.category, subject: msg.meta.subject, verdict });
+        // A triage find the verifier turned down is not a regex false positive,
+        // so it must not count against the sender domain or teach an exclusion.
+        // A triage find it CONFIRMED is recorded: it joins the genuine examples
+        // every future exclusion is regression-tested against.
+        if (!fromTriage || verdict.genuine) {
+          await recordVerdict({ fromEmail: senderEmail, rulesCategory: ai.category, subject: msg.meta.subject, verdict });
+        }
         // Verified false positive → have the AI write a DB-stored exclusion
         // pattern so this kind of mail dies at the regex stage next time.
         // Validation + genuine-mail regression checks happen inside; a
         // rejected proposal just means the other layers keep covering it.
-        if (verdict.ok && !verdict.genuine) {
-          const learned = await proposeAndStoreExclusion({
+        if (verdict.ok && !verdict.genuine && !fromTriage) {
+          const proposal = await proposeAndStoreExclusion({
             mail: { from: msg.meta.from, subject: msg.meta.subject, bodyText: msg.bodyText },
             rulesCategory: ai.category,
             verdict
           });
-          if (learned.stored) {
-            console.log(`[mail-regex] ${mailbox}: new exclusion /${learned.pattern}/i from ${messageId}`);
+          if (proposal.stored) {
+            console.log(`[mail-regex] ${mailbox}: new exclusion /${proposal.pattern}/i from ${messageId}`);
           }
         }
         const gate = milestoneGate(verdict);
@@ -604,14 +654,14 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
           bodyText: msg.bodyText,
           snippet: msg.snippet
         });
-        if (verdict.ok && !verdict.genuine) {
-          const learned = await proposeAndStoreExclusion({
+        if (verdict.ok && !verdict.genuine && !fromTriage) {
+          const proposal = await proposeAndStoreExclusion({
             mail: { from: msg.meta.from, subject: msg.meta.subject, bodyText: msg.bodyText },
             rulesCategory: "rejection",
             verdict
           });
-          if (learned.stored) {
-            console.log(`[mail-regex] ${mailbox}: new rejection exclusion /${learned.pattern}/i from ${messageId}`);
+          if (proposal.stored) {
+            console.log(`[mail-regex] ${mailbox}: new rejection exclusion /${proposal.pattern}/i from ${messageId}`);
           }
         }
         verifyFields = {
@@ -634,6 +684,19 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
           opsNotifyEligible: false,
           clientNotifySkippedReason: "rejection_recorded_only"
         };
+      }
+
+      // Self-correction: a learned exclusion hid this mail, triage found it and
+      // the verifier confirmed it genuine. That rule is wrong; switch it off.
+      if (fromTriage && learned.excludedByRule && verifyFields.verifyGenuine === true) {
+        const r = await retireExclusionRule(learned.excludedByRule, {
+          subject: msg.meta.subject,
+          reason: verifyFields.verifyReason || ""
+        });
+        if (r.retired) {
+          triageFields.retiredRuleId = learned.excludedByRule;
+          console.log(`[mail-regex] ${mailbox}: disabled learned rule ${learned.excludedByRule}, it hid a genuine ${ai.category} (${messageId})`);
+        }
       }
 
       const uploadedNames = new Set(msg.textAttachments.map((a) => a.filename));
@@ -670,6 +733,7 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
         // stored so the retry sweeps and any future UI read it without
         // re-classifying or re-verifying.
         ...verifyFields,
+        ...triageFields,
         ...eligibility
       };
 

@@ -29,6 +29,7 @@ export const AI_USAGE_SOURCES = {
     MAIL_SUMMARY: "mail-summary",     // mailAiSummarizer (disabled by default)
     MAIL_VERIFY: "mail-verify",       // mailMilestoneVerifier second-stage check
     MAIL_REGEX: "mail-regex",         // mailRegexLearner exclusion-pattern proposals
+    MAIL_TRIAGE: "mail-triage",       // mailAiTriage: second look at every mail the regexes did not flag
     SPEEDYAPPLY_ASK: "speedyapply-ask", // SpeedyApply sidebar Ask AI / answer suggestions
     SPEEDYAPPLY_COVER_LETTER: "speedyapply-cover-letter", // SpeedyApply per-job cover letter writer
     SPEEDYAPPLY_COVER_LETTER_AUTO: "speedyapply-cover-letter-auto", // queue: base letter tailored per job card
