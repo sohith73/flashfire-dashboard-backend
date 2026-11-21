@@ -108,7 +108,11 @@ const SCRAPER_EXTRACT_PATH = process.env.SCRAPER_EXTRACT_PATH || '/extract/infor
 const SCRAPER_TIMEOUT_MS = parseInt(process.env.SECOND_JUDGE_SCRAPER_TIMEOUT_MS) || 70000;
 
 // OpenAI judge (reuses the same key as /extension/openai-judge).
-const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
+// SECOND_JUDGE_LLM_URL lets the operator's own machine run this worker against a
+// local OpenAI-compatible endpoint (e.g. Claude through a proxy) instead of
+// OpenAI. Unset = unchanged behaviour (OpenAI, billed to OPENAI_API_KEY).
+const CUSTOM_LLM_URL = process.env.SECOND_JUDGE_LLM_URL || '';
+const OPENAI_URL = CUSTOM_LLM_URL || 'https://api.openai.com/v1/chat/completions';
 const OPENAI_MODEL = process.env.OPENAI_JUDGE_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const OPENAI_TIMEOUT_MS = parseInt(process.env.SECOND_JUDGE_OPENAI_TIMEOUT_MS) || 30000;
 
@@ -612,7 +616,7 @@ async function scrapeJobText(joblink) {
 
 // ─── Call the OpenAI grader on the real-site text ────────────────────
 async function judgeRealSite({ profile, job, scrapedText }) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY || (CUSTOM_LLM_URL ? 'local' : '');
   if (!apiKey) {
     const err = new Error('OPENAI_API_KEY not configured on backend');
     err._stage = 'OpenAI Judge';
@@ -664,11 +668,14 @@ async function judgeRealSite({ profile, job, scrapedText }) {
   const data = await resp.json();
   // Real token usage → the milestone cost report. Fire-and-forget: a cost
   // datapoint must never be able to fail a job screen.
-  recordAiUsage({
-    source: AI_USAGE_SOURCES.SECOND_JUDGE,
-    model: data?.model || OPENAI_MODEL,
-    usage: data?.usage,
-  });
+  // A custom endpoint is not billed by OpenAI: keep it out of the OpenAI cost report.
+  if (!CUSTOM_LLM_URL) {
+    recordAiUsage({
+      source: AI_USAGE_SOURCES.SECOND_JUDGE,
+      model: data?.model || OPENAI_MODEL,
+      usage: data?.usage,
+    });
+  }
   const content = data?.choices?.[0]?.message?.content || '{}';
   let parsed = null;
   try { parsed = JSON.parse(content); } catch { /* ignore */ }
