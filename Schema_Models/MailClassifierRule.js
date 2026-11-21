@@ -38,7 +38,13 @@ const MailClassifierRuleSchema = new mongoose.Schema(
 
     // Effectiveness counters.
     timesMatched: { type: Number, default: 0 },
-    lastMatchedAt: { type: Date, default: null }
+    lastMatchedAt: { type: Date, default: null },
+
+    // Self-correction: set when the rule hid a mail that AI triage found and
+    // the verifier confirmed genuine. One such mail disables the rule.
+    disabledAt: { type: Date, default: null },
+    disabledReason: { type: String, default: "" },
+    wrongExampleSubject: { type: String, default: "" }
   },
   { timestamps: true, collection: "mailclassifierrules" }
 );
