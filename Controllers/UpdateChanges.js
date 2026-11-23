@@ -13,7 +13,7 @@ import { checkPlanCap } from "../Utils/dailyCapGuard.js";
 // summary builder, which uses it to drop legacy logistical entries too.
 import { buildSummaryForEmail, isPureLogisticalReason } from "./BuildAiSummary.js";
 
-const REMOVAL_LIMIT = 100;
+export const REMOVAL_LIMIT = 100;
 // Newest-first cap on profile.removalFeedback — enough history for the AI
 // summary prompt (it reads the top 10) without unbounded doc growth.
 const REMOVAL_FEEDBACK_CAP = 20;

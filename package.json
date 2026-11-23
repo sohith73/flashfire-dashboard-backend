@@ -41,6 +41,7 @@
     "@aws-sdk/client-s3": "^3.911.0",
     "@aws-sdk/s3-request-presigner": "^3.911.0",
     "@google-cloud/vertexai": "^1.12.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@sendgrid/mail": "^8.1.6",
     "axios": "^1.7.9",
     "bcrypt": "^6.0.0",
@@ -59,7 +60,8 @@
     "node-cron": "^3.0.3",
     "nodemailer": "^8.0.11",
     "sharp": "^0.34.5",
-    "stripe": "^22.4.0"
+    "stripe": "^22.4.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"

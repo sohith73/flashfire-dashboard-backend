@@ -366,7 +366,9 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 if (NODE_ENV === "development") {
   app.use((req, res, next) => {
     const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] ${req.method} ${req.path} - ${req.ip}`);
+    // The MCP connector URL carries the client's key; never print it.
+    const safePath = req.path.replace(/^\/mcp\/u\/[^/]+/, "/mcp/u/[key]");
+    console.log(`[${timestamp}] ${req.method} ${safePath} - ${req.ip}`);
     next();
   });
 }
