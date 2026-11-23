@@ -59,6 +59,8 @@ import { uploadClientDocument, getClientDocuments, updateClientOptimizationStatu
 import { serveCachedImage, getCacheStats, clearCache } from "./Controllers/ImageProxy.js";
 import { serveDocProxy } from "./Controllers/DocProxy.js";
 import LocalTokenValidator from "./Middlewares/LocalTokenValidator.js";
+import { listMcpKeys, createMcpKey, revokeMcpKey } from "./Controllers/McpKeys.js";
+import { handleMcpPost, handleMcpMethodNotAllowed } from "./src/mcp/server.js";
 import RegisterVerify from "./Middlewares/RegisterVerify.js";
 import AdminKeyVerify from "./Middlewares/AdminKeyVerify.js";
 import ProfileCheck from "./Middlewares/ProfileCheck.js";
@@ -816,6 +818,16 @@ app.patch('/extension/profile', ExtensionAuth, extPatchProfile);
 app.get('/speedyapply/access-code', LocalTokenValidator, getSpeedyApplyAccessCode);
 app.post('/speedyapply/access-code/rotate', LocalTokenValidator, rotateSpeedyApplyAccessCode);
 app.post('/extension/speedyapply/login', speedyApplyLogin);
+// FlashFire MCP server: a client connects Claude to their own account.
+// Keys are made and revoked by the client from Profile (never an operator
+// view); the MCP endpoint takes the key as a Bearer header, or in the URL for
+// connectors that cannot send headers. See src/mcp/server.js.
+app.get('/mcp-keys', LocalTokenValidator, listMcpKeys);
+app.post('/mcp-keys', LocalTokenValidator, createMcpKey);
+app.delete('/mcp-keys/:id', LocalTokenValidator, revokeMcpKey);
+app.post(['/mcp', '/mcp/u/:key'], handleMcpPost);
+app.get(['/mcp', '/mcp/u/:key'], handleMcpMethodNotAllowed);
+app.delete(['/mcp', '/mcp/u/:key'], handleMcpMethodNotAllowed);
 // SpeedyApply autofill sync — save/load a client's profile so it restores on
 // login from any machine.
 app.get('/extension/speedyapply/profile', SpeedyApplyAuth, getSpeedyApplyProfile);
