@@ -61,6 +61,8 @@ import { serveDocProxy } from "./Controllers/DocProxy.js";
 import LocalTokenValidator from "./Middlewares/LocalTokenValidator.js";
 import { listMcpKeys, createMcpKey, revokeMcpKey } from "./Controllers/McpKeys.js";
 import { handleMcpPost, handleMcpMethodNotAllowed } from "./src/mcp/server.js";
+import McpEnabled from "./Middlewares/McpEnabled.js";
+import HumanSpeedLimit from "./Middlewares/HumanSpeedLimit.js";
 import RegisterVerify from "./Middlewares/RegisterVerify.js";
 import AdminKeyVerify from "./Middlewares/AdminKeyVerify.js";
 import ProfileCheck from "./Middlewares/ProfileCheck.js";
@@ -525,7 +527,7 @@ app.post("/plan-usage", async (req, res) => {
 // Profile routes
 app.get("/get-profile", GetProfile);
 app.post("/check-profile", CheckProfile);
-app.post("/setprofile", LocalTokenValidator, ProfileCheck, Add_Update_Profile);
+app.post("/setprofile", LocalTokenValidator, HumanSpeedLimit, ProfileCheck, Add_Update_Profile);
 // AI candidate summary — written by JR-direct extension's "Build Summary"
 // step. Persisted on the profile so every grading call reuses it.
 app.post("/update-ai-summary", UpdateAiSummary);
@@ -612,13 +614,14 @@ app.post("/clear-cache", clearCache);
 
 
 // Job routes (dashboard manual add + job board — same handler, duplicate + exclusion checks)
-app.post("/addjob", CheckForDuplicateJobs, AddJob);
-app.post("/api/jobs", CheckForDuplicateJobs, AddJob);
+// HumanSpeedLimit slows only a client's own session; see Middlewares/HumanSpeedLimit.js.
+app.post("/addjob", HumanSpeedLimit, CheckForDuplicateJobs, AddJob);
+app.post("/api/jobs", HumanSpeedLimit, CheckForDuplicateJobs, AddJob);
 app.get("/getalljobs", LocalTokenValidator, GetAllJobs);
 app.post("/getalljobs", GetAllJobs);
 app.get("/get/prev24hourjobs", Get24HourJobs);
 app.post("/storejobanduserdetails", StoreJobAndUserDetails);
-app.put("/updatechanges", VerifyJobIDAndChanges, UpdateChanges);
+app.put("/updatechanges", HumanSpeedLimit, VerifyJobIDAndChanges, UpdateChanges);
 app.post("/get-removal-reason", GetRemovalReason);
 app.get("/ai-removed-jobs", GetAiRemovedJobs);
 app.post("/second-judge-flag/resolve", ResolveSecondJudgeFlag);
@@ -822,12 +825,13 @@ app.post('/extension/speedyapply/login', speedyApplyLogin);
 // Keys are made and revoked by the client from Profile (never an operator
 // view); the MCP endpoint takes the key as a Bearer header, or in the URL for
 // connectors that cannot send headers. See src/mcp/server.js.
-app.get('/mcp-keys', LocalTokenValidator, listMcpKeys);
-app.post('/mcp-keys', LocalTokenValidator, createMcpKey);
-app.delete('/mcp-keys/:id', LocalTokenValidator, revokeMcpKey);
-app.post(['/mcp', '/mcp/u/:key'], handleMcpPost);
-app.get(['/mcp', '/mcp/u/:key'], handleMcpMethodNotAllowed);
-app.delete(['/mcp', '/mcp/u/:key'], handleMcpMethodNotAllowed);
+// Turned off for now (503) until MCP_SERVER_ENABLED=true. See Middlewares/McpEnabled.js.
+app.get('/mcp-keys', McpEnabled, LocalTokenValidator, listMcpKeys);
+app.post('/mcp-keys', McpEnabled, LocalTokenValidator, createMcpKey);
+app.delete('/mcp-keys/:id', McpEnabled, LocalTokenValidator, revokeMcpKey);
+app.post(['/mcp', '/mcp/u/:key'], McpEnabled, handleMcpPost);
+app.get(['/mcp', '/mcp/u/:key'], McpEnabled, handleMcpMethodNotAllowed);
+app.delete(['/mcp', '/mcp/u/:key'], McpEnabled, handleMcpMethodNotAllowed);
 // SpeedyApply autofill sync — save/load a client's profile so it restores on
 // login from any machine.
 app.get('/extension/speedyapply/profile', SpeedyApplyAuth, getSpeedyApplyProfile);
