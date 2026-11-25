@@ -206,6 +206,7 @@ test('findings are disagreements and failures, not agreement', () => {
   const base = { kind: 'ran', engine: 'jev' };
   assert.equal(isFinding({ ...base, recorded: 'other', category: 'interview', found: true }), true); // Jev found a miss
   assert.equal(isFinding({ ...base, recorded: 'interview', category: 'none', found: false }), true); // pipeline flagged, Jev disagrees
+  assert.equal(isFinding({ ...base, recorded: 'rejection', category: 'none', found: false, verified: true }), false); // full-body verifier outranks a preview read
   assert.equal(isFinding({ ...base, recorded: 'interview', category: 'interview', found: true }), false);
   assert.equal(isFinding({ ...base, recorded: 'other', category: 'none', found: false }), false);
   assert.equal(isFinding({ ...base, recorded: 'other', category: 'interview', found: false }), false); // low confidence

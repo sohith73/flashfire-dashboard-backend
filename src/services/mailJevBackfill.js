@@ -61,7 +61,16 @@ export function recordedOutcome(d) {
  */
 export async function judgeDigest(d, { triage = triageMail } = {}) {
   const rules = d.rulesCategory || d.category || "";
-  const base = { subject: d.subject || "(no subject)", from: d.fromEmail || "", date: d.date || null, recorded: recordedOutcome(d), rules };
+  const base = {
+    subject: d.subject || "(no subject)",
+    from: d.fromEmail || "",
+    date: d.date || null,
+    recorded: recordedOutcome(d),
+    rules,
+    // The verifier read the full body and called it real. Jev here sees only
+    // the preview, so it does not get to overrule that.
+    verified: d.verifyRan === true && d.verifyGenuine === true
+  };
 
   const body = [d.snippet, d.summary].filter(Boolean).join("\n").trim();
   const mail = { from: d.from || d.fromEmail || "", subject: d.subject || "", bodyText: body, snippet: d.snippet || "", rulesCategory: rules };
@@ -83,14 +92,16 @@ export async function judgeDigest(d, { triage = triageMail } = {}) {
 
 /**
  * Worth an operator's eye: Jev found a hiring step the pipeline did not record,
- * the pipeline recorded one Jev does not see, or the call failed.
+ * the pipeline recorded one Jev does not see (unless the full-body verifier
+ * confirmed it: rejections often say "unfortunately" past the stored preview),
+ * or the call failed.
  */
 export function isFinding(r) {
   if (r.kind === "error") return true;
   if (r.kind !== "ran") return false;
   const recordedMilestone = MILESTONES.has(r.recorded);
   if (r.found && r.category !== r.recorded) return true;
-  if (recordedMilestone && r.category === "none") return true;
+  if (recordedMilestone && r.category === "none" && !r.verified) return true;
   return false;
 }
 
