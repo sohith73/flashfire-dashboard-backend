@@ -98,6 +98,7 @@ import {
   updateClientReminderConfig,
   setClientReminderPaymentEmail,
   sendClientReminderNow,
+  runClientJevBackfill,
   previewClientReminder,
   getClientReminderHistory,
   listReminderDeliveries
@@ -795,6 +796,7 @@ app.post('/operations/reminders/get', requireOpsKey, getClientReminderConfig);
 app.put('/operations/reminders', requireOpsKey, updateClientReminderConfig);
 app.post('/operations/reminders/payment-email', requireOpsKey, setClientReminderPaymentEmail);
 app.post('/operations/reminders/send-now', requireOpsKey, sendClientReminderNow);
+app.post('/operations/reminders/jev-backfill', requireOpsKey, runClientJevBackfill);
 app.post('/operations/reminders/preview', requireOpsKey, previewClientReminder);
 app.post('/operations/reminders/history', requireOpsKey, getClientReminderHistory);
 app.post('/operations/reminders/deliveries', requireOpsKey, listReminderDeliveries);

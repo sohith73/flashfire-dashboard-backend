@@ -148,6 +148,14 @@ const clientReminderConfigSchema = new mongoose.Schema(
      */
     mailAutoRejectEnabled: { type: Boolean, default: false },
 
+    /**
+     * Post a Discord card per hourly poll listing what the AI second look
+     * (TypeSafe Jev) decided for each of this client's new mails
+     * (src/services/mailJevWatch.js). A watch for operators, nothing reaches
+     * the client. OFF by default; strict === true is the only "on".
+     */
+    jevWatchEnabled: { type: Boolean, default: false },
+
     // Only consulted when dashboardtrackings has no paymentEmail for this
     // client. The tracking collection is owned by the applications-monitor
     // backend, so it stays the source of truth wherever it has an answer.
@@ -305,6 +313,7 @@ export function mergeWithDefaults(doc) {
     inboxAlertsEnabled: src.inboxAlertsOptOut !== true,
     inboxAlertsOptOut: src.inboxAlertsOptOut === true,
     mailAutoRejectEnabled: src.mailAutoRejectEnabled === true,
+    jevWatchEnabled: src.jevWatchEnabled === true,
     paymentEmailOverride: String(src.paymentEmailOverride || "").toLowerCase().trim(),
     items,
     history,
