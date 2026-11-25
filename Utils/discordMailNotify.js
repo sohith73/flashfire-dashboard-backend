@@ -490,4 +490,20 @@ export async function notifyUsefulMailLine(a = {}) {
   return postToWebhook(MAIL_WEBHOOK, { embeds: [embed], allowed_mentions: { parse: [] } });
 }
 
+/**
+ * Jev watch card (src/services/mailJevWatch.js). Goes to MAIL_JEV_WATCH_WEBHOOK
+ * when set, so the ops milestone channel can stay milestone-only; without it
+ * the card lands in the mail channel. Only clients an operator switched on
+ * (ClientReminderConfig.jevWatchEnabled) ever produce one.
+ */
+export function jevWatchWebhook(env = process.env) {
+  return String(env.MAIL_JEV_WATCH_WEBHOOK || "").trim() || MAIL_WEBHOOK;
+}
+
+/** One embed, or up to 10 in one message (the backfill sends several). */
+export async function notifyJevWatch(embedOrEmbeds) {
+  const embeds = (Array.isArray(embedOrEmbeds) ? embedOrEmbeds : [embedOrEmbeds]).slice(0, 10);
+  return postToWebhook(jevWatchWebhook(), { embeds, allowed_mentions: { parse: [] } });
+}
+
 export const __testables = { truncate, pickUploadable, discordTimestamp };

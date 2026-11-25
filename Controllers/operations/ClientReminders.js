@@ -22,6 +22,12 @@ import {
 import { ClientPaymentLookup, resolvePaymentEmail } from "../../Schema_Models/ClientPaymentLookup.js";
 import { isSmtpConfigured } from "../../Utils/smtpSender.js";
 import { CLIENT_MAIL_HOLD_REASON } from "../../Utils/clientMailDays.js";
+import {
+  runJevBackfill,
+  isBackfillRunning,
+  countBackfillMails,
+  backfillLimit
+} from "../../src/services/mailJevBackfill.js";
 import { renderReminderEmail } from "../../Utils/reminderTemplates.js";
 import { ReminderDelivery } from "../../Schema_Models/ReminderDelivery.js";
 import { parseDeliveryQuery, DELIVERY_STATUSES, EFFECTIVE_STATUS } from "../../Utils/reminderDeliveryQuery.js";
@@ -213,7 +219,10 @@ export const getClientReminderConfig = async (req, res) => {
     // saved with one yet, so the tab is not blank for an unconfigured client.
     if (!merged.clientName && destination.clientName) merged.clientName = destination.clientName;
 
-    const preview = await activityPreview(clientEmail);
+    const [preview, backfillMails] = await Promise.all([
+      activityPreview(clientEmail),
+      countBackfillMails(clientEmail)
+    ]);
 
     return res.status(200).json({
       success: true,
@@ -225,7 +234,13 @@ export const getClientReminderConfig = async (req, res) => {
         trackingMatched: destination.trackingMatched,
         smtpConfigured: isSmtpConfigured(),
         workerEnabled: reminderWorkerEnabled(),
-        preview
+        preview,
+        // What "Run Jev on previous mails" would read for this client.
+        jevBackfill: {
+          mails: Math.min(backfillMails, backfillLimit()),
+          totalMails: backfillMails,
+          running: isBackfillRunning(clientEmail)
+        }
       }
     });
   } catch (err) {
@@ -242,7 +257,7 @@ export const updateClientReminderConfig = async (req, res) => {
   if (!clientEmail) return undefined;
 
   try {
-    const { items, updatedBy, clientName, inboxAlertsEnabled, mailAutoRejectEnabled } = req.body || {};
+    const { items, updatedBy, clientName, inboxAlertsEnabled, mailAutoRejectEnabled, jevWatchEnabled } = req.body || {};
 
     const existing = await ClientReminderConfig.findOne({ clientEmail }).lean();
     const sanitized = sanitizeItemsInput(items, existing?.items || []);
@@ -266,6 +281,10 @@ export const updateClientReminderConfig = async (req, res) => {
     if (mailAutoRejectEnabled !== undefined) {
       set.mailAutoRejectEnabled = mailAutoRejectEnabled === true;
     }
+    // Jev watch Discord card. Off by default; strict === true, same reason.
+    if (jevWatchEnabled !== undefined) {
+      set.jevWatchEnabled = jevWatchEnabled === true;
+    }
 
     const saved = await ClientReminderConfig.findOneAndUpdate(
       { clientEmail },
@@ -279,6 +298,48 @@ export const updateClientReminderConfig = async (req, res) => {
     return res.status(200).json({ success: true, data: { config: merged } });
   } catch (err) {
     return fail(res, err, "updateClientReminderConfig", "Failed to save reminder settings");
+  }
+};
+
+/* ------------------------------------------------------------------ */
+/* POST /operations/reminders/jev-backfill                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Run Jev over this client's previously scanned mails and post the result to
+ * the Jev watch Discord channel. The switch only covers new mail; this is the
+ * one-off look back. Read-only (mailJevBackfill.js): no client email, no card
+ * moved. Answers 202 straight away; Discord gets the result in a minute or two.
+ */
+export const runClientJevBackfill = async (req, res) => {
+  const clientEmail = readClientEmail(req, res);
+  if (!clientEmail) return undefined;
+
+  try {
+    if (isBackfillRunning(clientEmail)) {
+      return res.status(409).json({ success: false, message: "Jev is already reading this client's previous mails" });
+    }
+    const total = await countBackfillMails(clientEmail);
+    if (!total) {
+      return res.status(404).json({ success: false, message: "No scanned mail for this client yet" });
+    }
+    const limit = backfillLimit(req.body?.limit);
+    const { merged } = await readConfig(clientEmail);
+    const requestedBy = String(req.body?.updatedBy || "").slice(0, 120);
+
+    // Not awaited: 500 mails take a minute or two. runJevBackfill never
+    // throws and takes the per-client lock synchronously, so a second click
+    // in the meantime gets the 409 above.
+    runJevBackfill({ clientEmail, client: { name: merged.clientName }, limit, requestedBy }).catch((err) =>
+      console.error(`${LOG_PREFIX} jev backfill crashed:`, err?.stack || err)
+    );
+
+    return res.status(202).json({
+      success: true,
+      data: { mails: Math.min(total, limit), totalMails: total }
+    });
+  } catch (err) {
+    return fail(res, err, "runClientJevBackfill", "Could not start the Jev run");
   }
 };
 

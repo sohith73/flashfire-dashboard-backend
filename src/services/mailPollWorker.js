@@ -56,6 +56,7 @@ import { classifyMailByRules, actionForCategory, hasMilestoneSubject } from "../
 import { triageSkipReason } from "../../Utils/mailPromoFilter.js";
 import { verifyMilestoneMail, milestoneGate, verifyRejectionMail } from "./mailMilestoneVerifier.js";
 import { autoRejectForDigest } from "./mailAutoReject.js";
+import { isJevWatchOn, jevWatchRow, postJevWatch } from "./mailJevWatch.js";
 import { shouldSuppressSender, recordVerdict } from "./mailVerifierLearning.js";
 import { applyLearnedExclusions, proposeAndStoreExclusion, retireExclusionRule } from "./mailRegexLearner.js";
 import { triageMail, triageFlags, RULE_FLAGGED_CATEGORIES } from "./mailAiTriage.js";
@@ -600,6 +601,9 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
 
   let posted = 0;
   let maxInternalDate = state.lastInternalDate || 0;
+  // Jev watch: operators switched this client on to see each AI decision on
+  // Discord. null when off, so the loop below costs nothing extra.
+  const jevWatch = fresh.length && (await isJevWatchOn(ownerEmail)) ? [] : null;
 
   for (const messageId of fresh) {
     try {
@@ -639,6 +643,7 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
       let ai = learned;
       let fromTriage = false;
       let triageFields = {};
+      let triageModel = "";
       // Clear marketing, sign-in codes and FlashFire's own mail skip it to save
       // cost; anything with a hiring word in it is always read (mailPromoFilter).
       const skipTriage = RULE_FLAGGED_CATEGORIES.has(learned.category)
@@ -661,6 +666,7 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
           rulesCategory: learned.category
         });
         fromTriage = triageFlags(t);
+        triageModel = t.model || "";
         triageFields = {
           aiTriageRan: t.ok,
           aiTriageCategory: t.category,
@@ -824,8 +830,9 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
       // that card to Rejected. Still notifies nobody. Fail-soft and idempotent
       // (see mailAutoReject.js). Only for clients an operator switched on
       // (ClientReminderConfig.mailAutoRejectEnabled); MAIL_AUTO_REJECT=off disables it all.
+      let rej = null;
       if (digestDoc.category === "rejection") {
-        const rej = await autoRejectForDigest(digestDoc);
+        rej = await autoRejectForDigest(digestDoc);
         if (rej.outcome === "applied") {
           console.log(`[mail-auto-reject] ${mailbox}: moved card ${rej.match?.jobId} to Rejected (${messageId}): ${rej.reason}`);
         } else if (rej.outcome === "error") {
@@ -847,8 +854,10 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
       // Independent of Discord and fail-soft: a send failure is recorded on the
       // digest and retried on a later tick, never blocking the poll. At most
       // once per digest (clientNotifiedAt), so a retry cannot double-deliver.
+      let clientNotify = "";
       try {
         const outcome = await notifyClientForDigest({ digestDoc, client, mailbox });
+        clientNotify = outcome;
         if (outcome === "sent") {
           console.log(`[client-notify] ${mailbox}: alerted client - ${digestDoc.clientNotifyCategory} (${messageId})`);
         }
@@ -856,6 +865,7 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
         console.warn(`[client-notify] ${mailbox}: unexpected error for ${messageId}: ${e.message}`);
       }
 
+      jevWatch?.push(jevWatchRow({ digest: digestDoc, triageModel, autoReject: rej?.outcome, clientNotify }));
       maxInternalDate = Math.max(maxInternalDate, msg.internalDate);
     } catch (err) {
       // An auth failure mid-loop means every remaining message will fail too —
@@ -866,6 +876,8 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
       console.warn(`[mail-poll] ${mailbox}: message ${messageId} failed: ${errorText(err)}`);
     }
   }
+
+  if (jevWatch?.length) await postJevWatch({ client, mailbox, rows: jevWatch });
 
   await GmailPollState.updateOne(
     { _id: state._id },
