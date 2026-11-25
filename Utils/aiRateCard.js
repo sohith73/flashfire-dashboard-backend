@@ -22,6 +22,10 @@ export const AI_RATES = {
     // Gemini figure a deliberate OVER-estimate rather than a flattering one.
     "gemini-2.5-flash-lite": { in: 0.10, cachedIn: 0.10, out: 0.40, asOf: "2025-04-01" },
     "gemini-2.5-flash": { in: 0.30, cachedIn: 0.30, out: 2.50, asOf: "2025-04-01" },
+    // TypeSafe Jev (mail second look). "$42 / Btok, $0.042 / Mtok. You pay per
+    // input token. Output tokens are free." - docs.typesafe.ai/models. Matches
+    // jev-latest, jev-1.14.0 and jev-1.13.0 by prefix.
+    "jev": { in: 0.042, cachedIn: 0.042, out: 0, asOf: "2026-11-25" },
 };
 
 // Unknown models must NOT silently price at zero — that is how a cost report
@@ -29,9 +33,32 @@ export const AI_RATES = {
 // unpriced model shows up as suspiciously high rather than invisible.
 const FALLBACK = { in: 2.50, cachedIn: 1.25, out: 10.00, asOf: "unknown-model" };
 
+// A model served by another provider (MAIL_AI_API_URL + MAIL_AI_MODEL) has no
+// card above. Its price comes from env, in USD per 1M tokens:
+//   MAIL_AI_RATE_IN, MAIL_AI_RATE_OUT, and optionally MAIL_AI_RATE_CACHED_IN.
+// Without them it falls back to FALLBACK, which over-states the cost on purpose.
+export function envRateFor(model, env = process.env) {
+    const configured = String(env.MAIL_AI_MODEL || "").trim().toLowerCase();
+    const key = String(model || "").trim().toLowerCase();
+    if (!configured || !key || !(key === configured || key.startsWith(configured))) return null;
+    const num = (v) => (v === undefined || v === "" ? NaN : Number(v));
+    const rIn = num(env.MAIL_AI_RATE_IN);
+    const rOut = num(env.MAIL_AI_RATE_OUT);
+    if (!(rIn >= 0) || !(rOut >= 0)) return null;
+    const rCached = num(env.MAIL_AI_RATE_CACHED_IN);
+    return { in: rIn, cachedIn: rCached >= 0 ? rCached : rIn, out: rOut, asOf: "env" };
+}
+
+/** True when a model would be priced at the over-stated FALLBACK card. */
+export function isUnpricedModel(model) {
+    return rateFor(model) === FALLBACK;
+}
+
 export function rateFor(model) {
     const key = String(model || "").trim().toLowerCase();
     if (AI_RATES[key]) return AI_RATES[key];
+    const fromEnv = envRateFor(key);
+    if (fromEnv) return fromEnv;
     // OpenAI returns dated ids like "gpt-4o-mini-2024-07-18"; match the family.
     const hit = Object.keys(AI_RATES).find((k) => key.startsWith(k));
     return hit ? AI_RATES[hit] : FALLBACK;

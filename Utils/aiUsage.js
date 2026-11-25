@@ -38,6 +38,14 @@ export function normaliseUsage(usage) {
             outputTokens: n(usage.completion_tokens),
         };
     }
+    // TypeSafe Jev (and Anthropic-style) { input_tokens, output_tokens }
+    if (usage.input_tokens != null || usage.output_tokens != null) {
+        return {
+            inputTokens: n(usage.input_tokens),
+            cachedTokens: n(usage.cache_read_input_tokens),
+            outputTokens: n(usage.output_tokens),
+        };
+    }
     // Vertex / Gemini
     if (usage.promptTokenCount != null || usage.candidatesTokenCount != null) {
         return {
