@@ -28,6 +28,7 @@ import {
   notifyUsefulMailLine
 } from "../../Utils/discordMailNotify.js";
 import { collectClientMailRows, summarizeClientMail, buildClientMailEmbed } from "./clientMailSummary.js";
+import { jobSourceForMail } from "./mailJobSource.js";
 import { mailAiCostEmbed } from "../../Utils/mailAiCostEmbed.js";
 
 // ─── Fixed tuning (hard-coded; no env knobs) ─────────────────────────
@@ -123,7 +124,8 @@ export async function sendDailySummary() {
     // stamps every line it delivers, so only the handful it failed to deliver
     // (webhook 5xx, a crash between post and stamp) are left for 5 AM.
     MailDigest.find({ ...verifiedMilestone, discordPostedAt: null })
-      .select("gmailEmail ownerEmail subject from date category clientNotifyCategory verifyError messageId")
+      // summary/snippet/urls/verify* feed the job matcher for the Source line.
+      .select("gmailEmail ownerEmail subject from date category clientNotifyCategory verifyError messageId summary snippet urls internalDate verifyCompany verifyJobTitle")
       .sort({ date: 1 })
       .lean()
       .catch(() => [])
@@ -175,7 +177,8 @@ export async function sendDailySummary() {
         d.clientNotifyCategory || (d.verifyError ? `${d.category} (unverified — check manually)` : d.category),
       subject: d.subject,
       from: d.from,
-      receivedAt: d.date
+      receivedAt: d.date,
+      job: await jobSourceForMail(d)
     });
     if (res.ok) {
       posted++;

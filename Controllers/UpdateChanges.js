@@ -3,6 +3,7 @@ import { JobModel } from "../Schema_Models/JobModel.js";
 import { UserModel } from "../Schema_Models/UserModel.js";
 import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { DiscordConnect } from "../Utils/DiscordConnect.js";
+import { jobSourceLabel, JOB_SOURCE_FIELDS } from "../Utils/jobSourceLabel.js";
 import { validateOperatorRemovalReason } from "../Utils/operatorRemovalReason.js";
 import { shouldSetAppliedDate, isBlankAppliedDate } from "../Utils/appliedDate.js";
 import { checkPlanCap } from "../Utils/dailyCapGuard.js";
@@ -136,7 +137,8 @@ Client: ${clientName}
 Company: ${job?.companyName || 'N/A'}
 Job Title: ${job?.jobTitle || 'N/A'}
 Status: ${newStatus}
-Previous: ${oldStatus}`;
+Previous: ${oldStatus}
+Source: ${jobSourceLabel(job)}`;
 };
 
 const sendDiscordNotification = async (
@@ -371,7 +373,7 @@ const handleUpdateStatus = async (
   const [_, currentJob] = await Promise.all([
     checkRemovalLimit(userEmail, trimmedStatus, role),
     JobModel.findOne({ jobID, userID: userEmail })
-      .select('currentStatus companyName jobTitle appliedDate')
+      .select(`currentStatus companyName jobTitle appliedDate ${JOB_SOURCE_FIELDS}`)
       .lean()
   ]);
 
@@ -487,7 +489,7 @@ const handleEdit = async (
   const [_, existingJob] = await Promise.all([
     checkRemovalLimit(userEmail, status, role),
     JobModel.findOne({ jobID, userID: userEmail })
-      .select('currentStatus companyName jobTitle appliedDate')
+      .select(`currentStatus companyName jobTitle appliedDate ${JOB_SOURCE_FIELDS}`)
       .lean()
   ]);
 

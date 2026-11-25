@@ -13,6 +13,7 @@ import { auSponsorPushBlock } from '../Utils/auVisaSponsor.js';
 import { euSponsorPushBlock } from '../Utils/euVisaSponsor.js';
 import { companyAllowlistBlock } from '../Utils/companyAllowlist.js';
 import { initialAutoOptimization } from '../Utils/autoOptimizationState.js';
+import { EXTENSION_SITES } from '../Utils/jobSourceLabel.js';
 
 // Clamp the judge's verdict into the shape JobModel.aiDecision expects.
 // Returns null when there is nothing worth storing, so a push from an older
@@ -44,7 +45,7 @@ function sanitizeAiDecision(raw) {
 }
 
 export default async function AddJob(req, res) {
-    let { jobDetails, userDetails, role, operationsEmail, operationsName, extensionCode, source, aiDecision } = req.body;
+    let { jobDetails, userDetails, role, operationsEmail, operationsName, extensionCode, source, aiDecision, importSource } = req.body;
 
     try {
         jobDetails = jobDetails || {};
@@ -503,7 +504,15 @@ export default async function AddJob(req, res) {
             // Operations-only - a client-submitted job never carries one.
             const ai = sanitizeAiDecision(aiDecision);
             if (ai) jobDetails.aiDecision = ai;
+            // Which site the extension scraped this job from ("seek", "jora",
+            // ...). Shown as the Source on Discord alerts. Only known site
+            // names are kept: /addjob is public, so nothing else is trusted.
+            const site = String(importSource || '').trim().toLowerCase();
+            if (EXTENSION_SITES.includes(site)) jobDetails.importSource = site;
+            else delete jobDetails.importSource;
         } else {
+            // A client's own add never carries a scraped source.
+            delete jobDetails.importSource;
             jobDetails.createdByRole = 'user';
             jobDetails.timeline = ['Added by user'];
             jobDetails.operatorName = 'user';
