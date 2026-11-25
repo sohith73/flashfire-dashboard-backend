@@ -14,15 +14,15 @@
 // client email. Nothing reaches a client on this call's say-so alone.
 //
 // Contract:
-//   - Always on. Uses the same OPENAI_API_KEY as the verifier; no new env.
+//   - Always on. Same endpoint, key and model as the verifier (Utils/mailAiConfig.js).
 //   - Fail-soft: OpenAI down or junk -> { ok:false } and the rules result
 //     stands, exactly as before this file existed.
 //   - temperature 0, json_object, body capped, usage recorded under "mail-triage".
 
 import { recordAiUsage, AI_USAGE_SOURCES } from "../../Utils/aiUsage.js";
+import { mailAiConfig, MISSING_KEY_ERROR, DEFAULT_MAIL_MODEL } from "../../Utils/mailAiConfig.js";
 
-const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
-const MODEL = "gpt-4o-mini";
+const MODEL = DEFAULT_MAIL_MODEL; // default only; mailAiConfig() picks the live one
 const TIMEOUT_MS = 20000;
 const MAX_BODY_CHARS = 4000;
 
@@ -70,8 +70,8 @@ function fail(error) {
  *          Always resolves.
  */
 export async function triageMail({ from, subject, bodyText, snippet, rulesCategory }, { fetchImpl = fetch, env = process.env } = {}) {
-  const apiKey = env.OPENAI_API_KEY;
-  if (!apiKey) return fail("OPENAI_API_KEY not configured");
+  const ai = mailAiConfig(env);
+  if (!ai.apiKey) return fail(MISSING_KEY_ERROR);
 
   const userPrompt = [
     `Keyword rules said: ${rulesCategory || "other"}`,
@@ -85,11 +85,11 @@ export async function triageMail({ from, subject, bodyText, snippet, rulesCatego
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const res = await fetchImpl(OPENAI_URL, {
+    const res = await fetchImpl(ai.url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}` },
       body: JSON.stringify({
-        model: MODEL,
+        model: ai.model,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: userPrompt }
@@ -104,7 +104,7 @@ export async function triageMail({ from, subject, bodyText, snippet, rulesCatego
       return fail(`OpenAI HTTP ${res.status}: ${text.slice(0, 200)}`);
     }
     const data = await res.json();
-    recordAiUsage({ source: AI_USAGE_SOURCES.MAIL_TRIAGE, model: data?.model || MODEL, usage: data?.usage });
+    recordAiUsage({ source: AI_USAGE_SOURCES.MAIL_TRIAGE, model: data?.model || ai.model, usage: data?.usage });
 
     const content = data?.choices?.[0]?.message?.content;
     if (!content) return fail("OpenAI returned no content");
@@ -119,7 +119,7 @@ export async function triageMail({ from, subject, bodyText, snippet, rulesCatego
       category: TRIAGE_CATEGORIES.has(parsed?.category) ? parsed.category : "none",
       confidence: CONFIDENCES.has(parsed?.confidence) ? parsed.confidence : "low",
       reason: typeof parsed?.reason === "string" ? parsed.reason.trim().slice(0, 300) : "",
-      model: data?.model || MODEL,
+      model: data?.model || ai.model,
       error: ""
     };
   } catch (e) {

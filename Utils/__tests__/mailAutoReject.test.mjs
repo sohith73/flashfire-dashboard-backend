@@ -203,12 +203,21 @@ test("fail-soft: a database error is returned and recorded, never thrown", async
   assert.equal(jobWrites.length, 0);
 });
 
+// The rejection side lives in verifyAsRejection(); the branch calls it and may
+// only leave the rejection path when the milestone verifier confirms an invite.
+const rejectionHelper = (worker) => worker.slice(worker.indexOf("async function verifyAsRejection"), worker.indexOf("// ─── Discord delivery"));
+const rejectionBranch = (worker) => {
+  const from = worker.indexOf('} else if (ai.category === "rejection") {');
+  return worker.slice(from, worker.indexOf("// Self-correction", from));
+};
+
 // -- pipeline wiring -------------------------------------------------------
 
 test("pipeline: the rejection branch still notifies nobody", () => {
   const worker = read("../../src/services/mailPollWorker.js");
-  const from = worker.indexOf('} else if (ai.category === "rejection") {');
-  const branch = worker.slice(from, worker.indexOf("const uploadedNames", from));
+  const branch = rejectionHelper(worker);
+  assert.match(rejectionBranch(worker), /await verifyAsRejection\(vctx\)/);
+  assert.match(rejectionBranch(worker), /if \(m\.verdict\.genuine\)/, "only a CONFIRMED invite leaves the rejection path");
   assert.match(branch, /clientNotifyEligible: false/);
   assert.match(branch, /opsNotifyEligible: false/);
   assert.match(branch, /rejection_recorded_only/);

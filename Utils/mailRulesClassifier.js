@@ -58,6 +58,17 @@ const REJECTION_STRONG = [
   /\b(?:won'?t|will not|cannot|can'?t) be able to (?:move|proceed|progress)\b/i,
   /\bwon'?t be (?:moving|proceeding|progressing)\b/i,
   /\bdecided not to (?:move|proceed|progress|continue)\b/i,
+  // Split infinitive, as written by Lever / Greenhouse templates (Nov 2026 misses).
+  /\b(?:decided|decision (?:has been|was) made) to not (?:move|proceed|progress|continue)\b/i,
+  /\bnot (?:being )?considered (?:further|for (?:this|the) (?:role|position))\b/i,
+  /\b(?:do|does) not (?:feel|think|believe) (?:that )?(?:this|the) (?:job|role|position) is the right (?:match|fit)\b/i,
+  /\b(?:do|did) not meet the (?:minimum |required |essential )?(?:qualifications|requirements|eligibility|criteria)\b/i,
+  /\bnot met the (?:minimum |required |essential )?(?:qualifications|requirements|eligibility|criteria)\b/i,
+  /\bthe difficult news\b/i,
+  /\b(?:are|were) (?:now )?considering other (?:candidates|applicants)\b/i,
+  // French: "nous sommes au regret", "ne pas donner suite".
+  /\bau regret de vous informer\b/i,
+  /\bne (?:pas )?(?:pouvons|pourrons|donnerons) (?:pas )?(?:donner )?suite\b/i,
   /\bnot to proceed with your (?:application|candidacy)\b/i,
   /\bunable to (?:offer|move forward|progress|proceed)\b/i,
   /\bnot progressing your (?:application|candidacy)\b/i,
@@ -134,11 +145,23 @@ const INTERVIEW = [
   /\b(?:phone|technical|onsite|on-site|video|final|first|second|initial) (?:screen|interview|round)\b/i,
   /\binterview (?:with|for|process)\b/i,
   /\bavailab\w+ (?:for|to) (?:a |an )?(?:call|interview|chat|meeting)\b/i,
-  /\b(?:calendly|book a time|pick a (?:time|slot))\b/i
+  /\b(?:calendly|book a time|pick a (?:time|slot))\b/i,
+  /\b(?:screening|pre[- ]?screen(?:ing)?|recruiter screen(?:ing)?) (?:call|interview)\b/i,
+  /\btalent screen\b/i,
+  /\b(?:get you|you(?:'re| are)) scheduled\b/i,
+  /\bscheduled to (?:meet|speak|talk|chat)\b/i,
+  /\bmeet (?:with )?the (?:team|hiring manager)\b/i
 ];
 // The bare word in a SUBJECT is a strong signal on its own ("Re: Interview",
 // "Interview confirmed"); in a body it is not (every rejection has it).
-const INTERVIEW_SUBJECT = [/\binterviews?\b/i];
+const INTERVIEW_SUBJECT = [
+  /\binterviews?\b/i,
+  // Google Calendar invite: "Invitation from an unknown sender: X and Y @ Wed Nov 25, 2026 ..."
+  /^(?:updated )?invitation(?: from an unknown sender)?:.*@ (?:mon|tue|wed|thu|fri|sat|sun)\b/i,
+  /\bmeeting (?:invite|invitation|confirmed|reminder)\b/i,
+  /\btime confirmed\b/i,
+  /\bscreening (?:call|interview)\b/i
+];
 const INTERVIEW_WEAK = [
   /\bnext (?:round|step|stage)\b/i,
   /\bmove(?:d)? (?:you )?(?:forward|to the next)\b/i,
@@ -151,8 +174,18 @@ const ASSESSMENT = [
   /\b(?:hackerrank|codility|coderpad|codesignal|leetcode|hackerearth|testgorilla|karat)\b/i,
   /\bonline assessment\b/i,
   /\bcomplete (?:the|this|a|your) (?:assessment|challenge|test|assignment|exercise)\b/i,
-  /\bskills? (?:test|challenge)\b/i
+  /\bskills? (?:test|challenge)\b/i,
+  /\b(?:numerical|verbal|logical|inductive|deductive|abstract|aptitude|psychometric|cognitive|competency|situational judge?ment|personality|reasoning) (?:test|assessment|questionnaire)s?\b/i,
+  /\binvitation to (?:your |an |the )?(?:online )?(?:assessment|test|video interview)s?\b/i,
+  /\bassessments? invitation\b/i,
+  /\b(?:one[- ]way|recorded|asynchronous|on[- ]demand|digital) (?:video )?interview\b/i,
+  /\bvideo introduction\b/i,
+  /\b(?:hirevue|ccat|criteria corp|sapia|pymetrics|harver|arctic shores|modern hire|spark hire|cappfinity|mettl|imocha|vervoe|testlify|wonderlic|amcat)\b/i
 ];
+// Assessment and video-interview platforms. Their mail is an assessment step
+// for a named employer (or a reminder of one) unless it is a rejection.
+const ASSESSMENT_SENDERS =
+  /@(?:[\w.-]+\.)?(?:hirevue(?:-app)?|criteriacorp|sapia|shl|pymetrics|harver|arcticshores|modernhire|mettl|imocha|vervoe|testlify|sparkhire|cappfinity|hackerrank|hackerrankforwork|codility|codesignal|coderpad|testgorilla|karat|hackerearth)\.[a-z.]+/i;
 const ASSESSMENT_SUBJECT = [/\bassessments?\b/i];
 const ASSESSMENT_WEAK = [/\btake[- ]?home\b/i, /\bassignment\b/i];
 
@@ -211,6 +244,11 @@ const SECURITY = [
   /\b(?:otp|2fa|two[- ]factor)\b/i
 ];
 
+// FlashFire's own client notifications ("You have an interview invite - ...")
+// land in the client's inbox too. Re-reading them only produced duplicate
+// Discord lines and paid AI calls, so they are filed before anything else.
+export const FLASHFIRE_OWN_SENDERS = /@(?:[\w.-]+\.)?flashfirehq\.com\b/i;
+
 const NEWSLETTER_SENDERS = /(newsletter|digest|noreply|no-reply|updates?|notifications?|mailer|marketing)@/i;
 // Job boards and aggregators: their mail is alerts and digests, never a step
 // in an application the client made. Checked before the positive lists.
@@ -226,6 +264,31 @@ const JOB_BOARD_SENDERS =
 const CONTENT_PLATFORM_SENDERS = /@(?:[\w.-]+\.)?(?:reddit|redditmail|medium|substack|quora|beehiiv|mailchimp|convertkit)\.[a-z.]+/i;
 
 const anyMatch = (patterns, text) => patterns.some((re) => re.test(text));
+
+// ── Text normalisation, applied before any pattern runs ──
+// The patterns are written with plain spaces and straight apostrophes. Real
+// mail is not: plain-text parts wrap lines mid-phrase ("after careful\n
+// consideration"), HTML leaves &nbsp; / &#39; / &rsquo; behind, Outlook uses
+// non-breaking spaces, and most templates now type "we’re" and "won’t" with a
+// curly apostrophe. Each of those silently broke a match, so a genuine
+// rejection or invite fell through to "job-application" or "other".
+const NAMED_ENTITIES = {
+  nbsp: " ", amp: "&", apos: "'", quot: '"', lt: "<", gt: ">",
+  rsquo: "'", lsquo: "'", sbquo: "'", rdquo: '"', ldquo: '"', bdquo: '"',
+  ndash: "-", mdash: "-", hellip: "...", zwj: "", zwnj: "", shy: ""
+};
+export function normalizeMailText(text) {
+  return String(text || "")
+    .replace(/&([a-z]+);/gi, (m, name) => NAMED_ENTITIES[name.toLowerCase()] ?? m)
+    .replace(/&#(\d{1,6});/g, (m, n) => { const c = Number(n); return c > 0 && c < 0x110000 ? String.fromCodePoint(c) : m; })
+    .replace(/&#x([0-9a-f]{1,6});/gi, (m, h) => { const c = parseInt(h, 16); return c > 0 && c < 0x110000 ? String.fromCodePoint(c) : m; })
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u00B4`]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"')
+    .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .replace(/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 // Generic, deterministic next-step line per notifiable category (no AI prose).
 const ACTION = {
@@ -245,8 +308,8 @@ const ACTION = {
  * @returns {Object} digest-shaped classification (see file header)
  */
 export function classifyMailByRules({ subject = "", from = "", bodyText = "", snippet = "" } = {}) {
-  const subj = String(subject);
-  const body = String(bodyText);
+  const subj = normalizeMailText(subject);
+  const body = normalizeMailText(bodyText);
   const fromLc = String(from).toLowerCase();
   // Subject is the highest-signal field; a subject hit → "high", body-only → "medium".
   const hay = `${subj}\n${body}`;
@@ -281,7 +344,9 @@ export function classifyMailByRules({ subject = "", from = "", bodyText = "", sn
     ASSESSMENT, ASSESSMENT_WEAK, ASSESSMENT_SUBJECT
   ].some((list) => anyMatch(list, subj));
 
-  if (rejection.hit) {
+  if (FLASHFIRE_OWN_SENDERS.test(fromLc)) {
+    set("flashfire-own", "low");
+  } else if (rejection.hit) {
     // Hard override — never a positive milestone, regardless of other keywords.
     // Priority carries how sure the phrasing was, which the AI verifier and the
     // ops Discord line both read.
@@ -298,6 +363,8 @@ export function classifyMailByRules({ subject = "", from = "", bodyText = "", sn
     classifyPositive("assessment", ASSESSMENT, ASSESSMENT_WEAK, ASSESSMENT_SUBJECT)
   ) {
     // set inside
+  } else if (ASSESSMENT_SENDERS.test(fromLc)) {
+    set("assessment", "medium");
   } else if (anyMatch(APPLICATION_ACK, hay) || anyMatch(ATS_HOUSEKEEPING, hay)) {
     set("job-application", "low");
   } else if (anyMatch(RECRUITER, hay)) {
@@ -327,6 +394,16 @@ export function classifyMailByRules({ subject = "", from = "", bodyText = "", sn
   };
 }
 
+/**
+ * A subject that by itself names a hiring step ("Your Interview Invitation at
+ * Anchor", "Pandora Assessment", "Offer letter"). Used to stop the learned
+ * sender suppression from silencing such a mail without an AI read.
+ */
+export function hasMilestoneSubject(subject) {
+  const subj = normalizeMailText(subject);
+  return [OFFER, INTERVIEW, INTERVIEW_SUBJECT, ASSESSMENT, ASSESSMENT_SUBJECT].some((list) => anyMatch(list, subj));
+}
+
 /** The fixed next-step line for a notifiable category ("" for anything else). */
 export function actionForCategory(category) {
   return ACTION[category] || "";
@@ -350,5 +427,7 @@ export const __patterns = {
   JOB_ALERT,
   SECURITY,
   JOB_BOARD_SENDERS,
-  CONTENT_PLATFORM_SENDERS
+  CONTENT_PLATFORM_SENDERS,
+  ASSESSMENT_SENDERS,
+  NEWSLETTER_SENDERS
 };

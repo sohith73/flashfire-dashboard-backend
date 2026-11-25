@@ -24,9 +24,9 @@
 import { MailClassifierRule } from "../../Schema_Models/MailClassifierRule.js";
 import { MailVerifierFeedback } from "../../Schema_Models/MailVerifierFeedback.js";
 import { recordAiUsage, AI_USAGE_SOURCES } from "../../Utils/aiUsage.js";
+import { mailAiConfig, MISSING_KEY_ERROR } from "../../Utils/mailAiConfig.js";
 
-const OPENAI_URL = process.env.MAIL_AI_API_URL || "https://api.openai.com/v1/chat/completions";
-const MODEL = process.env.MAIL_REGEX_MODEL || "gpt-4o-mini";
+const MODEL = mailAiConfig(process.env, { modelOverride: process.env.MAIL_REGEX_MODEL }).model;
 const TIMEOUT_MS = Number(process.env.MAIL_REGEX_TIMEOUT_MS) || 20000;
 
 const MAX_ACTIVE_RULES = 300; // hard cap — beyond this, stop proposing and tell ops
@@ -376,8 +376,9 @@ async function loadGenuineExamples(limit = 50) {
  */
 export async function proposeAndStoreExclusion({ mail, rulesCategory, verdict }) {
   if (verdict?.ok !== true || verdict?.genuine === true) return { stored: false, reason: "not a verified false positive" };
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return { stored: false, reason: "OPENAI_API_KEY not configured" };
+  const ai = mailAiConfig(process.env, { modelOverride: process.env.MAIL_REGEX_MODEL });
+  const apiKey = ai.apiKey;
+  if (!apiKey) return { stored: false, reason: MISSING_KEY_ERROR };
 
   try {
     const activeCount = await MailClassifierRule.countDocuments({ status: "active" });
@@ -401,7 +402,7 @@ export async function proposeAndStoreExclusion({ mail, rulesCategory, verdict })
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   let proposal;
   try {
-    const res = await fetch(OPENAI_URL, {
+    const res = await fetch(ai.url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({

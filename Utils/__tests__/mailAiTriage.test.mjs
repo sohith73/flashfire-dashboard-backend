@@ -123,7 +123,10 @@ test("pipeline: every mail the rules did not flag goes to triage, and a find tak
   // The verifier still runs on a triage find; nothing skips it.
   assert.match(worker, /const verdict = await verifyMilestoneMail\(/);
   // A triage find is never sender-suppressed and never teaches an exclusion.
-  assert.match(worker, /provisional\.clientNotifyEligible && !fromTriage\s*\? await shouldSuppressSender/);
+  // ... and neither is a mail whose subject names a hiring step.
+  assert.match(worker, /provisional\.clientNotifyEligible && !fromTriage && !hasMilestoneSubject\(msg\.meta\.subject\)\s*\? await shouldSuppressSender/);
+  // Only clear marketing skips the second look; a rules-flagged mail never asks the filter.
+  assert.match(worker, /const skipTriage = RULE_FLAGGED_CATEGORIES\.has\(learned\.category\)\s*\? ""\s*: triageSkipReason\(/);
   assert.equal((worker.match(/verdict\.ok && !verdict\.genuine && !fromTriage/g) || []).length, 2);
   // A wrong learned rule is switched off only after the verifier confirms.
   assert.match(worker, /fromTriage && learned\.excludedByRule && verifyFields\.verifyGenuine === true/);
