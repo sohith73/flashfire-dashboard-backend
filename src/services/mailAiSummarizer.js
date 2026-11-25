@@ -16,11 +16,11 @@
 
 import { extractUrls } from "../../Utils/gmailMessage.js";
 import { recordAiUsage, AI_USAGE_SOURCES } from "../../Utils/aiUsage.js";
+import { mailAiConfig, MISSING_KEY_ERROR } from "../../Utils/mailAiConfig.js";
 
 // Overridable so the pipeline can be pointed at a proxy / Azure deployment,
 // and so tests can exercise the real request path against a local stub.
-const OPENAI_URL = process.env.MAIL_AI_API_URL || "https://api.openai.com/v1/chat/completions";
-const MODEL = process.env.MAIL_AI_MODEL || "gpt-4o-mini";
+const MODEL = mailAiConfig(process.env).model;
 const TIMEOUT_MS = Number(process.env.MAIL_AI_TIMEOUT_MS) || 30000;
 
 // Keep the prompt well inside the context window and the cost sane. A job
@@ -150,8 +150,9 @@ export async function summarizeMail(mail) {
   const attachmentText = (mail.attachments || []).map((a) => a.text).join("\n");
   const urls = extractUrls(mail.bodyText, attachmentText, mail.subject);
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return { ...failOpen("OPENAI_API_KEY not configured"), urls };
+  const ai = mailAiConfig(process.env);
+  const apiKey = ai.apiKey;
+  if (!apiKey) return { ...failOpen(MISSING_KEY_ERROR), urls };
 
   const body = {
     model: MODEL,
@@ -166,7 +167,7 @@ export async function summarizeMail(mail) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(OPENAI_URL, {
+    const res = await fetch(ai.url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),

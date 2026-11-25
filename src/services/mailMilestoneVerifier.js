@@ -21,15 +21,17 @@
 //   • Usage is recorded under the "mail-verify" source for the cost report.
 
 import { recordAiUsage, AI_USAGE_SOURCES } from "../../Utils/aiUsage.js";
+import { mailAiConfig, MISSING_KEY_ERROR } from "../../Utils/mailAiConfig.js";
 
-const OPENAI_URL = process.env.MAIL_AI_API_URL || "https://api.openai.com/v1/chat/completions";
-const MODEL = process.env.MAIL_VERIFY_MODEL || "gpt-4o-mini";
+// MAIL_VERIFY_MODEL still overrides the model for the verifier alone.
+const MODEL = mailAiConfig(process.env, { modelOverride: process.env.MAIL_VERIFY_MODEL }).model;
 const TIMEOUT_MS = Number(process.env.MAIL_VERIFY_TIMEOUT_MS) || 20000;
 const MAX_BODY_CHARS = 9000;
 
 const MILESTONE_CATEGORIES = new Set(["interview", "assessment", "offer"]);
 const REJECTION_CATEGORIES = new Set(["rejection"]);
 const CONFIDENCES = new Set(["high", "medium", "low"]);
+const REDIRECT_CATEGORIES = new Set(["interview", "assessment", "offer", "rejection"]);
 
 const SYSTEM_PROMPT = `You are a strict verifier for a job-search operations team. Keyword rules flagged one email from a client's inbox as a possible career milestone (interview invite, assessment/assignment, or job offer). Most flagged emails are false positives. Your job is to reject them.
 
@@ -37,6 +39,12 @@ An email is a GENUINE milestone only if ALL of these hold:
 - It is personally addressed to the candidate about a SPECIFIC application, role, or hiring process they are in.
 - It comes from an employer, their recruiting team, or a scheduling/assessment tool acting for them (e.g. Calendly, HackerRank, Codility invites tied to a named company).
 - It asks for or announces a concrete hiring step: scheduling or confirming an interview, completing a named assessment, or presenting an offer.
+
+These ARE genuine, even though they are automated (they were wrongly turned down before, Nov 2026):
+- A reminder to complete an assessment, test, video interview or interview the candidate was invited to for a named employer or role ("Reminder to complete your Amazon Assessment", "Complete the Online Assessment stage by tomorrow"). A pending step with a deadline is exactly what the candidate must not miss.
+- An invitation or reminder from an assessment or video-interview platform acting for a named employer: HireVue, Criteria (CCAT), SHL, Sapia, Modern Hire, Spark Hire, Pymetrics, Harver, Codility, HackerRank, CodeSignal, TestGorilla, Testlify and similar.
+- A calendar invitation, confirmation or reminder for an interview, screen or call with the employer or their recruiter ("Invitation: Interview with Akita Health @ Mon Nov 23", "Time confirmed: Talent Screen with Volter").
+- An applicant-tracking-system mail (Workday, Greenhouse, iCIMS, Lever and others) that asks the candidate to complete a named assessment or book an interview for their application.
 
 It is NOT a genuine milestone if it is any of:
 - Marketing or promotional content, product updates, newsletters, webinar/course/bootcamp/career-coaching promotions.
@@ -46,16 +54,18 @@ It is NOT a genuine milestone if it is any of:
 - ATS / careers-portal housekeeping: candidate account creation or activation, profile completion reminders, password or login mail from Workday, Greenhouse, Lever, iCIMS, Taleo, SuccessFactors and similar.
 - Community and content digests (Reddit, Medium, Substack, forums) and listicles such as "13 high-paying remote jobs", even when they contain the words "job offer".
 - Rejections, account/security mail, payment or billing mail.
+- Notifications from FlashFire (flashfirehq.com) about a step: FlashFire already told the candidate, this is a copy.
+- An assessment RESULT or a "thanks for completing" note with no further step.
 
 Return ONLY a JSON object:
 {
   "genuine": true | false,
-  "category": "interview" | "assessment" | "offer" | "not-milestone",
+  "category": "interview" | "assessment" | "offer" | "rejection" | "not-milestone",
   "confidence": "high" | "medium" | "low",
   "reason": "one short sentence naming the decisive evidence"
 }
 
-Rules: base the decision only on the email content given. When uncertain, return genuine=false. Output raw JSON only.`;
+Rules: base the decision only on the email content given. When uncertain, return genuine=false. If the email is really a rejection of the candidate's application, return genuine=false with category "rejection". Output raw JSON only.`;
 
 const REJECTION_SYSTEM_PROMPT = `You are a strict verifier for a job-search operations team. Keyword rules flagged one email from a candidate's inbox as a possible REJECTION of a job application they made. Your job is to confirm or reject that reading.
 
@@ -74,14 +84,14 @@ It is NOT a genuine rejection if it is any of:
 Return ONLY a JSON object:
 {
   "genuine": true | false,
-  "category": "rejection" | "not-rejection",
+  "category": "rejection" | "interview" | "assessment" | "offer" | "not-rejection",
   "confidence": "high" | "medium" | "low",
   "reason": "one short sentence naming the decisive evidence",
   "company": "the employer the application was for, exactly as the email names it, or \"\"",
   "jobTitle": "the role the application was for, exactly as the email names it, or \"\""
 }
 
-Rules: base the decision only on the email content given. When uncertain, return genuine=false. For company and jobTitle copy the wording from the email and never guess: use "" when the email does not name them (a recruiting-platform name such as Greenhouse, Workday or Lever is not the employer). Output raw JSON only.`;
+Rules: base the decision only on the email content given. When uncertain, return genuine=false. If the email is really an interview invitation, assessment invitation or offer, return genuine=false with that category. For company and jobTitle copy the wording from the email and never guess: use "" when the email does not name them (a recruiting-platform name such as Greenhouse, Workday or Lever is not the employer). Output raw JSON only.`;
 
 function clamp(text, max) {
   const s = String(text || "").trim();
@@ -101,6 +111,7 @@ function fail(error) {
     reason: "",
     company: "",
     jobTitle: "",
+    redirect: "",
     model: MODEL,
     error: String(error || "unknown").slice(0, 300)
   };
@@ -173,8 +184,8 @@ async function askVerifier({
   fallbackCategory,
   usageSource
 }) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return fail("OPENAI_API_KEY not configured");
+  const ai = mailAiConfig(process.env, { modelOverride: process.env.MAIL_VERIFY_MODEL });
+  if (!ai.apiKey) return fail(MISSING_KEY_ERROR);
 
   const userPrompt = [
     `Rules classifier guess: ${rulesCategory || "unknown"}`,
@@ -188,11 +199,11 @@ async function askVerifier({
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(OPENAI_URL, {
+    const res = await fetch(ai.url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}` },
       body: JSON.stringify({
-        model: MODEL,
+        model: ai.model,
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt }
@@ -226,10 +237,16 @@ async function askVerifier({
     }
 
     const category = allowed.has(parsed?.category) ? parsed.category : fallbackCategory;
+    // The verifier may say the rules picked the wrong side: a "milestone" that
+    // is a rejection, or a "rejection" that is an invite. The pipeline then
+    // re-checks the mail on the other side instead of dropping it.
+    const raw = String(parsed?.category || "");
+    const redirect = !allowed.has(raw) && REDIRECT_CATEGORIES.has(raw) ? raw : "";
     return {
       ok: true,
       genuine: parsed?.genuine === true && category !== fallbackCategory,
       category,
+      redirect,
       confidence: CONFIDENCES.has(parsed?.confidence) ? parsed.confidence : "low",
       reason: typeof parsed?.reason === "string" ? parsed.reason.trim().slice(0, 300) : "",
       // Only the rejection prompt asks for these; the milestone prompt leaves them "".

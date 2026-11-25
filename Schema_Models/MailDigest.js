@@ -87,6 +87,12 @@ const MailDigestSchema = new mongoose.Schema(
     aiTriageReason: { type: String, default: "" },
     aiTriageError: { type: String, default: "" },
     aiTriageFound: { type: Boolean, default: false },
+    // Why the second look was not run ("marketing:job-alert", "flashfire-own-mail",
+    // "account-security"; see Utils/mailPromoFilter.js). "" when it ran.
+    aiTriageSkipped: { type: String, default: "" },
+    // The verifier said the rules picked the wrong side and the mail was
+    // re-checked on the other one, e.g. "interview->rejection".
+    verifyRerouted: { type: String, default: "" },
     // A learned exclusion that hid a mail the verifier then confirmed genuine.
     // That rule is switched off (MailClassifierRule.status = "disabled").
     excludedByRule: { type: String, default: "" },

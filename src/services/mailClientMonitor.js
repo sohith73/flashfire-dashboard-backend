@@ -29,6 +29,7 @@ import {
 } from "../../Utils/discordMailNotify.js";
 import { collectClientMailRows, summarizeClientMail, buildClientMailEmbed } from "./clientMailSummary.js";
 import { jobSourceForMail } from "./mailJobSource.js";
+import { mailAiCostEmbed } from "../../Utils/mailAiCostEmbed.js";
 
 // ─── Fixed tuning (hard-coded; no env knobs) ─────────────────────────
 const SUMMARY_WINDOW_HOURS = 24; // daily summary looks back this far
@@ -161,7 +162,7 @@ export async function sendDailySummary() {
     usefulMails: usefulInWindow,
     windowHours: SUMMARY_WINDOW_HOURS,
     dateLabel: new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" })
-  }, { extraEmbeds: [buildClientMailEmbed(clientMail, { error: clientMailError })] });
+  }, { extraEmbeds: [buildClientMailEmbed(clientMail, { error: clientMailError }), await mailAiCostEmbed()] });
 
   // Then one message per useful mail.
   let posted = 0;

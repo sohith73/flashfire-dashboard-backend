@@ -52,7 +52,8 @@ import {
   isTextLike
 } from "../../Utils/gmailMessage.js";
 import { summarizeMail } from "./mailAiSummarizer.js";
-import { classifyMailByRules, actionForCategory } from "../../Utils/mailRulesClassifier.js";
+import { classifyMailByRules, actionForCategory, hasMilestoneSubject } from "../../Utils/mailRulesClassifier.js";
+import { triageSkipReason } from "../../Utils/mailPromoFilter.js";
 import { verifyMilestoneMail, milestoneGate, verifyRejectionMail } from "./mailMilestoneVerifier.js";
 import { autoRejectForDigest } from "./mailAutoReject.js";
 import { shouldSuppressSender, recordVerdict } from "./mailVerifierLearning.js";
@@ -276,6 +277,132 @@ async function fetchMessage(gmail, messageId) {
     bodyText,
     textAttachments,
     allAttachments: bodies.attachments
+  };
+}
+
+// ─── Verification, one side each ───────────────────────────────────
+
+const NOTIFIABLE_MILESTONES = new Set(["interview", "assessment", "offer"]);
+
+// verifyAsMilestone: AI check of an interview / assessment / offer candidate,
+// the learning feedback, and the notify gate. Returns what the digest stores.
+async function verifyAsMilestone({ msg, category, fromTriage, senderEmail, mailbox, messageId }) {
+  const verdict = await verifyMilestoneMail({
+    from: msg.meta.from,
+    subject: msg.meta.subject,
+    bodyText: msg.bodyText,
+    snippet: msg.snippet,
+    rulesCategory: category
+  });
+  // Feed the loop: every real AI verdict updates the per-domain counters
+  // and evidence list that drive suppression + future regex tightening.
+  // A triage find the verifier turned down is not a regex false positive,
+  // so it must not count against the sender domain or teach an exclusion.
+  // A triage find it CONFIRMED is recorded: it joins the genuine examples
+  // every future exclusion is regression-tested against. A mail the verifier
+  // calls a rejection is not a promo either, so it does not count against the
+  // sender: the same ATS domain sends the real invites.
+  if ((!fromTriage || verdict.genuine) && verdict.redirect !== "rejection") {
+    await recordVerdict({ fromEmail: senderEmail, rulesCategory: category, subject: msg.meta.subject, verdict });
+  }
+  // Verified false positive → have the AI write a DB-stored exclusion
+  // pattern so this kind of mail dies at the regex stage next time.
+  // Validation + genuine-mail regression checks happen inside; a
+  // rejected proposal just means the other layers keep covering it.
+  if (verdict.ok && !verdict.genuine && !fromTriage) {
+    const proposal = await proposeAndStoreExclusion({
+      mail: { from: msg.meta.from, subject: msg.meta.subject, bodyText: msg.bodyText },
+      rulesCategory: category,
+      verdict
+    });
+    if (proposal.stored) {
+      console.log(`[mail-regex] ${mailbox}: new exclusion /${proposal.pattern}/i from ${messageId}`);
+    }
+  }
+  const gate = milestoneGate(verdict);
+  const verifyFields = {
+    verifyRan: true,
+    verifyGenuine: verdict.genuine,
+    verifyCategory: verdict.category,
+    verifyConfidence: verdict.confidence,
+    verifyReason: verdict.reason,
+    verifyModel: verdict.model,
+    verifyError: verdict.error
+  };
+  const eligibility = gate.eligible
+    ? { clientNotifyEligible: true, clientNotifyCategory: gate.category, opsNotifyEligible: true }
+    : {
+        clientNotifyEligible: false,
+        clientNotifyCategory: "",
+        // Unverifiable (AI down) still reaches Discord; a verified
+        // rejection reaches nobody.
+        opsNotifyEligible: !verdict.ok,
+        clientNotifySkippedReason: gate.reason
+      };
+  if (!gate.eligible) {
+    console.log(
+      `[mail-verify] ${mailbox}: ${verdict.ok ? "rejected" : "unverifiable"} ${category} candidate (${messageId}): ${gate.reason}`
+    );
+  }
+  return { verdict, verifyFields, eligibility };
+}
+
+// verifyAsRejection: AI check of a rejection candidate.
+//
+// REJECTIONS ARE CLASSIFIED AND STORED, AND THEY NOTIFY NOBODY.
+//
+// No Discord line (ops asked for that to stop on 28 Sept 2026 - a
+// steady trickle of bad news is not what that channel is for) and never
+// a client email. The digest still records the verdict, so the data is
+// there to query (and auto-reject reads it), and when the AI finds a false
+// positive the regex learner writes an exclusion, which is what keeps the
+// rejection patterns sharpening over time.
+//
+// Sender suppression is NOT consulted here and the verdict is NOT fed
+// back into it. Those counters are per DOMAIN and not per category, so
+// a rejected rejection-candidate from greenhouse.io would push that
+// domain toward suppression and start silencing genuine INTERVIEW mail
+// from the same sender. The regex learner is safe to share because its
+// rules carry a category.
+async function verifyAsRejection({ msg, fromTriage, mailbox, messageId }) {
+  const verdict = await verifyRejectionMail({
+    from: msg.meta.from,
+    subject: msg.meta.subject,
+    bodyText: msg.bodyText,
+    snippet: msg.snippet
+  });
+  if (verdict.ok && !verdict.genuine && !fromTriage) {
+    const proposal = await proposeAndStoreExclusion({
+      mail: { from: msg.meta.from, subject: msg.meta.subject, bodyText: msg.bodyText },
+      rulesCategory: "rejection",
+      verdict
+    });
+    if (proposal.stored) {
+      console.log(`[mail-regex] ${mailbox}: new rejection exclusion /${proposal.pattern}/i from ${messageId}`);
+    }
+  }
+  return {
+    verdict,
+    verifyFields: {
+      verifyRan: true,
+      verifyGenuine: verdict.genuine,
+      verifyCategory: verdict.category,
+      verifyConfidence: verdict.confidence,
+      verifyReason: verdict.reason,
+      verifyModel: verdict.model,
+      verifyError: verdict.error,
+      // Employer + role as the mail words them; the auto-reject matcher reads these.
+      verifyCompany: verdict.company || "",
+      verifyJobTitle: verdict.jobTitle || ""
+    },
+    // Every flag stays false. A rejection reaches neither the client nor
+    // the ops channel; it is recorded and nothing else.
+    eligibility: {
+      clientNotifyEligible: false,
+      clientNotifyCategory: "",
+      opsNotifyEligible: false,
+      clientNotifySkippedReason: "rejection_recorded_only"
+    }
   };
 }
 
@@ -512,7 +639,20 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
       let ai = learned;
       let fromTriage = false;
       let triageFields = {};
-      if (!RULE_FLAGGED_CATEGORIES.has(learned.category)) {
+      // Clear marketing, sign-in codes and FlashFire's own mail skip it to save
+      // cost; anything with a hiring word in it is always read (mailPromoFilter).
+      const skipTriage = RULE_FLAGGED_CATEGORIES.has(learned.category)
+        ? ""
+        : triageSkipReason({
+            from: msg.meta.from,
+            subject: msg.meta.subject,
+            bodyText: msg.bodyText,
+            snippet: msg.snippet,
+            rulesCategory: rawAi.category
+          });
+      if (skipTriage) {
+        triageFields = { aiTriageSkipped: skipTriage, rulesCategory: learned.category, excludedByRule: learned.excludedByRule || "" };
+      } else if (!RULE_FLAGGED_CATEGORIES.has(learned.category)) {
         const t = await triageMail({
           from: msg.meta.from,
           subject: msg.meta.subject,
@@ -560,12 +700,16 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
       let verifyFields = {};
       let eligibility = { clientNotifyEligible: false, clientNotifyCategory: "", opsNotifyEligible: false };
       const senderEmail = parseFromHeader(msg.meta.from).email;
+      const vctx = { msg, fromTriage, senderEmail, mailbox, messageId };
       // Learned suppression: a sender domain the AI has already rejected
       // repeatedly (and never once confirmed) skips the AI entirely — the
       // verdict is known, the check is free, and the alert stays silent.
       // Not for a triage find: the domain counters were built from regex false
       // positives, and the AI has just read this mail and called it real.
-      const suppression = provisional.clientNotifyEligible && !fromTriage
+      // Not when the SUBJECT itself names a hiring step either: "Your Interview
+      // Invitation at Anchor" and "Pandora Assessment" were silenced this way
+      // (Nov 2026) because three earlier mails from the same ATS were promos.
+      const suppression = provisional.clientNotifyEligible && !fromTriage && !hasMilestoneSubject(msg.meta.subject)
         ? await shouldSuppressSender(senderEmail)
         : { suppress: false };
       if (provisional.clientNotifyEligible && suppression.suppress) {
@@ -579,113 +723,34 @@ async function pollWithSource({ user, source, state, client, mailbox, ownerEmail
           `[mail-learn] ${mailbox}: suppressed ${ai.category} candidate from ${suppression.domain} (${suppression.rejectCount} prior AI rejections) (${messageId})`
         );
       } else if (provisional.clientNotifyEligible) {
-        const verdict = await verifyMilestoneMail({
-          from: msg.meta.from,
-          subject: msg.meta.subject,
-          bodyText: msg.bodyText,
-          snippet: msg.snippet,
-          rulesCategory: ai.category
-        });
-        // Feed the loop: every real AI verdict updates the per-domain counters
-        // and evidence list that drive suppression + future regex tightening.
-        // A triage find the verifier turned down is not a regex false positive,
-        // so it must not count against the sender domain or teach an exclusion.
-        // A triage find it CONFIRMED is recorded: it joins the genuine examples
-        // every future exclusion is regression-tested against.
-        if (!fromTriage || verdict.genuine) {
-          await recordVerdict({ fromEmail: senderEmail, rulesCategory: ai.category, subject: msg.meta.subject, verdict });
-        }
-        // Verified false positive → have the AI write a DB-stored exclusion
-        // pattern so this kind of mail dies at the regex stage next time.
-        // Validation + genuine-mail regression checks happen inside; a
-        // rejected proposal just means the other layers keep covering it.
-        if (verdict.ok && !verdict.genuine && !fromTriage) {
-          const proposal = await proposeAndStoreExclusion({
-            mail: { from: msg.meta.from, subject: msg.meta.subject, bodyText: msg.bodyText },
-            rulesCategory: ai.category,
-            verdict
-          });
-          if (proposal.stored) {
-            console.log(`[mail-regex] ${mailbox}: new exclusion /${proposal.pattern}/i from ${messageId}`);
+        let r = await verifyAsMilestone({ ...vctx, category: ai.category });
+        // The verifier read it as a REJECTION, not a milestone: re-check it as
+        // one so auto-reject and the records still get it.
+        if (r.verdict.ok && !r.verdict.genuine && r.verdict.redirect === "rejection") {
+          const rr = await verifyAsRejection(vctx);
+          if (rr.verdict.genuine) {
+            console.log(`[mail-verify] ${mailbox}: ${ai.category} candidate is a rejection, rerouted (${messageId})`);
+            rr.verifyFields.verifyRerouted = `${ai.category}->rejection`;
+            ai = { ...ai, category: "rejection", priority: "medium", actionRequired: "" };
+            r = rr;
           }
         }
-        const gate = milestoneGate(verdict);
-        verifyFields = {
-          verifyRan: true,
-          verifyGenuine: verdict.genuine,
-          verifyCategory: verdict.category,
-          verifyConfidence: verdict.confidence,
-          verifyReason: verdict.reason,
-          verifyModel: verdict.model,
-          verifyError: verdict.error
-        };
-        eligibility = gate.eligible
-          ? { clientNotifyEligible: true, clientNotifyCategory: gate.category, opsNotifyEligible: true }
-          : {
-              clientNotifyEligible: false,
-              clientNotifyCategory: "",
-              // Unverifiable (AI down) still reaches Discord; a verified
-              // rejection reaches nobody.
-              opsNotifyEligible: !verdict.ok,
-              clientNotifySkippedReason: gate.reason
-            };
-        if (!gate.eligible) {
-          console.log(
-            `[mail-verify] ${mailbox}: ${verdict.ok ? "rejected" : "unverifiable"} ${ai.category} candidate (${messageId}): ${gate.reason}`
-          );
-        }
+        ({ verifyFields, eligibility } = r);
       } else if (ai.category === "rejection") {
-        // REJECTIONS ARE CLASSIFIED AND STORED, AND THEY NOTIFY NOBODY.
-        //
-        // No Discord line (ops asked for that to stop on 28 Sept 2026 - a
-        // steady trickle of bad news is not what that channel is for) and never
-        // a client email. The digest still records the verdict, so the data is
-        // there to query, and the AI check still runs for ONE reason: when it
-        // finds a false positive it has the regex learner write an exclusion,
-        // which is what keeps the rejection patterns sharpening over time.
-        //
-        // Sender suppression is NOT consulted here and the verdict is NOT fed
-        // back into it. Those counters are per DOMAIN and not per category, so
-        // a rejected rejection-candidate from greenhouse.io would push that
-        // domain toward suppression and start silencing genuine INTERVIEW mail
-        // from the same sender. The regex learner is safe to share because its
-        // rules carry a category.
-        const verdict = await verifyRejectionMail({
-          from: msg.meta.from,
-          subject: msg.meta.subject,
-          bodyText: msg.bodyText,
-          snippet: msg.snippet
-        });
-        if (verdict.ok && !verdict.genuine && !fromTriage) {
-          const proposal = await proposeAndStoreExclusion({
-            mail: { from: msg.meta.from, subject: msg.meta.subject, bodyText: msg.bodyText },
-            rulesCategory: "rejection",
-            verdict
-          });
-          if (proposal.stored) {
-            console.log(`[mail-regex] ${mailbox}: new rejection exclusion /${proposal.pattern}/i from ${messageId}`);
+        let r = await verifyAsRejection(vctx);
+        // The verifier read it as an INVITE or OFFER, not a rejection: check it
+        // as that milestone instead of recording it as nothing.
+        if (r.verdict.ok && !r.verdict.genuine && NOTIFIABLE_MILESTONES.has(r.verdict.redirect)) {
+          const target = r.verdict.redirect;
+          const m = await verifyAsMilestone({ ...vctx, category: target });
+          if (m.verdict.genuine) {
+            console.log(`[mail-verify] ${mailbox}: rejection candidate is a ${target}, rerouted (${messageId})`);
+            m.verifyFields.verifyRerouted = `rejection->${target}`;
+            ai = { ...ai, category: target, priority: "high", actionRequired: actionForCategory(target) };
+            r = m;
           }
         }
-        verifyFields = {
-          verifyRan: true,
-          verifyGenuine: verdict.genuine,
-          verifyCategory: verdict.category,
-          verifyConfidence: verdict.confidence,
-          verifyReason: verdict.reason,
-          verifyModel: verdict.model,
-          verifyError: verdict.error,
-          // Employer + role as the mail words them; the auto-reject matcher reads these.
-          verifyCompany: verdict.company || "",
-          verifyJobTitle: verdict.jobTitle || ""
-        };
-        // Every flag stays false. A rejection reaches neither the client nor
-        // the ops channel; it is recorded and nothing else.
-        eligibility = {
-          clientNotifyEligible: false,
-          clientNotifyCategory: "",
-          opsNotifyEligible: false,
-          clientNotifySkippedReason: "rejection_recorded_only"
-        };
+        ({ verifyFields, eligibility } = r);
       }
 
       // Self-correction: a learned exclusion hid this mail, triage found it and

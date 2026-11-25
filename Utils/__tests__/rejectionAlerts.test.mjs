@@ -29,6 +29,14 @@ const read = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)),
 const classify = (from, subject, body) =>
   classifyMailByRules({ from, subject, bodyText: body, snippet: body.slice(0, 120) });
 
+// The rejection side lives in verifyAsRejection(); the branch calls it and may
+// only leave the rejection path when the milestone verifier confirms an invite.
+const rejectionHelper = (worker) => worker.slice(worker.indexOf("async function verifyAsRejection"), worker.indexOf("// ─── Discord delivery"));
+const rejectionBranch = (worker) => {
+  const from = worker.indexOf('} else if (ai.category === "rejection") {');
+  return worker.slice(from, worker.indexOf("// Self-correction", from));
+};
+
 // ── nothing is delivered ──────────────────────────────────────────────────
 
 test("no Discord line exists for a rejection any more", () => {
@@ -43,9 +51,10 @@ test("no Discord line exists for a rejection any more", () => {
 
 test("the rejection branch leaves every delivery flag false", () => {
   const worker = read("../../src/services/mailPollWorker.js");
-  const from = worker.indexOf('} else if (ai.category === "rejection") {');
-  assert.ok(from > -1, "the rejection branch must still exist - detection is kept");
-  const branch = worker.slice(from, worker.indexOf("const uploadedNames", from));
+  assert.ok(worker.indexOf('} else if (ai.category === "rejection") {') > -1, "the rejection branch must still exist - detection is kept");
+  assert.match(rejectionBranch(worker), /await verifyAsRejection\(vctx\)/);
+  assert.match(rejectionBranch(worker), /if \(m\.verdict\.genuine\)/, "only a CONFIRMED invite leaves the rejection path");
+  const branch = rejectionHelper(worker);
 
   assert.match(branch, /clientNotifyEligible: false/);
   assert.match(branch, /opsNotifyEligible: false/);
@@ -152,10 +161,7 @@ test("rejection is a category the regex learner may write rules for", () => {
 
 test("the AI check still runs so the learner keeps getting taught", () => {
   const worker = read("../../src/services/mailPollWorker.js");
-  const branch = worker.slice(
-    worker.indexOf('} else if (ai.category === "rejection") {'),
-    worker.indexOf("const uploadedNames", worker.indexOf('} else if (ai.category === "rejection") {'))
-  );
+  const branch = rejectionHelper(worker);
   assert.match(branch, /verifyRejectionMail/);
   assert.match(branch, /proposeAndStoreExclusion/, "a false positive must still teach an exclusion");
 });
