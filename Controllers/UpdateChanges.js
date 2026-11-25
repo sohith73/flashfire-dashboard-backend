@@ -1,6 +1,7 @@
 
 import { JobModel } from "../Schema_Models/JobModel.js";
 import { UserModel } from "../Schema_Models/UserModel.js";
+import Operations from "../Schema_Models/Operations.js";
 import { ProfileModel } from "../Schema_Models/ProfileModel.js";
 import { DiscordConnect } from "../Utils/DiscordConnect.js";
 import { jobSourceLabel, JOB_SOURCE_FIELDS } from "../Utils/jobSourceLabel.js";
@@ -59,20 +60,44 @@ const validateAttachmentUrls = (urls) => {
   }
 };
 
-// Role verification using caller email from the database.
-const getVerifiedUserRole = async (callerEmail) => {
-  const dbUser = await UserModel.findOne({ email: callerEmail })
-    .select('role')
-    .lean();
+// Role verification from the database, never from the request body's `role`.
+//
+// Operators live in the Operations collection (name@flashfirehq), clients in
+// UserModel. The first version of this check looked the operator's email up in
+// UserModel, where operators never are, so every operator edit, status change
+// and attachment upload answered 401 "User not found or unauthorized" (25 Nov
+// 2026). It also read UserModel.role, a field that does not exist, so even a
+// found caller could never be "operations".
+//
+//   operationsEmail sent  -> must be an Operations account -> "operations"
+//   otherwise             -> the client must exist          -> "user"
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const findByEmail = (Model, email) =>
+  Model.findOne({ email }).select('_id').lean().then((hit) =>
+    hit || Model.findOne({ email: { $regex: new RegExp(`^${escapeRegex(email)}$`, 'i') } }).select('_id').lean()
+  );
 
-  if (!dbUser) {
+export const getVerifiedUserRole = async ({ operationsEmail, userEmail }) => {
+  const opEmail = String(operationsEmail || '').trim();
+  if (opEmail) {
+    const operator = await findByEmail(Operations, opEmail);
+    if (!operator) {
+      throw {
+        status: 403,
+        message: "Operator account not found. Log out of Operations and sign in again."
+      };
+    }
+    return 'operations';
+  }
+
+  const client = await findByEmail(UserModel, String(userEmail || '').trim());
+  if (!client) {
     throw {
       status: 401,
       message: "User not found or unauthorized"
     };
   }
-
-  return dbUser.role || 'user';
+  return 'user';
 };
 
 const isRemovalStatus = (status) => {
@@ -626,9 +651,11 @@ export default async function UpdateChanges(req, res) {
   try {
     validateRequiredFields(jobID, userEmail);
 
-    // Verify caller role using operations email when supplied.
-    const callerEmail = req.body?.operationsEmail || userEmail;
-    const verifiedRole = await getVerifiedUserRole(callerEmail);
+    // Verify the caller's role from the database (see getVerifiedUserRole).
+    const verifiedRole = await getVerifiedUserRole({
+      operationsEmail: req.body?.operationsEmail,
+      userEmail
+    });
 
     req.verifiedRole = verifiedRole;
 
