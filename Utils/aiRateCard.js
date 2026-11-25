@@ -22,6 +22,10 @@ export const AI_RATES = {
     // Gemini figure a deliberate OVER-estimate rather than a flattering one.
     "gemini-2.5-flash-lite": { in: 0.10, cachedIn: 0.10, out: 0.40, asOf: "2025-04-01" },
     "gemini-2.5-flash": { in: 0.30, cachedIn: 0.30, out: 2.50, asOf: "2025-04-01" },
+    // TypeSafe Jev (mail second look). "$42 / Btok, $0.042 / Mtok. You pay per
+    // input token. Output tokens are free." - docs.typesafe.ai/models. Matches
+    // jev-latest, jev-1.14.0 and jev-1.13.0 by prefix.
+    "jev": { in: 0.042, cachedIn: 0.042, out: 0, asOf: "2026-11-25" },
 };
 
 // Unknown models must NOT silently price at zero — that is how a cost report

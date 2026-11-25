@@ -123,7 +123,7 @@ test('the custom model is priced from env, and flagged when it is not', () => {
 
 test('the daily cost card lists mail AI spend by model and step, and only mail sources', () => {
   const usage = { day: '2026-11-24', rows: [
-    { source: 'mail-triage', model: 'jev-1', calls: 900, callsMissingUsage: 0, inputTokens: 900000, outputTokens: 30000, usd: 0.06, inr: 5.64 },
+    { source: 'mail-triage', model: 'some-new-model', calls: 900, callsMissingUsage: 0, inputTokens: 900000, outputTokens: 30000, usd: 0.06, inr: 5.64 },
     { source: 'mail-verify', model: 'gpt-4o-mini-2024-07-18', calls: 120, callsMissingUsage: 2, inputTokens: 300000, outputTokens: 9000, usd: 0.05, inr: 4.7 },
     { source: 'second-judge', model: 'gpt-4o-mini', calls: 5000, callsMissingUsage: 0, inputTokens: 1, outputTokens: 1, usd: 9, inr: 846 },
   ] };
@@ -131,8 +131,8 @@ test('the daily cost card lists mail AI spend by model and step, and only mail s
   assert.match(e.title, /2026-11-24/);
   const f = Object.fromEntries(e.fields.map((x) => [x.name, x.value]));
   assert.match(f.Total, /\$0\.1100 \(₹10\.34\) for 1,020 calls/);
-  assert.match(f['By model'], /\*\*jev-1\*\*: 900 calls/);
-  assert.match(f['By model'], /jev-1.*no price set/, 'an unpriced model is called out');
+  assert.match(f['By model'], /\*\*some-new-model\*\*: 900 calls/);
+  assert.match(f['By model'], /some-new-model.*no price set/, 'an unpriced model is called out');
   assert.match(f['By step'], /Second look \(all non-marketing mail\): 900 calls/);
   assert.doesNotMatch(JSON.stringify(e), /second-judge/, 'job-judging spend is not mail spend');
   assert.match(f.Note, /2 call\(s\) returned no token count/);

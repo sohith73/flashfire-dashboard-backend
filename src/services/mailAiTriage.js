@@ -14,13 +14,15 @@
 // client email. Nothing reaches a client on this call's say-so alone.
 //
 // Contract:
-//   - Always on. Same endpoint, key and model as the verifier (Utils/mailAiConfig.js).
+//   - Always on. TypeSafe Jev when TYPESAFE_API_KEY is set (src/services/mailJevTriage.js),
+//     else the chat model from Utils/mailAiConfig.js; Jev failures fall back to the chat model.
 //   - Fail-soft: OpenAI down or junk -> { ok:false } and the rules result
 //     stands, exactly as before this file existed.
 //   - temperature 0, json_object, body capped, usage recorded under "mail-triage".
 
 import { recordAiUsage, AI_USAGE_SOURCES } from "../../Utils/aiUsage.js";
 import { mailAiConfig, MISSING_KEY_ERROR, DEFAULT_MAIL_MODEL } from "../../Utils/mailAiConfig.js";
+import { jevTriage, jevConfig } from "./mailJevTriage.js";
 
 const MODEL = DEFAULT_MAIL_MODEL; // default only; mailAiConfig() picks the live one
 const TIMEOUT_MS = 20000;
@@ -69,7 +71,21 @@ function fail(error) {
  * @returns {Promise<{ok:boolean, category:string, confidence:string, reason:string, model:string, error:string}>}
  *          Always resolves.
  */
-export async function triageMail({ from, subject, bodyText, snippet, rulesCategory }, { fetchImpl = fetch, env = process.env } = {}) {
+export async function triageMail(mail, deps = {}) {
+  // TypeSafe Jev first when its key is set (cheaper, built for this exact
+  // decision); the chat model below is the fallback if Jev is down.
+  if (jevConfig(deps.env || process.env).apiKey) {
+    const j = await jevTriage(mail, deps);
+    if (j.ok) return j;
+    console.warn(`[mail-triage] Jev failed, falling back to the chat model: ${j.error}`);
+    const fallback = await chatTriage(mail, deps);
+    return fallback.ok ? fallback : { ...fallback, error: `${j.error} | fallback: ${fallback.error}`.slice(0, 300) };
+  }
+  return chatTriage(mail, deps);
+}
+
+/** The chat-model second look (OpenAI or MAIL_AI_API_URL). */
+export async function chatTriage({ from, subject, bodyText, snippet, rulesCategory }, { fetchImpl = fetch, env = process.env } = {}) {
   const ai = mailAiConfig(env);
   if (!ai.apiKey) return fail(MISSING_KEY_ERROR);
 
