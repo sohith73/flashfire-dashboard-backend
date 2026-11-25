@@ -59,6 +59,7 @@ import { shouldSuppressSender, recordVerdict } from "./mailVerifierLearning.js";
 import { applyLearnedExclusions, proposeAndStoreExclusion, retireExclusionRule } from "./mailRegexLearner.js";
 import { triageMail, triageFlags, RULE_FLAGGED_CATEGORIES } from "./mailAiTriage.js";
 import { notifyUsefulMailLine, isGmailAuthError, errorText } from "../../Utils/discordMailNotify.js";
+import { jobSourceForMail } from "./mailJobSource.js";
 import {
   deriveEligibility,
   notifyClientForDigest,
@@ -301,7 +302,8 @@ async function deliver({ digestDoc, client, mailbox }) {
       (digestDoc.verifyError ? `${digestDoc.category} (unverified — check manually)` : digestDoc.category),
     subject: digestDoc.subject,
     from: digestDoc.from,
-    receivedAt: digestDoc.date
+    receivedAt: digestDoc.date,
+    job: await jobSourceForMail(digestDoc)
   });
 
   if (!result.ok) {

@@ -459,7 +459,10 @@ const USEFUL_META = {
 /**
  * One message per useful mail: "Client (Name) got: <subject> — received <time>".
  *
- * @param {Object} a - { clientName, clientEmail, category, subject, from, receivedAt }
+ * @param {Object} a - { clientName, clientEmail, category, subject, from, receivedAt,
+ *                      job?: { jobTitle, companyName, source } }
+ *   `job` is the card the mail was matched to (src/services/mailJobSource.js).
+ *   Without one the line says the mail matched no card, so the source is unknown.
  */
 export async function notifyUsefulMailLine(a = {}) {
   const meta = USEFUL_META[a.category] || { emoji: "⭐", label: "Useful", color: 0x22c55e };
@@ -473,7 +476,13 @@ export async function notifyUsefulMailLine(a = {}) {
         name: "Received",
         value: a.receivedAt ? `${discordTimestamp(a.receivedAt)} · ${discordTimestamp(a.receivedAt, "R")}` : "—",
         inline: true
-      }
+      },
+      ...(a.job
+        ? [
+            { name: "Job", value: truncate(`${a.job.jobTitle || "?"} at ${a.job.companyName || "?"}`, LIMIT.fieldValue), inline: false },
+            { name: "Source", value: truncate(a.job.source || "Not recorded", LIMIT.fieldValue), inline: true }
+          ]
+        : [{ name: "Source", value: "Unknown (no matching job card)", inline: true }])
     ],
     timestamp: a.receivedAt ? new Date(a.receivedAt).toISOString() : new Date().toISOString(),
     footer: { text: "FlashFire • Mail update" }
