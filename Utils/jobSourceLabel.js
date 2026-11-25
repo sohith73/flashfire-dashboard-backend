@@ -4,14 +4,17 @@
 //   1. importSource: the site or API the job was pulled from ("adzuna-api",
 //      "seek", ...). Set by the API importers, and by the jr-direct extension
 //      once it sends the board it scraped.
-//   2. Otherwise who added it: the client, the jr-direct extension (it sends
+//   2. A JobRight match score (aiDecision.jrScore > 0). The extension copies
+//      JobRight's own card score there, and only JobRight cards have one, so
+//      it names the site for extension pushes made before importSource.
+//   3. Otherwise who added it: the client, the jr-direct extension (it sends
 //      an AI decision and usually an operator code), or an operator by hand.
 //
 // aiDecision is a nested schema path, so Mongoose may store an object of nulls
 // on every card. Only aiDecision.reason counts as evidence.
 
 /** Fields a caller must load for jobSourceLabel to work. */
-export const JOB_SOURCE_FIELDS = "importSource createdByRole operatorName operatorEmail addedBy extensionCode aiDecision.reason";
+export const JOB_SOURCE_FIELDS = "importSource createdByRole operatorName operatorEmail addedBy extensionCode aiDecision.reason aiDecision.jrScore";
 
 const SITE_LABELS = Object.freeze({
   "adzuna-api": "Adzuna API",
@@ -44,11 +47,16 @@ export function jobSourceLabel(job) {
   const who = clean(job.addedBy || job.operatorName);
   const viaExtension = Boolean(job.extensionCode || clean(job.aiDecision?.reason));
 
-  if (site) {
-    const label = SITE_LABELS[site] || site;
+  const jrScore = Number(job.aiDecision?.jrScore);
+  const isClientAdd = job.createdByRole === "user" || job.operatorEmail === "user@flashfirehq";
+  // Only for operator/extension pushes: a client's own add says so, whatever score it carries.
+  const inferred = !site && !isClientAdd && Number.isFinite(jrScore) && jrScore > 0 ? "jobright" : "";
+
+  if (site || inferred) {
+    const label = SITE_LABELS[site || inferred] || site;
     return who && who !== "operations" ? `${label} (added by ${who})` : label;
   }
-  if (job.createdByRole === "user" || job.operatorEmail === "user@flashfirehq") return "Added by the client";
+  if (isClientAdd) return "Added by the client";
   if (viaExtension) return who ? `Extension, site not recorded (pushed by ${who})` : "Extension, site not recorded";
   if (who && who !== "operations") return `Added by ${who}`;
   return "Not recorded";

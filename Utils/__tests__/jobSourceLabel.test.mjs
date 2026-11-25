@@ -19,6 +19,16 @@ test('an extension push that reports its board names the board', () => {
   assert.equal(jobSourceLabel({ importSource: 'JobRight' }), 'JobRight');
 });
 
+test('an extension push with a JobRight score is JobRight', () => {
+  assert.equal(jobSourceLabel({ createdByRole: 'operations', addedBy: 'Sonali', aiDecision: { reason: 'fits', jrScore: 82 } }), 'JobRight (added by Sonali)');
+  // A zero score is what the extension writes when the card had none.
+  assert.equal(jobSourceLabel({ createdByRole: 'operations', addedBy: 'Sonali', aiDecision: { reason: 'fits', jrScore: 0 } }), 'Extension, site not recorded (pushed by Sonali)');
+  // A client's own add stays a client add.
+  assert.equal(jobSourceLabel({ createdByRole: 'user', operatorEmail: 'user@flashfirehq', aiDecision: { jrScore: 90 } }), 'Added by the client');
+  // A recorded site always wins over the score.
+  assert.equal(jobSourceLabel({ importSource: 'seek', aiDecision: { reason: 'fits', jrScore: 70 } }), 'Seek');
+});
+
 test('an unknown importSource is shown as stored', () => {
   assert.equal(jobSourceLabel({ importSource: 'newboard' }), 'newboard');
 });
